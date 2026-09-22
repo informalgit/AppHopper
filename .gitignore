@@ -10,3 +10,6 @@ Thumbs.db
 
 # WorkBuddy session data
 .workbuddy/
+
+# local dev tools (never push)
+tools/

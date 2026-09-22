@@ -28,9 +28,9 @@ using System.Windows.Forms;
 // "Properties -> Details") without any build.bat change. Bump once per
 // release - the tray tooltip and the startup log line read it back at
 // runtime via AppVersion, so this is the single place a version lives.
-[assembly: System.Reflection.AssemblyVersion("1.1.1.0")]
-[assembly: System.Reflection.AssemblyFileVersion("1.1.1.0")]
-[assembly: System.Reflection.AssemblyInformationalVersion("1.1.1")]
+[assembly: System.Reflection.AssemblyVersion("1.1.4.0")]
+[assembly: System.Reflection.AssemblyFileVersion("1.1.4.0")]
+[assembly: System.Reflection.AssemblyInformationalVersion("1.1.4")]
 
 namespace AppHopper
 {
@@ -48,16 +48,14 @@ namespace AppHopper
         public const int WH_KEYBOARD_LL = 13;
         public const int WH_MOUSE_LL = 14;
         public const uint LLKHF_UP = 0x80;
+        public const uint LLKHF_INJECTED = 0x10;
+        public const uint LLKHF_ALTDOWN = 0x20;
         public const int WM_LBUTTONDOWN = 0x0201;
         public const int WM_MOUSEWHEEL = 0x020A;
         public const int VK_TAB = 0x09;
         public const int VK_MENU = 0x12;
         public const int VK_LMENU = 0xA4;
         public const int VK_RMENU = 0xA5;
-        // No physical keyboard has F24 and no app binds it: the perfect
-        // harmless keystroke for staking a last-input claim (see
-        // StakeInputClaim).
-        public const byte VK_F24 = 0x87;
         public const uint KEYEVENTF_KEYUP = 0x0002;
         public const int VK_LWIN = 0x5B;
         public const int VK_RWIN = 0x5C;
@@ -66,11 +64,10 @@ namespace AppHopper
         public const int GWL_EXSTYLE = -20;
         public const int WS_EX_TOOLWINDOW = 0x00000080;
         public const int WS_EX_APPWINDOW = 0x00040000;
+        public const int WS_EX_LAYERED = 0x00080000;
         public const int WS_EX_NOACTIVATE = 0x08000000;
         public const int WS_EX_TOPMOST = 0x00000008;
-        public const int WS_EX_LAYERED = 0x00080000;
         public const uint GW_OWNER = 4;
-        public const uint GA_ROOTOWNER = 2;
         public const int GCLP_HICONSM = -34;
         public const int GCLP_HICON = -14;
         public const uint PROCESS_QUERY_LIMITED_INFORMATION = 0x1000;
@@ -208,9 +205,9 @@ namespace AppHopper
         [DllImport("user32.dll")]
         public static extern IntPtr GetWindow(IntPtr hWnd, uint nCmd);
         [DllImport("user32.dll")]
-        public static extern IntPtr GetAncestor(IntPtr hwnd, uint gaFlags);
-        [DllImport("user32.dll")]
         public static extern IntPtr GetLastActivePopup(IntPtr hwnd);
+        [DllImport("user32.dll")]
+        public static extern bool GetLayeredWindowAttributes(IntPtr hwnd, out int crKey, out byte bAlpha, out int dwFlags);
         [DllImport("user32.dll")]
         public static extern bool IsWindow(IntPtr hWnd);
         [DllImport("user32.dll")]
@@ -221,8 +218,6 @@ namespace AppHopper
         public static extern bool DeleteObject(IntPtr hObject);
         [DllImport("user32.dll", EntryPoint = "GetWindowLongW")]
         public static extern int GetWindowLong(IntPtr hWnd, int nIndex);
-        [DllImport("user32.dll", EntryPoint = "GetClassLongW")]
-        public static extern int GetClassLong(IntPtr hWnd, int nIndex);
         // GetClassLongW truncates an HICON to 32 bits on x64; always use the
         // pointer-sized variant for icon handles.
         [DllImport("user32.dll", EntryPoint = "GetClassLongPtrW")]
@@ -255,8 +250,6 @@ namespace AppHopper
         public static extern bool GetClientRect(IntPtr hWnd, out RECT lpRect);
         [DllImport("user32.dll")]
         public static extern bool PostMessageW(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam);
-        [DllImport("user32.dll")]
-        public static extern bool SetProcessDPIAware();
         [DllImport("user32.dll")]
         public static extern IntPtr MonitorFromWindow(IntPtr hwnd, uint dwFlags);
         [DllImport("user32.dll", CharSet = CharSet.Unicode)]
@@ -477,7 +470,7 @@ namespace AppHopper
         public IntPtr ReprHwnd;
         public string Exe;
         public string Title;
-        public Icon Icon;      // shared handle (window icons) or owned clone
+        public Icon Icon;      // owned managed clone; cache lifetime owns disposal
         public IntPtr Thumb = IntPtr.Zero;
         public int Rank;       // Z-order rank of the representative window
         public bool Topmost;   // representative window is WS_EX_TOPMOST
@@ -611,8 +604,10 @@ namespace AppHopper
         // ================= state =================
         static IntPtr _hook = IntPtr.Zero;
         static IntPtr _mouseHook = IntPtr.Zero;
-        static NativeMethods.HookProc _hookProc;
-        static NativeMethods.HookProc _mouseHookProc;
+        // Keep the delegates rooted for the lifetime of the native hooks.
+        // Passing null here silently installs no usable callback.
+        static NativeMethods.HookProc _hookProc = new NativeMethods.HookProc(KbHookProc);
+        static NativeMethods.HookProc _mouseHookProc = new NativeMethods.HookProc(MouseHookProc);
         static Mutex _mutex;
         static StreamWriter _log;
         static bool _enabled = true;
@@ -625,6 +620,13 @@ namespace AppHopper
         static List<AppEntry> _apps = new List<AppEntry>();
         static List<IntPtr> _thumbs = new List<IntPtr>();
         static bool _session;
+        // A queued card click belongs to one exact session snapshot. The
+        // generation changes on session start and every live refresh, so a
+        // stale WM_APP_COMMITAT cannot target a new list by numeric index.
+        static int _sessionGeneration;
+        static bool _replayingTab;
+        static bool _altHookDown;
+        const int ReplayInputTag = 0x41504831;
         // Commit/Cancel teardown in progress: a second trigger pumped in via
         // Application.DoEvents (watchdog tick / queued WM_APP_COMMIT) must
         // no-op instead of running a nested Commit to completion - the nested
@@ -641,10 +643,12 @@ namespace AppHopper
         // Polls for windows that disappeared while the overlay is up. Only
         // runs during a session; see RefreshTick.
         static System.Windows.Forms.Timer _refreshTimer;
+        static bool _verboseLog;
+        static bool _logTruncated;
+        const long MaxLogBytes = 8L * 1024L * 1024L;
 
-        // Product version shown to humans ("1.1.1"), read back from the
-        // [assembly: AssemblyInformationalVersion] attribute at the top of
-        // this file - one literal per release, consumed everywhere.
+        // Product version shown to humans, read back from the
+        // AssemblyInformationalVersion attribute at the top of this file.
         static readonly string AppVersion = InitVersion();
 
         static string InitVersion()
@@ -655,15 +659,44 @@ namespace AppHopper
             return attr != null ? attr.InformationalVersion : asm.GetName().Version.ToString(3);
         }
 
+        static string LogText(string value)
+        {
+            return _verboseLog ? (value ?? "") : "<redacted>";
+        }
+
         static void Log(string msg)
         {
-            if (_log == null) return;
-            try { _log.WriteLine(DateTime.Now.ToString("HH:mm:ss.fff ") + msg); _log.Flush(); }
+            if (_log == null || _logTruncated) return;
+            try
+            {
+                string line = DateTime.Now.ToString("HH:mm:ss.fff ") + msg;
+                long bytes = _log.BaseStream.Length;
+                int extra = Encoding.UTF8.GetByteCount(line) + 2;
+                if (bytes + extra > MaxLogBytes)
+                {
+                    string marker = "log truncated at " + MaxLogBytes + " bytes";
+                    if (bytes + Encoding.UTF8.GetByteCount(marker) + 2 <= MaxLogBytes)
+                        _log.WriteLine(marker);
+                    _log.Flush();
+                    _logTruncated = true;
+                    return;
+                }
+                _log.WriteLine(line);
+                _log.Flush();
+            }
             catch { }
         }
 
-        static void Post(int m) { NativeMethods.PostMessageW(_msg.Handle, (uint)m, IntPtr.Zero, IntPtr.Zero); }
-        static void PostAt(int m, int i) { NativeMethods.PostMessageW(_msg.Handle, (uint)m, (IntPtr)i, IntPtr.Zero); }
+        static bool Post(int m)
+        {
+            if (_msg == null || !_msg.IsHandleCreated) return false;
+            return NativeMethods.PostMessageW(_msg.Handle, (uint)m, IntPtr.Zero, IntPtr.Zero);
+        }
+        static bool PostAt(int m, int i, int generation)
+        {
+            if (_msg == null || !_msg.IsHandleCreated) return false;
+            return NativeMethods.PostMessageW(_msg.Handle, (uint)m, (IntPtr)i, (IntPtr)generation);
+        }
 
         // ================= windows =================
         class MsgForm : Form
@@ -676,7 +709,7 @@ namespace AppHopper
             }
             protected override void WndProc(ref Message m)
             {
-                if (m.Msg >= NativeMethods.WM_APP_START && m.Msg <= NativeMethods.WM_APP_COMMITAT) { HandleAppMsg(m.Msg, m.WParam); return; }
+                if (m.Msg >= NativeMethods.WM_APP_START && m.Msg <= NativeMethods.WM_APP_COMMITAT) { HandleAppMsg(m.Msg, m.WParam, m.LParam); return; }
                 base.WndProc(ref m);
             }
         }
@@ -729,17 +762,23 @@ namespace AppHopper
             finally { NativeMethods.CloseHandle(h); }
         }
 
-        static IntPtr FindWindowByClass(IntPtr parent, string className)
+        static IntPtr FindUniqueChildCoreWindow(IntPtr frame, uint hostPid)
         {
             IntPtr found = IntPtr.Zero;
-            NativeMethods.EnumChildWindows(parent, delegate(IntPtr h, IntPtr lp)
+            int count = 0;
+            NativeMethods.EnumChildWindows(frame, delegate(IntPtr h, IntPtr lp)
             {
-                var sb = new StringBuilder(256);
+                var sb = new StringBuilder(64);
                 NativeMethods.GetClassNameW(h, sb, sb.Capacity);
-                if (sb.ToString() == className) { found = h; return false; }
+                if (sb.ToString() != ClassCoreWindow) return true;
+                uint pid;
+                NativeMethods.GetWindowThreadProcessId(h, out pid);
+                if (pid == 0 || pid == hostPid) return true;
+                found = h;
+                count++;
                 return true;
             }, IntPtr.Zero);
-            return found;
+            return count == 1 ? found : IntPtr.Zero;
         }
 
         static string ClassNameOf(IntPtr hwnd)
@@ -790,12 +829,16 @@ namespace AppHopper
 
         // The CoreWindow is a child of the frame while the app runs. Once it
         // suspends the window tree is torn down and Windows keeps only a
-        // top-level CoreWindow carrying the same title, so match by title then.
+        // top-level CoreWindow carrying the same title. Title is only a
+        // last-resort key here: the candidate must belong to another process
+        // than ApplicationFrameHost and the match must be unique.
         static IntPtr UwpCoreWindowOf(IntPtr frame)
         {
-            IntPtr child = FindWindowByClass(frame, ClassCoreWindow);
+            uint hostPid;
+            NativeMethods.GetWindowThreadProcessId(frame, out hostPid);
+            IntPtr child = FindUniqueChildCoreWindow(frame, hostPid);
             if (child != IntPtr.Zero) return child;
-            return FindTopLevelCoreWindowByTitle(GetWindowTitle(frame));
+            return FindTopLevelCoreWindowByTitle(GetWindowTitle(frame), hostPid);
         }
 
         // Reverse lookup: GetForegroundWindow() reports a UWP app's CoreWindow
@@ -807,13 +850,16 @@ namespace AppHopper
             string title = GetWindowTitle(coreWindow);
             if (string.IsNullOrEmpty(title)) return IntPtr.Zero;
             IntPtr found = IntPtr.Zero;
+            int count = 0;
             NativeMethods.EnumWindows(delegate(IntPtr h, IntPtr lp)
             {
                 if (ClassNameOf(h) != ClassAppFrame) return true;
-                if (GetWindowTitle(h) == title) { found = h; return false; }
+                if (GetWindowTitle(h) != title) return true;
+                found = h;
+                count++;
                 return true;
             }, IntPtr.Zero);
-            return found;
+            return count == 1 ? found : IntPtr.Zero;
         }
 
         const string ClassCoreWindow = "Windows.UI.Core.CoreWindow";
@@ -824,9 +870,28 @@ namespace AppHopper
         // until it stops changing or turns visible. Single implementation
         // shared by RepresentativeOf and the eligibility predicate - the
         // logic used to live in three drifting copies.
+        //
+        // The root is walked with GetWindow(GW_OWNER), NOT GetAncestor(
+        // GA_ROOTOWNER): measured on this machine (2026-09-11 probe),
+        // GA_ROOTOWNER stops at the window itself when the only link to the
+        // root is ownership - ChatGPT's IFileDialog "Select Project Root"
+        // reported itself as its own root, which silently disabled the
+        // entire walk and let the dialog pass as its own chain.
+        static IntPtr OwnerChainRoot(IntPtr hwnd)
+        {
+            IntPtr root = hwnd;
+            for (int hops = 0; hops < 32; hops++)   // owner chains are acyclic; the cap is pure paranoia
+            {
+                IntPtr o = NativeMethods.GetWindow(root, NativeMethods.GW_OWNER);
+                if (o == IntPtr.Zero) break;
+                root = o;
+            }
+            return root;
+        }
+
         static IntPtr OwnerChainRepresentative(IntPtr hwnd)
         {
-            IntPtr walk = NativeMethods.GetAncestor(hwnd, NativeMethods.GA_ROOTOWNER);
+            IntPtr walk = OwnerChainRoot(hwnd);
             for (; ; )
             {
                 IntPtr pop = NativeMethods.GetLastActivePopup(walk);
@@ -858,25 +923,49 @@ namespace AppHopper
             return t.ToString();
         }
 
-        static IntPtr FindTopLevelCoreWindowByTitle(string title)
+        static IntPtr FindTopLevelCoreWindowByTitle(string title, uint excludedPid)
         {
             if (string.IsNullOrEmpty(title)) return IntPtr.Zero;
             IntPtr found = IntPtr.Zero;
+            int count = 0;
             NativeMethods.EnumWindows(delegate(IntPtr h, IntPtr lp)
             {
                 var cls = new StringBuilder(64);
                 NativeMethods.GetClassNameW(h, cls, 64);
                 if (cls.ToString() != ClassCoreWindow) return true;
-                if (GetWindowTitle(h) == title) { found = h; return false; }
+                uint pid;
+                NativeMethods.GetWindowThreadProcessId(h, out pid);
+                if (pid == 0 || pid == excludedPid) return true;
+                if (GetWindowTitle(h) != title) return true;
+                found = h;
+                count++;
                 return true;
             }, IntPtr.Zero);
-            return found;
+            return count == 1 ? found : IntPtr.Zero;
         }
 
         static bool IsCloaked(IntPtr hwnd)
         {
             int v;
             return NativeMethods.DwmGetWindowAttribute(hwnd, 14 /*DWMWA_CLOAKED*/, out v, 4) == 0 && v != 0;
+        }
+
+        // A layered window whose stored opacity has been driven to 0 is fully
+        // transparent: invisible to the user while IsWindowVisible keeps
+        // reporting true and DWM does not cloak it. CC Meter (Electron)
+        // "closes" its widget exactly this way, leaving a ghost entry in the
+        // switcher. Measured across this machine's 144 layered top-level
+        // windows (2026-09-11 probe): the stored alpha byte tracks real
+        // opacity (opaque consoles 255, translucent Tk windows 237-242, every
+        // hidden/transparent one 0) even where the flags word only reports
+        // LWA_COLORKEY - so alpha == 0 is the reliable test, not the flags.
+        static bool IsAlphaInvisible(IntPtr hwnd)
+        {
+            int ex = NativeMethods.GetWindowLong(hwnd, NativeMethods.GWL_EXSTYLE);
+            if ((ex & NativeMethods.WS_EX_LAYERED) == 0) return false;
+            int crKey; byte alpha; int flags;
+            if (!NativeMethods.GetLayeredWindowAttributes(hwnd, out crKey, out alpha, out flags)) return false;
+            return alpha == 0;
         }
 
         // The classic native Alt-Tab predicate (Raymond Chen / PowerToys
@@ -886,6 +975,42 @@ namespace AppHopper
         // copies (AltTabEligible + the SkipReason diagnostic); the merged
         // form serves both the filter and the log so they can never diverge.
         static string AltTabIneligibilityReason(IntPtr hwnd)
+        {
+            string why = AltTabIneligibleIgnoreChain(hwnd);
+            if (why != null) return why;
+
+            // Owner chains appear exactly once, represented by their ROOT
+            // window. An owned popup never gets an entry of its own: it sits
+            // above its owner and is raised together with it, and while a
+            // MODAL popup is up the root cannot take focus anyway - a separate
+            // popup entry would only trap the user. ChatGPT's IFileDialog
+            // "Select Project Root" showed up next to its own main window
+            // exactly like that (its main window carries WS_EX_APPWINDOW, so
+            // the dialog fell out of the exe grouping into an entry of its
+            // own). A popup may stand in for the chain only when the root
+            // itself is not presentable (hidden, cloaked, toolwindow, other
+            // desktop), which keeps "main window hidden while an owned dialog
+            // is visible" groups alive.
+            IntPtr root = OwnerChainRoot(hwnd);
+            if (root != hwnd)
+            {
+                if (AltTabIneligibleIgnoreChain(root) == null) return "owned-popup";
+                // Root cannot represent the chain (hidden, cloaked, alpha-0,
+                // toolwindow, other desktop): a visible popup is then the only
+                // presentable member left, so it stands in. No further check:
+                // the walk in OwnerChainRepresentative always stops BEFORE a
+                // visible popup (it returns the root or an invisible one), so
+                // a "not-owner-rep" test here could never let a visible
+                // dialog through and would hide apps like "tray utility with
+                // a floating panel" from the switcher entirely.
+            }
+            return null;
+        }
+
+        // Every eligibility check except the owner-chain rule. Shared by the
+        // full predicate and by the root-presentable probe above it, so the
+        // two can never drift apart.
+        static string AltTabIneligibleIgnoreChain(IntPtr hwnd)
         {
             if (!NativeMethods.IsWindowVisible(hwnd)) return "invisible";
 
@@ -905,10 +1030,10 @@ namespace AppHopper
             // activating one wakes it.
             if (IsCloaked(hwnd)) return "cloaked";
 
-            // Only the visible representative of its owner chain participates
-            // (this also catches groups whose main window is minimized while
-            // an owned dialog is still visible).
-            if (OwnerChainRepresentative(hwnd) != hwnd) return "not-owner-rep";
+            // Fully transparent (opacity 0) - see IsAlphaInvisible. Same
+            // user-visible effect as cloaked/invisible: nothing to show, no
+            // entry to offer.
+            if (IsAlphaInvisible(hwnd)) return "alpha-0";
 
             int ex = NativeMethods.GetWindowLong(hwnd, NativeMethods.GWL_EXSTYLE);
             if ((ex & NativeMethods.WS_EX_TOOLWINDOW) != 0 && (ex & NativeMethods.WS_EX_APPWINDOW) == 0) return "toolwindow";
@@ -924,23 +1049,27 @@ namespace AppHopper
             return null;
         }
 
-        // Owns a private copy of h, so the caller may dispose it freely.
+        // Clone every native icon handle so the returned Icon owns managed
+        // storage, then destroy the temporary HICON explicitly.
         static Icon CopyIconSafe(IntPtr h)
         {
+            if (h == IntPtr.Zero) return null;
+            IntPtr copy = IntPtr.Zero;
             try
             {
-                IntPtr copy = NativeMethods.CopyIcon(h);
-                if (copy != IntPtr.Zero) return Icon.FromHandle(copy);
+                copy = NativeMethods.CopyIcon(h);
+                if (copy == IntPtr.Zero) return null;
+                return (Icon)Icon.FromHandle(copy).Clone();
             }
-            catch { }
-            return null;
+            catch { return null; }
+            finally
+            {
+                if (copy != IntPtr.Zero) NativeMethods.DestroyIcon(copy);
+            }
         }
 
-        // Always returns an icon this process owns, so EndSession can dispose it
-        // unconditionally. Window icons are copied first: adopting a live HICON
-        // via Icon.FromHandle() and disposing it (or letting it be finalized)
-        // destroys the target window's own icon, blanking it on screen and in
-        // the taskbar.
+        // Always returns an icon this process owns. Window icons are copied
+        // first so no live HICON from another process is ever adopted.
         static Icon GetAppIcon(IntPtr hwnd, string exe)
         {
             // prefer the window's own icons (exactly what the taskbar shows)
@@ -958,21 +1087,20 @@ namespace AppHopper
             {
                 var fi = new NativeMethods.SHFILEINFOW();
                 IntPtr r2 = NativeMethods.SHGetFileInfoW(exe, 0x80, ref fi, (uint)Marshal.SizeOf(typeof(NativeMethods.SHFILEINFOW)), NativeMethods.SHGFI_ICON | NativeMethods.SHGFI_LARGEICON | NativeMethods.SHGFI_USEFILEATTRIBUTES);
-                // the shell allocates this one for us, so adopting it (and
-                // disposing it later) is exactly right
-                if (r2 != IntPtr.Zero && fi.hIcon != IntPtr.Zero) return Icon.FromHandle(fi.hIcon);
+                if (r2 != IntPtr.Zero && fi.hIcon != IntPtr.Zero)
+                {
+                    IntPtr shellIcon = fi.hIcon;
+                    try { return (Icon)Icon.FromHandle(shellIcon).Clone(); }
+                    finally { NativeMethods.DestroyIcon(shellIcon); }
+                }
             }
             catch { }
             return (Icon)SystemIcons.Application.Clone();
         }
 
-        // Icons are cached per executable for the lifetime of the process.
-        // Fetching one costs up to two WM_GETICON round-trips into another
-        // process (100 ms timeout each), which is by far the slowest part of
-        // opening a cycle - and a rapid Alt+Tab back and forth re-opens one
-        // every time. The cache turns every cycle after the first into a
-        // dictionary lookup. Entries are owned by the cache, NEVER disposed
-        // by a session.
+        // Icons are cached per executable to avoid repeated WM_GETICON
+        // round-trips during rapid cycles. The cache owns every managed Icon
+        // and releases them during normal shutdown.
         static Dictionary<string, Icon> _iconCache = new Dictionary<string, Icon>(StringComparer.OrdinalIgnoreCase);
 
         static Icon CachedIcon(string exe, IntPtr hwnd)
@@ -984,9 +1112,15 @@ namespace AppHopper
             _iconCache[exe] = ic;
             return ic;
         }
+        static void DisposeIconCache()
+        {
+            foreach (var pair in _iconCache)
+                if (pair.Value != null) pair.Value.Dispose();
+            _iconCache.Clear();
+        }
 
         // ================= state machine =================
-        static void HandleAppMsg(int msg, IntPtr wparam)
+        static void HandleAppMsg(int msg, IntPtr wparam, IntPtr lparam)
         {
             switch (msg)
             {
@@ -999,14 +1133,28 @@ namespace AppHopper
                     // hotkey pressed in that window would otherwise start a
                     // new session that the in-flight Commit's EndSession()
                     // then tears right down.
-                    if (!_session && !_committing) { Log("hotkey: alt+tab -> start"); StartSession(); }
+                    bool started = false;
+                    if (!_session && !_committing) { Log("hotkey: alt+tab -> start"); started = StartSession(); }
+                    if (!started && !_session && !_committing && AltDown()) ReplayTabToSystem();
                     if (_session && !AltDown()) Commit();  // quick tap: Alt already released
                     break;
                 case NativeMethods.WM_APP_NEXT: if (_session) MoveIndex(1); break;
                 case NativeMethods.WM_APP_PREV: if (_session) MoveIndex(-1); break;
                 case NativeMethods.WM_APP_COMMIT: if (_session) { Log("hotkey: alt up -> commit"); Commit(); } break;
                 case NativeMethods.WM_APP_CANCEL: if (_session) Cancel(); break;
-                case NativeMethods.WM_APP_COMMITAT: if (_session) { _index = (int)wparam; RenderChrome(); Commit(); } break;
+                case NativeMethods.WM_APP_COMMITAT:
+                    if (!_session) break;
+                    int clickedIndex = (int)wparam;
+                    int clickedGeneration = (int)lparam;
+                    if (clickedGeneration != _sessionGeneration || clickedIndex < 0 || clickedIndex >= _apps.Count)
+                    {
+                        Log("click ignored: stale index=" + clickedIndex + " generation=" + clickedGeneration);
+                        break;
+                    }
+                    _index = clickedIndex;
+                    RenderChrome();
+                    Commit();
+                    break;
             }
         }
 
@@ -1046,9 +1194,9 @@ namespace AppHopper
                 string why = AltTabIneligibilityReason(hwnd);
                 if (why != null)
                 {
-                    if (_log != null)
+                    if (_verboseLog)
                         Log("  skip 0x" + hwnd.ToInt64().ToString("X") + " [" + ClassNameOf(hwnd)
-                            + "] \"" + GetWindowTitle(hwnd) + "\" - " + why);
+                            + "] \"" + LogText(GetWindowTitle(hwnd)) + "\" - " + why);
                     return true;
                 }
                 // The predicate already vetted that an exe resolves; re-resolve
@@ -1056,12 +1204,13 @@ namespace AppHopper
                 string exe = WindowExe(hwnd);
                 int ex = NativeMethods.GetWindowLong(hwnd, NativeMethods.GWL_EXSTYLE);
                 // WS_EX_APPWINDOW is how a window asks the shell for a taskbar
-                // / switcher entry of its own (Explorer folder Properties, Save
-                // As and Preferences dialogs, extra document windows, ...).
-                // Windows' own Alt+Tab lists those separately, and so do we:
-                // keying them per window keeps them reachable instead of being
-                // swallowed by the single entry of their exe - an Explorer
-                // Properties dialog could otherwise never be switched to.
+                // / switcher entry of its own (extra document windows, apps
+                // that style their main window this way - Electron, Avalonia).
+                // Windows' own Alt+Tab lists those separately, and so do we.
+                // Owned popups never reach this point - the predicate folds
+                // them into their root's entry ("owned-popup") - so an APPW
+                // flag on a dialog can no longer split it off from its own
+                // application (the ChatGPT folder-picker bug).
                 bool ownEntry = (ex & NativeMethods.WS_EX_APPWINDOW) != 0;
                 string key = ownEntry ? exe + "|" + hwnd.ToInt64().ToString("X") : exe;
                 AppEntry e;
@@ -1086,25 +1235,26 @@ namespace AppHopper
                     e.Title = t.ToString();
                     byExe[key] = e;
                     order.Add(e);
-                    if (ownEntry && _log != null)
+                    if (ownEntry && _verboseLog)
                         Log("  own entry (WS_EX_APPWINDOW) 0x" + hwnd.ToInt64().ToString("X")
-                            + " \"" + e.Title + "\"");
+                            + " \"" + LogText(e.Title) + "\"");
                 }
                 return true;
             }, IntPtr.Zero);
             return order;
         }
 
-        static void StartSession()
+        static bool StartSession()
         {
+            unchecked { _sessionGeneration++; }
             IntPtr fgRaw = NativeMethods.GetForegroundWindow();
-            if (fgRaw == IntPtr.Zero) { Log("start aborted: no foreground window"); return; }
+            if (fgRaw == IntPtr.Zero) { Log("start aborted: no foreground window"); return false; }
             string fgExe = WindowExe(fgRaw);
             if (fgExe == null)
             {
                 Log("start aborted: no exe for fg 0x" + fgRaw.ToInt64().ToString("X")
-                    + " [" + ClassNameOf(fgRaw) + "] \"" + GetWindowTitle(fgRaw) + "\"");
-                return;
+                    + " [" + ClassNameOf(fgRaw) + "] \"" + LogText(GetWindowTitle(fgRaw)) + "\"");
+                return false;
             }
             // Normalise the foreground window onto the one that represents it in
             // the cycle: a UWP app reports its CoreWindow (which the cycle
@@ -1112,16 +1262,22 @@ namespace AppHopper
             // its owned popup. Matching on the raw handle alone fails in both.
             IntPtr fg = RepresentativeOf(fgRaw);
             if (fg == IntPtr.Zero || !NativeMethods.IsWindowVisible(fg)) fg = fgRaw;
+            // Entries are rooted (owned popups never enumerate), so pin
+            // against the chain ROOT: opening the cycle from a modal popup
+            // (ChatGPT's folder picker) must select the app's entry, not
+            // fall through to "nothing matched".
+            IntPtr fgRoot = OwnerChainRoot(fg);
+            if (fgRoot != fg && NativeMethods.IsWindowVisible(fgRoot)) fg = fgRoot;
             _fgHwnd = fg;
             Log("fg 0x" + fgRaw.ToInt64().ToString("X") + " [" + ClassNameOf(fgRaw) + "] \""
-                + GetWindowTitle(fgRaw) + "\" -> repr 0x" + fg.ToInt64().ToString("X")
-                + " exe=" + Path.GetFileName(fgExe));
+                + LogText(GetWindowTitle(fgRaw)) + "\" -> repr 0x" + fg.ToInt64().ToString("X")
+                + " exe=" + LogText(Path.GetFileName(fgExe)));
 
             var order = EnumerateEntries();
             if (order.Count < 2)
             {
                 Log("start aborted: only " + order.Count + " app(s) in cycle");
-                return;
+                return false;
             }
 
             NativeMethods.RECT work;
@@ -1165,23 +1321,29 @@ namespace AppHopper
             _pageStart = 0;
             Log("fgPinned=" + fgPinned + " index=" + _index);
 
-            var sb2 = new StringBuilder("order:");
-            foreach (var e in _apps)
-                sb2.Append(' ').Append(System.IO.Path.GetFileNameWithoutExtension(e.Exe))
-                   .Append('@').Append(e.Rank).Append(e.Topmost ? "*" : "");
-            Log(sb2.ToString());
+            if (_verboseLog)
+            {
+                var sb2 = new StringBuilder("order:");
+                foreach (var e in _apps)
+                    sb2.Append(' ').Append(Path.GetFileNameWithoutExtension(e.Exe))
+                       .Append('@').Append(e.Rank).Append(e.Topmost ? "*" : "");
+                Log(sb2.ToString());
+            }
+            else Log("order: " + _apps.Count + " apps");
 
             foreach (var e in _apps) e.Icon = CachedIcon(e.Exe, e.ReprHwnd);
 
             ShowPanel();
             RegisterThumbnails();
             RenderChrome();
-            InstallMouseHook();
+            if (!InstallMouseHook())
+                Log("session: mouse hook unavailable; keyboard controls remain active");
             if (_refreshTimer != null) _refreshTimer.Start();
 
             _session = true;
             Log("session start, apps=" + _apps.Count + " scale=" + _scale.ToString("0.##")
                 + " panel=" + _layout.panelW + "x" + _layout.panelH + " tile=" + _layout.tileW + "x" + _layout.tileH);
+            return true;
         }
 
         static void ShowPanel()
@@ -1288,7 +1450,16 @@ namespace AppHopper
                     fVisible = true,
                     fSourceClientAreaOnly = clientOnly
                 };
-                NativeMethods.DwmUpdateThumbnailProperties(tid, ref props);
+                int updateHr = NativeMethods.DwmUpdateThumbnailProperties(tid, ref props);
+                if (updateHr != 0)
+                {
+                    Log("  thumb: DwmUpdateThumbnailProperties failed for 0x"
+                        + app.ReprHwnd.ToInt64().ToString("X") + " hr=0x"
+                        + unchecked((uint)updateHr).ToString("X8"));
+                    NativeMethods.DwmUnregisterThumbnail(tid);
+                    _thumbs.RemoveAt(_thumbs.Count - 1);
+                    app.Thumb = IntPtr.Zero;
+                }
             }
         }
 
@@ -1325,6 +1496,12 @@ namespace AppHopper
             if (_committing) { Log("commit swallowed: reentrant"); return; }
             if (!_session) return;
             if (_apps.Count == 0) { Cancel(); return; }
+            if (_index < 0 || _index >= _apps.Count)
+            {
+                Log("commit aborted: invalid index=" + _index + " apps=" + _apps.Count);
+                Cancel();
+                return;
+            }
             // Disarm every session-scoped trigger BEFORE doing any work: from
             // here on the watchdog and every queued WM_APP_* message no-ops on
             // the !_session check, so no nested trigger (pumped in via
@@ -1373,7 +1550,7 @@ namespace AppHopper
                 }
                 EndSession();
                 IntPtr now = NativeMethods.GetForegroundWindow();
-                Log("commit -> 0x" + target.ToInt64().ToString("X") + " " + Path.GetFileName(targetExe)
+                Log("commit -> 0x" + target.ToInt64().ToString("X") + " " + LogText(Path.GetFileName(targetExe))
                     + " sfw=" + (ok ? "ok" : "FAILED")
                     + " fgNow=0x" + now.ToInt64().ToString("X") + " [" + ClassNameOf(now) + "]");
             }
@@ -1448,8 +1625,8 @@ namespace AppHopper
 
         static void EndSession()
         {
-            // Reentrancy guard first: the watchdog timer must not re-enter
-            // Commit/Cancel while we tear down.
+            // Mark the session inactive before tearing down hooks and windows;
+            // queued messages then no-op while the cleanup runs.
             _session = false;
             if (_refreshTimer != null) _refreshTimer.Stop();
             UninstallMouseHook();
@@ -1468,7 +1645,6 @@ namespace AppHopper
         // refresh finds there is nothing left to switch to.
         static void AbortSession()
         {
-            _session = false;
             EndSession();
             Log("session aborted: no windows left");
         }
@@ -1486,9 +1662,9 @@ namespace AppHopper
             for (int i = 0; i < _apps.Count; i++)
             {
                 IntPtr h = _apps[i].ReprHwnd;
-                if (!NativeMethods.IsWindow(h) || !NativeMethods.IsWindowVisible(h) || IsCloaked(h))
+                if (!NativeMethods.IsWindow(h) || !NativeMethods.IsWindowVisible(h) || IsCloaked(h) || IsAlphaInvisible(h))
                 {
-                    Log("refresh: entry \"" + _apps[i].Title + "\" is gone");
+                    Log("refresh: entry \"" + LogText(_apps[i].Title) + "\" is gone");
                     RefreshEntries();
                     return;
                 }
@@ -1500,8 +1676,8 @@ namespace AppHopper
             if (_committing) return;
             var fresh = EnumerateEntries();
             if (fresh.Count == 0) { AbortSession(); return; }
+            unchecked { _sessionGeneration++; }
 
-            int oldIndex = _index >= 0 && _index < _apps.Count ? _index : 0;
             string selKey = _index >= 0 && _index < _apps.Count ? _apps[_index].Key : null;
 
             // Surviving entries keep their slot: match the fresh snapshot
@@ -1549,36 +1725,24 @@ namespace AppHopper
                 + " rows=" + _layout.rows + " cols=" + _layout.cols);
         }
 
-        // Hand the foreground to hwnd.
+        // Hand the foreground to hwnd without injecting a synthetic key into
+        // the target application.
         //
-        // Windows grants SetForegroundWindow only to a process with an input
-        // claim - the foreground process, or the one that received the last
-        // input event. Against a UWP app (any ApplicationFrameWindow pair)
-        // two things go wrong at once: the lock is held by the CoreWindow's
-        // own app thread, which may be SUSPENDED and therefore cannot help
-        // even via AttachThreadInput; and SetForegroundWindow lies about it,
-        // reporting success while the frame keeps the foreground (the
-        // "To Do stays in front" bug). So the handoff is driven three ways:
+        // The fast path is a normal BringWindowToTop/SetForegroundWindow pair.
+        // If the foreground lock rejects it, the slow path attaches this
+        // thread to the raw foreground thread (or the target thread while the
+        // system is between foreground owners), then retries through the same
+        // APIs used by the shell task switcher.
         //
-        //   1. AttachThreadInput to whoever owns the foreground RIGHT NOW
-        //      (raw handle - NOT _fgHwnd, which was normalised onto the
-        //      frame whose thread owns nothing). If the foreground happens
-        //      to be one of our own windows the thread is ours and the
-        //      fgThread != myThread check skips the attach by itself.
-        //   2. StakeInputClaim before every attempt: injecting an F24 makes
-        //      us the last-input process, which satisfies SetForegroundWindow
-        //      all by itself and needs no cooperation from the frozen thread.
-        //   3. SwitchToThisWindow as the escalation, the entry point the
-        //      task switcher itself uses.
+        // ForegroundIs: true when the foreground really is hwnd. Either half
+        // of the UWP CoreWindow<->frame pair may be reported as foreground,
+        // so compare through RepresentativeOf on both sides.
         //
         // BringWindowToTop/SetFocus are kept on purpose: BringWindowToTop
         // itself pumps messages (dropping it is what broke plain switching in
         // the previous attempt), and SetFocus finishes the keyboard handoff
         // once the window is already in the foreground.
         //
-        // ForegroundIs: true when the foreground really is hwnd. Either half
-        // of the UWP CoreWindow<->frame pair may be reported as foreground,
-        // so compare through RepresentativeOf on both sides.
         static bool ForegroundIs(IntPtr hwnd)
         {
             IntPtr now = NativeMethods.GetForegroundWindow();
@@ -1598,33 +1762,16 @@ namespace AppHopper
             return pid != 0 && pid == (uint)Process.GetCurrentProcess().Id;
         }
 
-        // Press and release F24. The keystroke is delivered to whatever has
-        // focus and does nothing there, but it credits US with the last
-        // input event - the condition SetForegroundWindow actually checks.
-        static void StakeInputClaim()
-        {
-            NativeMethods.keybd_event(NativeMethods.VK_F24, 0, 0, UIntPtr.Zero);
-            NativeMethods.keybd_event(NativeMethods.VK_F24, 0, NativeMethods.KEYEVENTF_KEYUP, UIntPtr.Zero);
-        }
-
         static bool ForceForeground(IntPtr hwnd)
         {
             if (!NativeMethods.IsWindow(hwnd)) return false;
             if (NativeMethods.IsIconic(hwnd)) NativeMethods.ShowWindow(hwnd, NativeMethods.SW_RESTORE);
 
-            // ---- fast path: no cross-thread call, no attach ----
-            // BringWindowToTop (it also pumps the queue - dropping it is what
-            // broke plain switching before), stake the input claim with F24,
-            // then SetForegroundWindow. Staking the claim is what authorises
-            // us, so AttachThreadInput is NOT needed here - and it is a
-            // synchronous cross-thread call that blocks until the *other*
-            // thread processes it. Explorer's window thread is exactly the
-            // kind that can be busy for hundreds of milliseconds, which is
-            // what left the overlay hanging on screen after Alt+Tab (and made
-            // rapid back-and-forth switching feel sticky).
+            // ---- fast path: normal foreground handoff ----
+            // BringWindowToTop also pumps the queue; keep that behavior because
+            // it lets the target receive the activation transition promptly.
             NativeMethods.BringWindowToTop(hwnd);
             Application.DoEvents();
-            StakeInputClaim();
             NativeMethods.SetForegroundWindow(hwnd);
             Application.DoEvents();
             if (ForegroundIs(hwnd))
@@ -1644,12 +1791,9 @@ namespace AppHopper
             IntPtr fgRaw = NativeMethods.GetForegroundWindow();
             uint fgThread = fgRaw != IntPtr.Zero ? NativeMethods.GetWindowThreadProcessId(fgRaw, IntPtr.Zero) : 0;
             uint myThread = NativeMethods.GetCurrentThreadId();
-            // Mid-transition the foreground is 0 and there is no current owner
-            // to attach to - attach the TARGET's thread instead (the classic
-            // taskbar recipe). Skipping the attach entirely is what left the
-            // game switch with no weapon at all: the 2026-09-10 log shows the
-            // old code ran all three attempts against LoL without ever
-            // calling AttachThreadInput.
+            // Mid-transition the foreground can be 0 and there is no current
+            // owner to attach to. In that case attach to the target thread,
+            // matching the classic taskbar activation recipe.
             if (fgThread == 0) fgThread = NativeMethods.GetWindowThreadProcessId(hwnd, IntPtr.Zero);
             bool attached = fgThread != 0 && fgThread != myThread && NativeMethods.AttachThreadInput(myThread, fgThread, true);
             try
@@ -1664,7 +1808,6 @@ namespace AppHopper
                 var sw = Stopwatch.StartNew();
                 for (int i = 0; i < 8 && !ForegroundIs(hwnd) && sw.ElapsedMilliseconds < 200; i++)
                 {
-                    StakeInputClaim();
                     NativeMethods.SetForegroundWindow(hwnd);
                     Application.DoEvents();
                     if (ForegroundIs(hwnd)) { how = "sfw#" + (i + 1); break; }
@@ -1684,7 +1827,7 @@ namespace AppHopper
                 IntPtr stuck = NativeMethods.GetForegroundWindow();
                 Log("  force-fg 0x" + hwnd.ToInt64().ToString("X") + " FAILED, fg stuck at 0x"
                     + stuck.ToInt64().ToString("X") + " [" + ClassNameOf(stuck) + "] \""
-                    + GetWindowTitle(stuck) + "\" after " + sw.ElapsedMilliseconds + "ms");
+                    + LogText(GetWindowTitle(stuck)) + "\" after " + sw.ElapsedMilliseconds + "ms");
                 return false;
             }
             catch { return false; }
@@ -1875,7 +2018,8 @@ namespace AppHopper
         // ================= keyboard hook =================
         static bool AltDown()
         {
-            return (NativeMethods.GetAsyncKeyState(NativeMethods.VK_LMENU) & 0x8000) != 0
+            return _altHookDown
+                || (NativeMethods.GetAsyncKeyState(NativeMethods.VK_LMENU) & 0x8000) != 0
                 || (NativeMethods.GetAsyncKeyState(NativeMethods.VK_RMENU) & 0x8000) != 0
                 || (NativeMethods.GetAsyncKeyState(NativeMethods.VK_MENU) & 0x8000) != 0;
         }
@@ -1886,14 +2030,33 @@ namespace AppHopper
                 || (NativeMethods.GetAsyncKeyState(NativeMethods.VK_RWIN) & 0x8000) != 0;
         }
 
+        static void ReplayTabToSystem()
+        {
+            if (!AltDown() || WinDown()) return;
+            Log("alt+tab fallback: replaying native tab");
+            _replayingTab = true;
+            try
+            {
+                UIntPtr tag = new UIntPtr((uint)ReplayInputTag);
+                NativeMethods.keybd_event((byte)NativeMethods.VK_TAB, 0, 0, tag);
+                NativeMethods.keybd_event((byte)NativeMethods.VK_TAB, 0, NativeMethods.KEYEVENTF_KEYUP, tag);
+            }
+            finally { _replayingTab = false; }
+        }
+
         static IntPtr KbHookProc(int nCode, IntPtr wParam, IntPtr lParam)
         {
-            if (nCode >= 0 && _enabled)
+            if (nCode >= 0)
             {
                 var s = (NativeMethods.KBDLLHOOKSTRUCT)Marshal.PtrToStructure(lParam, typeof(NativeMethods.KBDLLHOOKSTRUCT));
                 bool up = (s.flags & NativeMethods.LLKHF_UP) != 0;
+                if (s.vkCode == NativeMethods.VK_MENU || s.vkCode == NativeMethods.VK_LMENU || s.vkCode == NativeMethods.VK_RMENU)
+                    _altHookDown = !up;
 
-                if (s.vkCode == NativeMethods.VK_TAB && !up && AltDown() && !WinDown())
+                if (_enabled && s.vkCode == NativeMethods.VK_TAB && !up
+                    && (AltDown() || (s.flags & NativeMethods.LLKHF_ALTDOWN) != 0) && !WinDown()
+                    && !_replayingTab
+                    && !((s.flags & NativeMethods.LLKHF_INJECTED) != 0 && s.dwExtraInfo == (IntPtr)ReplayInputTag))
                 {
                     // Nothing in this callback may do real work (file I/O in
                     // particular): a low-level hook that exceeds
@@ -1902,16 +2065,23 @@ namespace AppHopper
                     // when the posted message is handled on the UI thread
                     // (see HandleAppMsg), which also proves the whole
                     // hook -> post -> dispatch chain, not just the hook.
-                    if (!_session) Post(NativeMethods.WM_APP_START);
-                    else Post((NativeMethods.GetAsyncKeyState(NativeMethods.VK_SHIFT) & 0x8000) != 0 ? NativeMethods.WM_APP_PREV : NativeMethods.WM_APP_NEXT);
-                    return (IntPtr)1;
+                    bool posted = !_session
+                        ? Post(NativeMethods.WM_APP_START)
+                        : Post((NativeMethods.GetAsyncKeyState(NativeMethods.VK_SHIFT) & 0x8000) != 0
+                            ? NativeMethods.WM_APP_PREV : NativeMethods.WM_APP_NEXT);
+                    if (posted) return (IntPtr)1;
+                    return NativeMethods.CallNextHookEx(_hook, nCode, wParam, lParam);
                 }
-                if (_session && s.vkCode == NativeMethods.VK_ESCAPE)
+                if (_enabled && _session && s.vkCode == NativeMethods.VK_ESCAPE)
                 {
-                    if (up) Post(NativeMethods.WM_APP_CANCEL);
+                    if (up)
+                    {
+                        if (Post(NativeMethods.WM_APP_CANCEL)) return (IntPtr)1;
+                        return NativeMethods.CallNextHookEx(_hook, nCode, wParam, lParam);
+                    }
                     return (IntPtr)1;
                 }
-                if (_session && (s.vkCode == NativeMethods.VK_MENU || s.vkCode == NativeMethods.VK_LMENU || s.vkCode == NativeMethods.VK_RMENU) && up)
+                if (_enabled && _session && (s.vkCode == NativeMethods.VK_MENU || s.vkCode == NativeMethods.VK_LMENU || s.vkCode == NativeMethods.VK_RMENU) && up)
                 {
                     Post(NativeMethods.WM_APP_COMMIT);   // let the Alt release through
                 }
@@ -1935,19 +2105,21 @@ namespace AppHopper
                         int slot = SlotAtPhysical(s.pt.X, s.pt.Y);
                         if (slot >= 0)
                         {
-                            PostAt(NativeMethods.WM_APP_COMMITAT, _pageStart + slot);
-                            return (IntPtr)1;
+                            if (PostAt(NativeMethods.WM_APP_COMMITAT, _pageStart + slot, _sessionGeneration))
+                                return (IntPtr)1;
+                            return NativeMethods.CallNextHookEx(_mouseHook, nCode, wParam, lParam);
                         }
                         return IntPtr.Zero;   // panel background: ignore
                     }
-                    Post(NativeMethods.WM_APP_CANCEL);
-                    return (IntPtr)1;         // swallow outside clicks
+                    if (Post(NativeMethods.WM_APP_CANCEL)) return (IntPtr)1;
+                    return NativeMethods.CallNextHookEx(_mouseHook, nCode, wParam, lParam);
                 }
                 if (msg == NativeMethods.WM_MOUSEWHEEL)
                 {
                     short delta = (short)((s.mouseData >> 16) & 0xFFFF);
-                    Post(delta > 0 ? NativeMethods.WM_APP_PREV : NativeMethods.WM_APP_NEXT);
-                    return (IntPtr)1;
+                    if (Post(delta > 0 ? NativeMethods.WM_APP_PREV : NativeMethods.WM_APP_NEXT))
+                        return (IntPtr)1;
+                    return NativeMethods.CallNextHookEx(_mouseHook, nCode, wParam, lParam);
                 }
             }
             return NativeMethods.CallNextHookEx(_mouseHook, nCode, wParam, lParam);
@@ -1967,11 +2139,55 @@ namespace AppHopper
             };
         }
 
-        static void InstallMouseHook()
+        static bool InstallKeyboardHook()
+        {
+            if (_hook != IntPtr.Zero) return true;
+            try
+            {
+                // The hook procedure lives in this executable. Passing the
+                // current module handle avoids ProcessModule.ModuleName
+                // resolution failures on localized or renamed binaries.
+                _hook = NativeMethods.SetWindowsHookEx(
+                    NativeMethods.WH_KEYBOARD_LL, _hookProc,
+                    NativeMethods.GetModuleHandle(null), 0);
+            }
+            catch { _hook = IntPtr.Zero; }
+            if (_hook == IntPtr.Zero)
+            {
+                Log("keyboard hook install failed err=" + Marshal.GetLastWin32Error());
+                return false;
+            }
+            Log("keyboard hook installed");
+            return true;
+        }
+        static void UninstallKeyboardHook()
+        {
+            if (_hook != IntPtr.Zero)
+            {
+                NativeMethods.UnhookWindowsHookEx(_hook);
+                _hook = IntPtr.Zero;
+            }
+        }
+
+        static bool InstallMouseHook()
         {
             UpdatePanelRect();
             if (_mouseHook == IntPtr.Zero)
-                _mouseHook = NativeMethods.SetWindowsHookEx(NativeMethods.WH_MOUSE_LL, _mouseHookProc, NativeMethods.GetModuleHandle(null), 0);
+            {
+                try
+                {
+                    _mouseHook = NativeMethods.SetWindowsHookEx(
+                        NativeMethods.WH_MOUSE_LL, _mouseHookProc,
+                        NativeMethods.GetModuleHandle(null), 0);
+                }
+                catch { _mouseHook = IntPtr.Zero; }
+            }
+            if (_mouseHook == IntPtr.Zero)
+            {
+                Log("mouse hook install failed err=" + Marshal.GetLastWin32Error());
+                return false;
+            }
+            return true;
         }
 
         static void UninstallMouseHook()
@@ -1992,20 +2208,29 @@ namespace AppHopper
         }
 
         // ================= infra =================
-        static void SetStartup(bool add)
+        static bool IsProtectedInstallPath()
         {
             try
             {
-                using (var key = Microsoft.Win32.Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Run", true))
+                string dir = Path.GetDirectoryName(Path.GetFullPath(Application.ExecutablePath));
+                string[] roots =
                 {
-                    if (add) key.SetValue("AppHopper", "\"" + Application.ExecutablePath + "\"");
-                    else if (key.GetValue("AppHopper") != null) key.DeleteValue("AppHopper");
+                    Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles),
+                    Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86)
+                };
+                foreach (string root in roots)
+                {
+                    if (string.IsNullOrEmpty(root)) continue;
+                    string normalizedRoot = Path.GetFullPath(root).TrimEnd('\\') + "\\";
+                    string normalizedDir = dir.TrimEnd('\\') + "\\";
+                    if (normalizedDir.StartsWith(normalizedRoot, StringComparison.OrdinalIgnoreCase)) return true;
                 }
             }
             catch { }
+            return false;
         }
 
-        static bool StartupEnabled()
+        static bool StartupEntryPresent()
         {
             try
             {
@@ -2015,23 +2240,92 @@ namespace AppHopper
             catch { return false; }
         }
 
+        static bool SetStartup(bool add)
+        {
+            try
+            {
+                if (add && !IsProtectedInstallPath())
+                {
+                    Log("startup refused: executable is not under a protected install directory");
+                    return false;
+                }
+                using (var key = Microsoft.Win32.Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Run", true))
+                {
+                    if (key == null) return false;
+                    if (add) key.SetValue("AppHopper", "\"" + Application.ExecutablePath + "\"");
+                    else if (key.GetValue("AppHopper") != null) key.DeleteValue("AppHopper");
+                    return true;
+                }
+            }
+            catch { return false; }
+        }
+
+        static bool StartupEnabled()
+        {
+            return IsProtectedInstallPath() && StartupEntryPresent();
+        }
+
+
+        static bool RunSelfTests()
+        {
+            try
+            {
+                NativeMethods.RECT work = new NativeMethods.RECT { Left = 0, Top = 0, Right = 1920, Bottom = 1080 };
+                Logic.OverlayLayout layout = new Logic.OverlayLayout();
+                Logic.ComputeLayout(work, 2, 1.0, ref layout);
+                if (layout.pageSize != 2 || layout.cols != 2 || layout.rows != 1) return false;
+
+                Logic.ComputeLayout(work, 7, 1.0, ref layout);
+                if (layout.pageSize != 7 || layout.cols != 6 || layout.rows != 2 || layout.rowCount[1] != 1) return false;
+                if (Logic.PageStartFor(-1, 7, 6) != 0 || Logic.PageStartFor(5, 7, 6) != 0
+                    || Logic.PageStartFor(6, 7, 6) != 6 || Logic.PageStartFor(8, 7, 6) != 6) return false;
+
+                NativeMethods.RECT crop = Logic.CoverSource(
+                    new NativeMethods.RECT { Left = 0, Top = 0, Right = 160, Bottom = 90 },
+                    new NativeMethods.RECT { Left = 0, Top = 0, Right = 400, Bottom = 300 });
+                if ((crop.Right - crop.Left) * 90 != (crop.Bottom - crop.Top) * 160) return false;
+
+                AppEntry pinned = new AppEntry { ReprHwnd = new IntPtr(1), Rank = 20, Topmost = false };
+                AppEntry topmost = new AppEntry { ReprHwnd = new IntPtr(2), Rank = 1, Topmost = true };
+                if (Logic.AppSortKey(pinned, new IntPtr(1)) != -1) return false;
+                if (Logic.AppSortKey(topmost, IntPtr.Zero) <= Logic.AppSortKey(pinned, IntPtr.Zero)) return false;
+                return true;
+            }
+            catch { return false; }
+        }
+
         [STAThread]
         static void Main(string[] args)
         {
+            foreach (string a in args)
+                if (a == "--self-test")
+                {
+                    Environment.ExitCode = RunSelfTests() ? 0 : 1;
+                    return;
+                }
             bool created;
             _mutex = new Mutex(true, "Local\\AppHopper", out created);
             if (!created) return;
 
+            bool logRequested = false;
             foreach (string a in args)
-                if (a == "--log")
+            {
+                if (a == "--log" || a == "--log-verbose") logRequested = true;
+                if (a == "--log-verbose") _verboseLog = true;
+            }
+            if (logRequested)
+            {
+                try
                 {
                     _log = new StreamWriter(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "apphopper.log"), false);
                     // First line of every log names the build, so a pasted log
                     // is self-identifying.
                     Log("AppHopper v" + AppVersion + " starting, pid " + Process.GetCurrentProcess().Id);
                 }
+                catch { _log = null; }
+            }
 
-            NativeMethods.SetProcessDPIAware();
+            // DPI awareness is declared by app.manifest (PerMonitorV2).
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
 
@@ -2048,19 +2342,41 @@ namespace AppHopper
             try { _vdm = (NativeMethods.IVirtualDesktopManager)new NativeMethods.VirtualDesktopManagerClass(); }
             catch { _vdm = null; }
 
-            _hookProc = KbHookProc;
-            _mouseHookProc = MouseHookProc;
-            using (var cur = Process.GetCurrentProcess())
-            using (var mod = cur.MainModule)
-                _hook = NativeMethods.SetWindowsHookEx(NativeMethods.WH_KEYBOARD_LL, _hookProc, NativeMethods.GetModuleHandle(mod.ModuleName), 0);
+            if (!InstallKeyboardHook()) _enabled = false;
+            NotifyIcon icon = null;
+            Func<string> trayText = delegate
+            {
+                if (_hook == IntPtr.Zero) return "AppHopper " + AppVersion + " - keyboard hook unavailable";
+                return "AppHopper " + AppVersion + (_enabled ? " - keyboard hook ok, enabled" : " - keyboard hook ok, disabled");
+            };
 
             var menu = new ContextMenu();
             var miToggle = new MenuItem("Enabled");
-            miToggle.Checked = true;
-            miToggle.Click += delegate { _enabled = !_enabled; miToggle.Checked = _enabled; };
+            miToggle.Checked = _enabled;
+            miToggle.Enabled = true;
+            miToggle.Click += delegate
+            {
+                if (_enabled)
+                    _enabled = false;
+                else if (InstallKeyboardHook())
+                    _enabled = true;
+                else
+                    MessageBox.Show("The keyboard hook is unavailable.", "AppHopper", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                miToggle.Checked = _enabled;
+                if (icon != null) icon.Text = trayText();
+            };
             var miStartup = new MenuItem("Start with Windows");
             miStartup.Checked = StartupEnabled();
-            miStartup.Click += delegate { bool add = !StartupEnabled(); SetStartup(add); miStartup.Checked = add; };
+            miStartup.Enabled = true;
+            miStartup.Click += delegate
+            {
+                bool remove = StartupEntryPresent();
+                if (!remove && !IsProtectedInstallPath())
+                    MessageBox.Show("Install AppHopper under Program Files before enabling startup.", "AppHopper", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                else
+                    SetStartup(!remove);
+                miStartup.Checked = StartupEnabled();
+            };
             var miExit = new MenuItem("Exit");
             miExit.Click += delegate { _exitRequested = true; };
             menu.MenuItems.Add(miToggle);
@@ -2068,10 +2384,10 @@ namespace AppHopper
             menu.MenuItems.Add(new MenuItem("-"));
             menu.MenuItems.Add(miExit);
 
-            var icon = new NotifyIcon();
+            icon = new NotifyIcon();
             _trayIcon = MakeTrayIcon();
             icon.Icon = _trayIcon;
-            icon.Text = "AppHopper " + AppVersion + " - one entry per app";
+            icon.Text = trayText();
             icon.ContextMenu = menu;
             icon.Visible = true;
 
@@ -2112,7 +2428,7 @@ namespace AppHopper
                 EndSession();
                 exitTimer.Stop();
                 icon.Visible = false;
-                if (_hook != IntPtr.Zero) NativeMethods.UnhookWindowsHookEx(_hook);
+                UninstallKeyboardHook();
                 Application.Exit();
             };
             exitTimer.Start();
@@ -2120,7 +2436,11 @@ namespace AppHopper
             Application.Run();
 
             EndSession();
+            UninstallKeyboardHook();
             icon.Visible = false;
+            icon.Dispose();
+            if (_trayIcon != null) { _trayIcon.Dispose(); _trayIcon = null; }
+            DisposeIconCache();
             if (_log != null) _log.Dispose();
         }
     }

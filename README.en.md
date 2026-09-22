@@ -20,7 +20,7 @@ No more "walking through" five Explorer windows to reach the browser: `Alt+Tab` 
 - **Live DWM thumbnails** — real-time composite previews (the same mechanism as taskbar peek), center-cropped to the card ratio so nothing is stretched.
 - **Full mouse support** — click a card to switch, click anywhere outside the panel to cancel, mouse wheel to cycle. (`Esc` also cancels.)
 - **Virtual-desktop aware** — only windows on the *current* desktop are listed (via the public `IVirtualDesktopManager`), and switching never yanks windows across desktops.
-- **Zero intrusion** — the switcher is pure floating UI. No window styles, visibility, owner or taskbar attributes are ever modified on any other window, so there are no side effects on the taskbar, virtual desktops or anything else — and nothing to clean up after a crash.
+- **Low intrusion** — the switcher is pure floating UI: it never changes another window's styles, visibility, ownership or taskbar attributes. If fewer than two candidate apps are available, it replays that one `Tab` to Windows' native switcher and leaves no cleanup state behind.
 - **Per-monitor, DPI-aware** — the panel is centered on the monitor of the foreground window, scaled by that monitor's DPI, capped at 6 columns with automatic paging.
 - **Single-file, zero-dependency** — one C# source that builds with the compiler already shipped in Windows. No installer, no runtime to install, green portable exe.
 
@@ -29,7 +29,7 @@ No more "walking through" five Explorer windows to reach the browser: `Alt+Tab` 
 1. **The easiest route: double-click `build.bat` in the repository** — it terminates any running instance and embeds `app.manifest` so the resulting exe requests administrator privileges on launch. If an elevated instance is already running, quit it from the tray first; the locked output file would break the build.
 2. Or run the compiler manually:
     ```bat
-    C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe -nologo -target:winexe -platform:anycpu -optimize+ ^
+    C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe -nologo -target:winexe -platform:anycpu -optimize+ -win32manifest:app.manifest ^
       -r:System.dll -r:System.Core.dll -r:System.Drawing.dll -r:System.Windows.Forms.dll ^
       -out:AppHopper.exe AppHopper.cs
     ```
@@ -48,11 +48,11 @@ Run `AppHopper.exe` — a tray icon appears (right-click: *Enabled*, *Start with
 | click a card | switch to that app immediately |
 | mouse wheel | cycle |
 
-Everything about the app list is computed on the fly each time the switcher opens; there is nothing to configure. Diagnostics: launch with `--log` to write `apphopper.log` next to the exe.
+Everything about the app list is computed on the fly each time the switcher opens; there is nothing to configure. Diagnostics: launch with `--log`; the log is capped at 8 MiB and redacts window titles and executable names by default. Use `--log-verbose` for full enumeration details. If the Windows switcher still appears, `hotkey: alt+tab -> start`, `start aborted:`, and `alt+tab fallback:` distinguish a hook miss from an abort and the intentional native fallback. `AppHopper.exe --self-test` (or double-click `self-test.bat`) runs the pure-logic regression checks and exits 0 on success. `Start with Windows` is allowed only when the executable is installed under a protected `Program Files` directory; because the program requires administrator rights, Windows may show UAC at logon.
 
 ## How it works (short version)
 
-- A low-level keyboard hook swallows only `Alt+Tab`/`Esc` while the overlay is up; everything else passes through untouched.
+- The low-level keyboard hook swallows `Alt+Tab`/`Esc` during a switcher session. If startup conditions are not met, it hands that one `Tab` back to Windows' native switcher; all other keys pass through untouched.
 - Top-level windows are enumerated in Z-order, filtered by the classic Alt-Tab eligibility rules plus a current-desktop check, then grouped by process image path (UWP windows are attributed to their hosted app via the child `Windows.UI.Core.CoreWindow`).
 - Live previews are `DwmRegisterThumbnail` composites rendered into an opaque rounded panel; the card chrome (headers, strokes, focus ring, page indicator) is drawn with GDI+ into a premultiplied-alpha DIB and composited with `UpdateLayeredWindow` — the same two-layer design as the PowerToys module it was ported from.
 - Activation uses the classic `AttachThreadInput` foreground handoff; minimized windows are restored first.
@@ -65,4 +65,4 @@ Everything about the app list is computed on the fly each time the switcher open
 
 ## License
 
-[MIT](LICENSE) © 2026 informalgit. PowerToys-derived UI code remains subject to the [MIT license of PowerToys](https://github.com/microsoft/PowerToys/blob/main/LICENSE).
+[MIT](LICENSE) © 2026 informalgit. PowerToys-derived UI code remains MIT-licensed; the complete third-party notice is in [THIRD_PARTY_NOTICES.txt](THIRD_PARTY_NOTICES.txt).
