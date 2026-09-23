@@ -28,9 +28,9 @@ using System.Windows.Forms;
 // "Properties -> Details") without any build.bat change. Bump once per
 // release - the tray tooltip and the startup log line read it back at
 // runtime via AppVersion, so this is the single place a version lives.
-[assembly: System.Reflection.AssemblyVersion("1.1.1.0")]
-[assembly: System.Reflection.AssemblyFileVersion("1.1.1.0")]
-[assembly: System.Reflection.AssemblyInformationalVersion("1.1.1")]
+[assembly: System.Reflection.AssemblyVersion("1.1.2.0")]
+[assembly: System.Reflection.AssemblyFileVersion("1.1.2.0")]
+[assembly: System.Reflection.AssemblyInformationalVersion("1.1.2")]
 
 namespace AppHopper
 {
@@ -251,6 +251,11 @@ namespace AppHopper
         public static extern bool EnumChildWindows(IntPtr hwndParent, EnumWindowsProc lpEnumFunc, IntPtr lParam);
         [DllImport("user32.dll")]
         public static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
+        // Needed to spot a fully transparent (opacity 0) layered window: such a
+        // window is visible and uncloaked, but there is nothing to show and no
+        // entry worth offering in the switcher.
+        [DllImport("user32.dll")]
+        public static extern bool GetLayeredWindowAttributes(IntPtr hwnd, out int crKey, out byte bAlpha, out int dwFlags);
         [DllImport("user32.dll")]
         public static extern bool GetClientRect(IntPtr hWnd, out RECT lpRect);
         [DllImport("user32.dll")]
@@ -790,16 +795,46 @@ namespace AppHopper
 
         // The CoreWindow is a child of the frame while the app runs. Once it
         // suspends the window tree is torn down and Windows keeps only a
-        // top-level CoreWindow carrying the same title, so match by title then.
+        // top-level CoreWindow carrying the same title. Title is only a
+        // last-resort key here: the candidate must belong to another process
+        // than ApplicationFrameHost and the match must be unique.
         static IntPtr UwpCoreWindowOf(IntPtr frame)
         {
-            IntPtr child = FindWindowByClass(frame, ClassCoreWindow);
+            uint hostPid;
+            NativeMethods.GetWindowThreadProcessId(frame, out hostPid);
+            IntPtr child = FindUniqueChildCoreWindow(frame, hostPid);
             if (child != IntPtr.Zero) return child;
-            return FindTopLevelCoreWindowByTitle(GetWindowTitle(frame));
+            return FindTopLevelCoreWindowByTitle(GetWindowTitle(frame), hostPid);
+        }
+
+        // The CoreWindow is hosted by a DIFFERENT process than the frame -
+        // ApplicationFrameHost is only the shell - so a child owned by the
+        // frame's own process is never it. Requiring the match to be unique
+        // keeps a stray helper window from being mistaken for the app.
+        // (Replaces a plain "first child of this class" lookup.)
+        static IntPtr FindUniqueChildCoreWindow(IntPtr frame, uint hostPid)
+        {
+            IntPtr found = IntPtr.Zero;
+            int count = 0;
+            NativeMethods.EnumChildWindows(frame, delegate(IntPtr h, IntPtr lp)
+            {
+                var sb = new StringBuilder(64);
+                NativeMethods.GetClassNameW(h, sb, sb.Capacity);
+                if (sb.ToString() != ClassCoreWindow) return true;
+                uint pid;
+                NativeMethods.GetWindowThreadProcessId(h, out pid);
+                if (pid == 0 || pid == hostPid) return true;
+                found = h;
+                count++;
+                return true;
+            }, IntPtr.Zero);
+            return count == 1 ? found : IntPtr.Zero;
         }
 
         // Reverse lookup: GetForegroundWindow() reports a UWP app's CoreWindow
         // just as often as its frame, and only the frame is in the cycle.
+        // The title match must be unique, or a frame that merely shares a
+        // title with an unrelated one would be picked.
         static IntPtr UwpFrameOf(IntPtr coreWindow)
         {
             IntPtr p = NativeMethods.GetParent(coreWindow);
@@ -807,13 +842,16 @@ namespace AppHopper
             string title = GetWindowTitle(coreWindow);
             if (string.IsNullOrEmpty(title)) return IntPtr.Zero;
             IntPtr found = IntPtr.Zero;
+            int count = 0;
             NativeMethods.EnumWindows(delegate(IntPtr h, IntPtr lp)
             {
                 if (ClassNameOf(h) != ClassAppFrame) return true;
-                if (GetWindowTitle(h) == title) { found = h; return false; }
+                if (GetWindowTitle(h) != title) return true;
+                found = h;
+                count++;
                 return true;
             }, IntPtr.Zero);
-            return found;
+            return count == 1 ? found : IntPtr.Zero;
         }
 
         const string ClassCoreWindow = "Windows.UI.Core.CoreWindow";
@@ -824,9 +862,29 @@ namespace AppHopper
         // until it stops changing or turns visible. Single implementation
         // shared by RepresentativeOf and the eligibility predicate - the
         // logic used to live in three drifting copies.
+        //
+        // The root is walked with GetWindow(GW_OWNER), NOT GetAncestor(
+        // GA_ROOTOWNER): measured on this machine, GA_ROOTOWNER stops at the
+        // window itself when the only link to the root is ownership - a
+        // file dialog reported itself as its own root, which silently disabled
+        // the entire walk and let the dialog pass as its own chain (showing up
+        // as a duplicate entry next to its own main window).
+        static IntPtr OwnerChainRoot(IntPtr hwnd)
+        {
+            IntPtr root = hwnd;
+            // Owner chains are acyclic; the cap is pure paranoia.
+            for (int hops = 0; hops < 32; hops++)
+            {
+                IntPtr o = NativeMethods.GetWindow(root, NativeMethods.GW_OWNER);
+                if (o == IntPtr.Zero) break;
+                root = o;
+            }
+            return root;
+        }
+
         static IntPtr OwnerChainRepresentative(IntPtr hwnd)
         {
-            IntPtr walk = NativeMethods.GetAncestor(hwnd, NativeMethods.GA_ROOTOWNER);
+            IntPtr walk = OwnerChainRoot(hwnd);
             for (; ; )
             {
                 IntPtr pop = NativeMethods.GetLastActivePopup(walk);
@@ -858,19 +916,29 @@ namespace AppHopper
             return t.ToString();
         }
 
-        static IntPtr FindTopLevelCoreWindowByTitle(string title)
+        // Title alone is a weak key, so the candidate must (a) not belong to
+        // the frame's own process (ApplicationFrameHost is only the shell) and
+        // (b) be the unique match; otherwise a frame that merely shares a title
+        // with something unrelated would be picked.
+        static IntPtr FindTopLevelCoreWindowByTitle(string title, uint excludedPid)
         {
             if (string.IsNullOrEmpty(title)) return IntPtr.Zero;
             IntPtr found = IntPtr.Zero;
+            int count = 0;
             NativeMethods.EnumWindows(delegate(IntPtr h, IntPtr lp)
             {
                 var cls = new StringBuilder(64);
                 NativeMethods.GetClassNameW(h, cls, 64);
                 if (cls.ToString() != ClassCoreWindow) return true;
-                if (GetWindowTitle(h) == title) { found = h; return false; }
+                if (GetWindowTitle(h) != title) return true;
+                uint pid;
+                NativeMethods.GetWindowThreadProcessId(h, out pid);
+                if (pid == 0 || pid == excludedPid) return true;
+                found = h;
+                count++;
                 return true;
             }, IntPtr.Zero);
-            return found;
+            return count == 1 ? found : IntPtr.Zero;
         }
 
         static bool IsCloaked(IntPtr hwnd)
@@ -879,13 +947,67 @@ namespace AppHopper
             return NativeMethods.DwmGetWindowAttribute(hwnd, 14 /*DWMWA_CLOAKED*/, out v, 4) == 0 && v != 0;
         }
 
+        // A layered window with alpha 0 is "visible" and uncloaked but shows
+        // nothing, so it must not take a slot in the cycle.
+        static bool IsAlphaInvisible(IntPtr hwnd)
+        {
+            int ex = NativeMethods.GetWindowLong(hwnd, NativeMethods.GWL_EXSTYLE);
+            if ((ex & NativeMethods.WS_EX_LAYERED) == 0) return false;
+            int crKey; byte alpha; int flags;
+            if (!NativeMethods.GetLayeredWindowAttributes(hwnd, out crKey, out alpha, out flags)) return false;
+            return alpha == 0;
+        }
+
         // The classic native Alt-Tab predicate (Raymond Chen / PowerToys
         // AltWindowCycle) plus this app's extra exclusions, as a SINGLE
         // predicate that reports why a top-level window is left out of the
-        // cycle (null = it participates). It used to exist in two drifting
-        // copies (AltTabEligible + the SkipReason diagnostic); the merged
-        // form serves both the filter and the log so they can never diverge.
+        // cycle (null = it participates). The merged form serves both the
+        // filter and the log so they can never diverge.
+        //
+        // This entry point is the owner-chain rule; every other check lives in
+        // AltTabIneligibleIgnoreChain below, which the root-presentable probe
+        // also calls.
         static string AltTabIneligibilityReason(IntPtr hwnd)
+        {
+            string why = AltTabIneligibleIgnoreChain(hwnd);
+            if (why != null) return why;
+
+            // Owner chains appear exactly once, represented by their ROOT
+            // window. An owned popup sits above its owner and is raised with
+            // it, and while a MODAL popup is up the root cannot take focus
+            // anyway - a separate popup entry would only trap the user. (A
+            // file dialog used to show up next to its own main window exactly
+            // like that: the main window carries WS_EX_APPWINDOW, so the dialog
+            // fell out of the exe grouping into an entry of its own.)
+            //
+            // Note the old form of this rule could never fire for a VISIBLE
+            // popup: OwnerChainRepresentative walks to GetLastActivePopup,
+            // which - by construction - returns that very popup, so the popup
+            // compared equal to its representative and passed.
+            //
+            // A popup may stand in for the chain only when the root itself is
+            // not presentable (hidden, cloaked, alpha-0, toolwindow, other
+            // desktop), which keeps "main window hidden while an owned dialog
+            // is visible" groups alive.
+            IntPtr root = OwnerChainRoot(hwnd);
+            if (root != hwnd)
+            {
+                if (AltTabIneligibleIgnoreChain(root) == null) return "owned-popup";
+                // Root cannot represent the chain: a visible popup is then the
+                // only presentable member left, so it stands in. No further
+                // check here - the walk in OwnerChainRepresentative always
+                // stops BEFORE a visible popup (it returns the root or an
+                // invisible one), so a "not-owner-rep" test on this path could
+                // never let a visible dialog through and would instead hide
+                // apps like "tray utility with a floating panel" entirely.
+            }
+            return null;
+        }
+
+        // Every eligibility check except the owner-chain rule. Shared by the
+        // full predicate and by the root-presentable probe above it, so the
+        // two can never drift apart.
+        static string AltTabIneligibleIgnoreChain(IntPtr hwnd)
         {
             if (!NativeMethods.IsWindowVisible(hwnd)) return "invisible";
 
@@ -905,10 +1027,10 @@ namespace AppHopper
             // activating one wakes it.
             if (IsCloaked(hwnd)) return "cloaked";
 
-            // Only the visible representative of its owner chain participates
-            // (this also catches groups whose main window is minimized while
-            // an owned dialog is still visible).
-            if (OwnerChainRepresentative(hwnd) != hwnd) return "not-owner-rep";
+            // Fully transparent (opacity 0) - see IsAlphaInvisible. Same
+            // user-visible effect as cloaked/invisible: nothing to show, no
+            // entry to offer.
+            if (IsAlphaInvisible(hwnd)) return "alpha-0";
 
             int ex = NativeMethods.GetWindowLong(hwnd, NativeMethods.GWL_EXSTYLE);
             if ((ex & NativeMethods.WS_EX_TOOLWINDOW) != 0 && (ex & NativeMethods.WS_EX_APPWINDOW) == 0) return "toolwindow";
@@ -2015,9 +2137,55 @@ namespace AppHopper
             catch { return false; }
         }
 
+        // Pure-logic regression checks, run by self-test.bat via
+        // "AppHopper.exe --self-test". No GUI, no hooks, no windows - safe to
+        // run at any time and with an instance already running.
+        //
+        // These guard the layout/paging/sort maths specifically, because that
+        // is the part that has actually regressed before: a rewrite of
+        // ComputeLayout dropped the "clamp the column count to the window
+        // count" step, so a 2-window list still drew a 6-column-wide panel.
+        // The first assertion below fails in exactly that case.
+        static bool RunSelfTests()
+        {
+            try
+            {
+                NativeMethods.RECT work = new NativeMethods.RECT { Left = 0, Top = 0, Right = 1920, Bottom = 1080 };
+                Logic.OverlayLayout layout = new Logic.OverlayLayout();
+                Logic.ComputeLayout(work, 2, 1.0, ref layout);
+                if (layout.pageSize != 2 || layout.cols != 2 || layout.rows != 1) return false;
+
+                Logic.ComputeLayout(work, 7, 1.0, ref layout);
+                if (layout.pageSize != 7 || layout.cols != 6 || layout.rows != 2 || layout.rowCount[1] != 1) return false;
+                if (Logic.PageStartFor(-1, 7, 6) != 0 || Logic.PageStartFor(5, 7, 6) != 0
+                    || Logic.PageStartFor(6, 7, 6) != 6 || Logic.PageStartFor(8, 7, 6) != 6) return false;
+
+                NativeMethods.RECT crop = Logic.CoverSource(
+                    new NativeMethods.RECT { Left = 0, Top = 0, Right = 160, Bottom = 90 },
+                    new NativeMethods.RECT { Left = 0, Top = 0, Right = 400, Bottom = 300 });
+                if ((crop.Right - crop.Left) * 90 != (crop.Bottom - crop.Top) * 160) return false;
+
+                AppEntry pinned = new AppEntry { ReprHwnd = new IntPtr(1), Rank = 20, Topmost = false };
+                AppEntry topmost = new AppEntry { ReprHwnd = new IntPtr(2), Rank = 1, Topmost = true };
+                if (Logic.AppSortKey(pinned, new IntPtr(1)) != -1) return false;
+                if (Logic.AppSortKey(topmost, IntPtr.Zero) <= Logic.AppSortKey(pinned, IntPtr.Zero)) return false;
+                return true;
+            }
+            catch { return false; }
+        }
+
         [STAThread]
         static void Main(string[] args)
         {
+            // Checked BEFORE the single-instance mutex, so a self-test still
+            // runs while the switcher is already up.
+            foreach (string a in args)
+                if (a == "--self-test")
+                {
+                    Environment.ExitCode = RunSelfTests() ? 0 : 1;
+                    return;
+                }
+
             bool created;
             _mutex = new Mutex(true, "Local\\AppHopper", out created);
             if (!created) return;
