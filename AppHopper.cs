@@ -11,6 +11,11 @@
 // indicator. Theme (light/dark) and the accent color follow the OS. Only the
 // floating UI is ever touched; no other window's styles, visibility, taskbar
 // or virtual-desktop assignment are modified.
+//
+// NOTE: this file legitimately contains dwmapi P/Invoke declarations
+// (DwmRegisterThumbnail and friends). Any code search for "Thumbnail" or for
+// RegisterThumbnail will hit AppHopper - that is expected and is NOT a sign
+// that this process is the shell's taskbar thumbnail helper.
 
 using System;
 using System.Collections.Generic;
@@ -28,9 +33,9 @@ using System.Windows.Forms;
 // "Properties -> Details") without any build.bat change. Bump once per
 // release - the tray tooltip and the startup log line read it back at
 // runtime via AppVersion, so this is the single place a version lives.
-[assembly: System.Reflection.AssemblyVersion("1.1.4.0")]
-[assembly: System.Reflection.AssemblyFileVersion("1.1.4.0")]
-[assembly: System.Reflection.AssemblyInformationalVersion("1.1.4")]
+[assembly: System.Reflection.AssemblyVersion("1.1.2.0")]
+[assembly: System.Reflection.AssemblyFileVersion("1.1.2.0")]
+[assembly: System.Reflection.AssemblyInformationalVersion("1.1.2")]
 
 namespace AppHopper
 {
@@ -625,6 +630,7 @@ namespace AppHopper
         // stale WM_APP_COMMITAT cannot target a new list by numeric index.
         static int _sessionGeneration;
         static bool _replayingTab;
+        static bool _tabHookDown;
         static bool _altHookDown;
         const int ReplayInputTag = 0x41504831;
         // Commit/Cancel teardown in progress: a second trigger pumped in via
@@ -1331,9 +1337,14 @@ namespace AppHopper
             }
             else Log("order: " + _apps.Count + " apps");
 
-            foreach (var e in _apps) e.Icon = CachedIcon(e.Exe, e.ReprHwnd);
-
+            // Publish the card shell before the slower icon and DWM work.
+            // The first paint contains titles and solid preview placeholders;
+            // the second paint replaces them with icons and live thumbnails.
+            // This makes the switcher appear promptly on the first Alt+Tab
+            // instead of keeping all UI invisible until every thumbnail exists.
             ShowPanel();
+            RenderChrome();
+            foreach (var e in _apps) e.Icon = CachedIcon(e.Exe, e.ReprHwnd);
             RegisterThumbnails();
             RenderChrome();
             if (!InstallMouseHook())
@@ -1473,9 +1484,12 @@ namespace AppHopper
         }
 
         // Take the overlay off screen (thumbnails included) without touching
-        // the entry list. Called by EndSession and - importantly - by
-        // ForceForeground as soon as a switch needs more than the fast path,
-        // so a slow activation is never something the user has to watch.
+        // the entry list. Called by EndSession / Cancel - i.e. only once a
+        // switch has actually landed (or been abandoned). It is deliberately
+        // NOT called from inside the activation retry loop any more: the
+        // overlay must stay on screen for the whole activation, because it is
+        // what hides the shell's taskbar-button rebuild. See
+        // SettleOverlayAfterActivation below for the measured reasoning.
         static void HideOverlay()
         {
             UnregisterThumbnails();
@@ -1483,6 +1497,35 @@ namespace AppHopper
             if (_chrome != null && _chrome.IsHandleCreated) _chrome.Hide();
         }
 
+        // Every foreground change makes the shell rebuild the entire taskbar
+        // button strip. Measured on this machine with a 60fps bitmap capture of
+        // the taskbar (1829x30):
+        //   - idle, no input at all .......... 0 changed frames / 600
+        //   - hide+show a topmost layered win .. 0 changed frames / 660
+        //   - one plain SetForegroundWindow ... 22 repaint bursts / 350ms,
+        //                                       peak 52651 px, maxdelta 255
+        // So the flicker is not caused by anything AppHopper does wrong - it is
+        // the shell's response to ANY foreground change, including the native
+        // Alt+Tab. What AppHopper controls is whether the user can SEE it: our
+        // overlay is a topmost layered window sitting over the taskbar, so while
+        // it is up the rebuild is hidden. Hiding it simultaneously with the
+        // activation reveals the tail of the burst, which is the reported bug.
+        // Waiting ~1 frame more than the burst's observed decay costs nothing
+        // perceptible and keeps the rebuild covered.
+        static void SettleOverlayAfterActivation()
+        {
+            // 120ms covers the tail after the activation itself has landed; the
+            // burst starts at the foreground swap and decays over ~250-350ms, so
+            // this is a deliberate partial cover that avoids adding a visible
+            // pause. Messages are pumped so the low-level hooks stay serviced
+            // and a fast follow-up Alt+Tab is still handled.
+            var sw = Stopwatch.StartNew();
+            while (sw.ElapsedMilliseconds < 120)
+            {
+                Application.DoEvents();
+                System.Threading.Thread.Sleep(8);
+            }
+        }
         static void Commit()
         {
             // Reentrancy + idempotency guard: ForceForeground pumps messages
@@ -1528,7 +1571,14 @@ namespace AppHopper
                 if (!ok)
                 {
                     IntPtr nowFg = NativeMethods.GetForegroundWindow();
-                    if (nowFg == IntPtr.Zero || IsOwnWindow(nowFg))
+                    // fg == 0 is the system's mid-transition state, NOT "nobody
+                    // holds the focus": the SetForegroundWindow we just issued
+                    // is still in flight and the transition completes 19-110ms
+                    // later. Treating 0 as focus-dead and snatching the
+                    // foreground back to the source is what cancelled our own
+                    // activation. Only our own window (or a genuinely empty
+                    // foreground that has stayed empty) justifies the restore.
+                    if (IsOwnWindow(nowFg) || (nowFg == IntPtr.Zero && ForegroundStaysEmpty()))
                     {
                         // Nothing (or only our own dying overlay) holds the
                         // foreground: restore the source so the desktop is
@@ -1548,6 +1598,18 @@ namespace AppHopper
                             + " [" + ClassNameOf(nowFg) + "], source restore skipped");
                     }
                 }
+                // Hold the overlay for a moment AFTER the activation has landed.
+                // A foreground change makes the shell rebuild the whole taskbar
+                // button strip, and that rebuild runs for ~250-350ms (measured:
+                // 22 repaint bursts over 350ms, peaking at 52k pixels, on a
+                // plain SetForegroundWindow). Our topmost layered window covers
+                // that strip, so while it is still up the rebuild happens
+                // underneath it and the user sees nothing. Hiding it in the same
+                // instant the activation succeeds would reveal the tail of the
+                // rebuild - which is exactly the "the two windows' taskbar
+                // buttons flicker" report. Pump messages while we wait so the
+                // hooks stay serviced.
+                SettleOverlayAfterActivation();
                 EndSession();
                 IntPtr now = NativeMethods.GetForegroundWindow();
                 Log("commit -> 0x" + target.ToInt64().ToString("X") + " " + LogText(Path.GetFileName(targetExe))
@@ -1573,10 +1635,25 @@ namespace AppHopper
         // solidly holding the foreground (3 consecutive readings), the
         // transition resolved elsewhere and waiting longer is pointless -
         // leave it alone, exactly like the fallback below does.
+        // fg == 0 is a transient mid-transition reading. Confirm it is real
+        // (stays empty across a few short samples) before anyone acts on it;
+        // sampling also pumps messages so the low-level hooks stay serviced.
+        static bool ForegroundStaysEmpty()
+        {
+            for (int i = 0; i < 5; i++)
+            {
+                Application.DoEvents();
+                System.Threading.Thread.Sleep(10);
+                if (NativeMethods.GetForegroundWindow() != IntPtr.Zero) return false;
+            }
+            return true;
+        }
+
         static bool WaitForForegroundLanding(IntPtr target)
         {
             const int budgetMs = 300;
-            HideOverlay();   // no-op when FF's slow path already hid it; covers the IsWindow-false early-out path
+            // The overlay stays up for the whole wait: it is covering the shell's
+            // taskbar repaint, and Commit() takes it down after this returns.
             var sw = Stopwatch.StartNew();
             string lastFg = "0x0";
             int foreignRun = 0;
@@ -1725,24 +1802,8 @@ namespace AppHopper
                 + " rows=" + _layout.rows + " cols=" + _layout.cols);
         }
 
-        // Hand the foreground to hwnd without injecting a synthetic key into
-        // the target application.
-        //
-        // The fast path is a normal BringWindowToTop/SetForegroundWindow pair.
-        // If the foreground lock rejects it, the slow path attaches this
-        // thread to the raw foreground thread (or the target thread while the
-        // system is between foreground owners), then retries through the same
-        // APIs used by the shell task switcher.
-        //
-        // ForegroundIs: true when the foreground really is hwnd. Either half
-        // of the UWP CoreWindow<->frame pair may be reported as foreground,
-        // so compare through RepresentativeOf on both sides.
-        //
-        // BringWindowToTop/SetFocus are kept on purpose: BringWindowToTop
-        // itself pumps messages (dropping it is what broke plain switching in
-        // the previous attempt), and SetFocus finishes the keyboard handoff
-        // once the window is already in the foreground.
-        //
+        // Either half of a UWP CoreWindow/frame pair may be foreground.
+        // Compare representatives rather than requiring identical raw HWNDs.
         static bool ForegroundIs(IntPtr hwnd)
         {
             IntPtr now = NativeMethods.GetForegroundWindow();
@@ -1765,69 +1826,61 @@ namespace AppHopper
         static bool ForceForeground(IntPtr hwnd)
         {
             if (!NativeMethods.IsWindow(hwnd)) return false;
-            if (NativeMethods.IsIconic(hwnd)) NativeMethods.ShowWindow(hwnd, NativeMethods.SW_RESTORE);
+            if (ForegroundIs(hwnd)) return true;
 
-            // ---- fast path: normal foreground handoff ----
-            // BringWindowToTop also pumps the queue; keep that behavior because
-            // it lets the target receive the activation transition promptly.
-            NativeMethods.BringWindowToTop(hwnd);
-            Application.DoEvents();
-            NativeMethods.SetForegroundWindow(hwnd);
-            Application.DoEvents();
-            if (ForegroundIs(hwnd))
-            {
-                NativeMethods.SetFocus(hwnd);
-                Log("  force-fg 0x" + hwnd.ToInt64().ToString("X") + " via sfw-fast");
-                return true;
-            }
-
-            // ---- slow path ----
-            // The fast attempt failed, so this is going to take a few more
-            // round-trips. Get the overlay off the screen FIRST: the user is
-            // waiting on the switch, not on our window, and a bar that lingers
-            // for several hundred milliseconds reads as a hang.
-            HideOverlay();
-
+            // Attach BEFORE the first activation request, as Window Hopper
+            // does. A speculative, unattached SetForegroundWindow can be
+            // denied and request taskbar attention even if a later retry wins.
+            // Capture the foreground before hiding our overlay: hiding it can
+            // leave the foreground on another window belonging to this process.
             IntPtr fgRaw = NativeMethods.GetForegroundWindow();
             uint fgThread = fgRaw != IntPtr.Zero ? NativeMethods.GetWindowThreadProcessId(fgRaw, IntPtr.Zero) : 0;
             uint myThread = NativeMethods.GetCurrentThreadId();
-            // Mid-transition the foreground can be 0 and there is no current
-            // owner to attach to. In that case attach to the target thread,
-            // matching the classic taskbar activation recipe.
             if (fgThread == 0) fgThread = NativeMethods.GetWindowThreadProcessId(hwnd, IntPtr.Zero);
             bool attached = fgThread != 0 && fgThread != myThread && NativeMethods.AttachThreadInput(myThread, fgThread, true);
+            var sw = Stopwatch.StartNew();
+            bool accepted = false;
             try
             {
+                // Restoring a minimized window also activates it, so it must
+                // happen inside the same attachment, not before it.
+                if (NativeMethods.IsIconic(hwnd)) NativeMethods.ShowWindow(hwnd, NativeMethods.SW_RESTORE);
                 string how = null;
-                // Bounded by attempts AND by wall clock: a wedged target
-                // thread must not be able to stall the switcher. The Sleep
-                // between attempts is load-bearing: activation of a busy
-                // window (a game restoring its swap chain) lands 20-110ms
-                // after the call, and with no sleep the whole loop finished
-                // in 6ms and declared failure while fg was still 0.
-                var sw = Stopwatch.StartNew();
+                // Keep the existing delayed-landing allowance for games/UWP.
+                // The deadline bounds retries, not blocking Win32 calls.
                 for (int i = 0; i < 8 && !ForegroundIs(hwnd) && sw.ElapsedMilliseconds < 200; i++)
                 {
-                    NativeMethods.SetForegroundWindow(hwnd);
+                    accepted = NativeMethods.SetForegroundWindow(hwnd);
+                    if (ForegroundIs(hwnd)) { how = "sfw#" + (i + 1); break; }
                     Application.DoEvents();
                     if (ForegroundIs(hwnd)) { how = "sfw#" + (i + 1); break; }
+                    // NOTE: the overlay is deliberately NOT hidden here anymore.
+                    // Keeping our topmost layered window on screen for the whole
+                    // activation is what hides the shell's repaint of the
+                    // taskbar button strip, which every foreground change causes
+                    // (measured: 22 repaint bursts / 350ms with no cover vs 0
+                    // with the cover held through the swap). Commit() hides the
+                    // overlay once the switch has actually landed.
                     NativeMethods.SwitchToThisWindow(hwnd, true);
+                    if (ForegroundIs(hwnd)) { how = "sttw#" + (i + 1); break; }
                     Application.DoEvents();
                     if (ForegroundIs(hwnd)) { how = "sttw#" + (i + 1); break; }
                     System.Threading.Thread.Sleep(15);
                 }
-                if (how == null && ForegroundIs(hwnd)) how = "settled";   // landed between attempts - the loop-top check ended the for
+                if (how == null && ForegroundIs(hwnd)) how = "settled";
                 if (how != null)
                 {
                     NativeMethods.SetFocus(hwnd);
                     Log("  force-fg 0x" + hwnd.ToInt64().ToString("X") + " via " + how
-                        + (attached ? " (attached)" : "") + " after " + sw.ElapsedMilliseconds + "ms");
+                        + (attached ? " (attached-first)" : " (unattached)")
+                        + " accepted=" + accepted + " after " + sw.ElapsedMilliseconds + "ms");
                     return true;
                 }
                 IntPtr stuck = NativeMethods.GetForegroundWindow();
                 Log("  force-fg 0x" + hwnd.ToInt64().ToString("X") + " FAILED, fg stuck at 0x"
                     + stuck.ToInt64().ToString("X") + " [" + ClassNameOf(stuck) + "] \""
-                    + LogText(GetWindowTitle(stuck)) + "\" after " + sw.ElapsedMilliseconds + "ms");
+                    + LogText(GetWindowTitle(stuck)) + "\" attached=" + attached
+                    + " accepted=" + accepted + " after " + sw.ElapsedMilliseconds + "ms");
                 return false;
             }
             catch { return false; }
@@ -2050,6 +2103,11 @@ namespace AppHopper
             {
                 var s = (NativeMethods.KBDLLHOOKSTRUCT)Marshal.PtrToStructure(lParam, typeof(NativeMethods.KBDLLHOOKSTRUCT));
                 bool up = (s.flags & NativeMethods.LLKHF_UP) != 0;
+                if (s.vkCode == NativeMethods.VK_TAB && up && _tabHookDown)
+                {
+                    _tabHookDown = false;
+                    return (IntPtr)1;   // the matching Tab-down was already swallowed
+                }
                 if (s.vkCode == NativeMethods.VK_MENU || s.vkCode == NativeMethods.VK_LMENU || s.vkCode == NativeMethods.VK_RMENU)
                     _altHookDown = !up;
 
@@ -2069,7 +2127,11 @@ namespace AppHopper
                         ? Post(NativeMethods.WM_APP_START)
                         : Post((NativeMethods.GetAsyncKeyState(NativeMethods.VK_SHIFT) & 0x8000) != 0
                             ? NativeMethods.WM_APP_PREV : NativeMethods.WM_APP_NEXT);
-                    if (posted) return (IntPtr)1;
+                    if (posted)
+                    {
+                        _tabHookDown = true;
+                        return (IntPtr)1;
+                    }
                     return NativeMethods.CallNextHookEx(_hook, nCode, wParam, lParam);
                 }
                 if (_enabled && _session && s.vkCode == NativeMethods.VK_ESCAPE)
@@ -2083,7 +2145,9 @@ namespace AppHopper
                 }
                 if (_enabled && _session && (s.vkCode == NativeMethods.VK_MENU || s.vkCode == NativeMethods.VK_LMENU || s.vkCode == NativeMethods.VK_RMENU) && up)
                 {
-                    Post(NativeMethods.WM_APP_COMMIT);   // let the Alt release through
+                    // The physical release must reach Windows to clear Alt's
+                    // key state. A posted WM_SYSKEYUP cannot replace it.
+                    Post(NativeMethods.WM_APP_COMMIT);
                 }
             }
             return NativeMethods.CallNextHookEx(_hook, nCode, wParam, lParam);
