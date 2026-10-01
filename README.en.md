@@ -13,6 +13,17 @@ Two shortcuts, two distinct jobs — exactly like macOS:
 
 No more "walking through" five Explorer windows to reach the browser: `Alt+Tab` jumps straight to the next *app*, ``Alt+` `` cycles inside the current one.
 
+## 1.1.2beta1
+
+- Fix lost `Alt+Tab` on startup failure: failed message posts pass through, while aborted startup replays native input using a dedicated `SendInput` tag. Matching `Tab` releases are consumed; physical `Alt` releases always pass through.
+- If disable, commit or a failed post forwards a held `Tab` repeat, its release also passes through so Windows can clear the key state.
+- Honor the first `Alt+Shift+Tab` and its selected page. Partial input insertion releases only keys actually introduced by the replay and still held.
+- Redact window titles and executable names by default. `--log-verbose` alone enables detailed diagnostics. Complete UTF-8 records are limited to 8 MiB.
+- Remove F24 injection and all `AttachThreadInput` queue sharing. Restore minimized targets asynchronously; retain foreground landing checks and the game/UWP switching fallback.
+- Check autostart paths, reparse points, file and ancestor ACLs. Reject locations writable by untrusted identities and report registration failure instead of marking the menu enabled.
+
+This beta does not guarantee elimination of taskbar flashing. Regression tests cover input, logging and autostart protection; isolated-desktop smoke runs do not replace rapid switching, game or UWP checks on the input desktop.
+
 ## Highlights
 
 - **True app-level `Alt+Tab`** — windows are grouped by process, ordered by Z-order (MRU). The group's representative is its most recently used window, so returning to an app puts you back where you left it.
@@ -20,7 +31,7 @@ No more "walking through" five Explorer windows to reach the browser: `Alt+Tab` 
 - **Live DWM thumbnails** — real-time composite previews (the same mechanism as taskbar peek), center-cropped to the card ratio so nothing is stretched.
 - **Full mouse support** — click a card to switch, click anywhere outside the panel to cancel, mouse wheel to cycle. (`Esc` also cancels.)
 - **Virtual-desktop aware** — only windows on the *current* desktop are listed (via the public `IVirtualDesktopManager`), and switching never yanks windows across desktops.
-- **Low intrusion** — the switcher is pure floating UI: it never changes another window's styles, visibility, ownership or taskbar attributes. If fewer than two candidate apps are available, it replays that one `Tab` to Windows' native switcher and leaves no cleanup state behind.
+- **Low intrusion** — no changes to other windows' styles, ownership or taskbar attributes; switching only requests restoration of a minimized target. Aborted startup replays that `Tab` to Windows' native switcher.
 - **Per-monitor, DPI-aware** — the panel is centered on the monitor of the foreground window, scaled by that monitor's DPI, capped at 6 columns with automatic paging.
 - **Single-file, zero-dependency** — one C# source that builds with the compiler already shipped in Windows. No installer, no runtime to install, green portable exe.
 
@@ -48,14 +59,18 @@ Run `AppHopper.exe` — a tray icon appears (right-click: *Enabled*, *Start with
 | click a card | switch to that app immediately |
 | mouse wheel | cycle |
 
-Everything about the app list is computed on the fly each time the switcher opens; there is nothing to configure. Diagnostics: launch with `--log`; the log is capped at 8 MiB and redacts window titles and executable names by default. Use `--log-verbose` for full enumeration details. If the Windows switcher still appears, `hotkey: alt+tab -> start`, `start aborted:`, and `alt+tab fallback:` distinguish a hook miss from an abort and the intentional native fallback. `AppHopper.exe --self-test` (or double-click `self-test.bat`) runs the pure-logic regression checks and exits 0 on success. `Start with Windows` is allowed only when the executable is installed under a protected `Program Files` directory; because the program requires administrator rights, Windows may show UAC at logon.
+The app list is computed each time the switcher opens; there is nothing to configure. Launch with `--log` for an 8 MiB log that redacts window titles and executable names while retaining HWNDs, window classes and timing. Use `--log-verbose` for full enumeration details; inspect sensitive content before sharing it. `hotkey: alt+tab -> start`, `start aborted:`, and `alt+tab fallback:` identify message dispatch, startup failure and intentional fallback. Missing records alone do not prove a hook miss: the log may also be full or unwritable.
+
+`AppHopper.exe --self-test` runs pure layout checks. `self-test.bat` compiles the current source and `tests/RegressionTests.cs` into a temporary directory, runs input-state, log-boundary and ACL regressions, then removes the outputs. It does not replace the running exe, install hooks, change foreground focus or write an autostart registration. Exit code 0 means success.
+
+`Start with Windows` requires a protected installation under `Program Files` or `Program Files (x86)`, without reparse points or file/ancestor ACLs permitting untrusted modification. HKCU Run registration does not bypass UAC; Windows may block elevated startup, so unattended launch is not guaranteed.
 
 ## How it works (short version)
 
-- The low-level keyboard hook swallows `Alt+Tab`/`Esc` during a switcher session. If startup conditions are not met, it hands that one `Tab` back to Windows' native switcher; all other keys pass through untouched.
+- The keyboard hook consumes `Alt+Tab` only after posting succeeds and consumes its matching `Tab` release. Aborted startup replays tagged input to the native switcher; physical `Alt` releases are never intercepted.
 - Top-level windows are enumerated in Z-order, filtered by the classic Alt-Tab eligibility rules plus a current-desktop check, then grouped by process image path (UWP windows are attributed to their hosted app via the child `Windows.UI.Core.CoreWindow`).
 - Live previews are `DwmRegisterThumbnail` composites rendered into an opaque rounded panel; the card chrome (headers, strokes, focus ring, page indicator) is drawn with GDI+ into a premultiplied-alpha DIB and composited with `UpdateLayeredWindow` — the same two-layer design as the PowerToys module it was ported from.
-- Activation uses the classic `AttachThreadInput` foreground handoff; minimized windows are restored first.
+- Activation uses `SetForegroundWindow` without sharing foreign input queues or injecting permission keystrokes; minimized targets are restored via `ShowWindowAsync`. Failure retains `SwitchToThisWindow` and foreground landing checks. The 200ms/300ms budgets bound retries and waiting, not Win32 calls or message processing, and cannot override Windows foreground restrictions.
 
 ## Acknowledgements
 

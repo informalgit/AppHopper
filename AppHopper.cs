@@ -20,6 +20,8 @@ using System.Drawing.Drawing2D;
 using System.Drawing.Imaging;
 using System.IO;
 using System.Runtime.InteropServices;
+using System.Security.AccessControl;
+using System.Security.Principal;
 using System.Text;
 using System.Threading;
 using System.Windows.Forms;
@@ -30,7 +32,7 @@ using System.Windows.Forms;
 // runtime via AppVersion, so this is the single place a version lives.
 [assembly: System.Reflection.AssemblyVersion("1.1.2.0")]
 [assembly: System.Reflection.AssemblyFileVersion("1.1.2.0")]
-[assembly: System.Reflection.AssemblyInformationalVersion("1.1.2")]
+[assembly: System.Reflection.AssemblyInformationalVersion("1.1.2beta1")]
 
 namespace AppHopper
 {
@@ -54,11 +56,9 @@ namespace AppHopper
         public const int VK_MENU = 0x12;
         public const int VK_LMENU = 0xA4;
         public const int VK_RMENU = 0xA5;
-        // No physical keyboard has F24 and no app binds it: the perfect
-        // harmless keystroke for staking a last-input claim (see
-        // StakeInputClaim).
-        public const byte VK_F24 = 0x87;
         public const uint KEYEVENTF_KEYUP = 0x0002;
+        public const uint LLKHF_ALTDOWN = 0x20;
+        public const uint INPUT_KEYBOARD = 1;
         public const int VK_LWIN = 0x5B;
         public const int VK_RWIN = 0x5C;
         public const int VK_SHIFT = 0x10;
@@ -101,6 +101,34 @@ namespace AppHopper
             public uint flags;
             public uint time;
             public IntPtr dwExtraInfo;
+        }
+
+        // The mouse member fixes INPUT's union size/alignment on both x86/x64.
+        [StructLayout(LayoutKind.Sequential)]
+        public struct MOUSEINPUT
+        {
+            public int dx, dy;
+            public uint mouseData, dwFlags, time;
+            public UIntPtr dwExtraInfo;
+        }
+        [StructLayout(LayoutKind.Sequential)]
+        public struct KEYBDINPUT
+        {
+            public ushort wVk, wScan;
+            public uint dwFlags, time;
+            public UIntPtr dwExtraInfo;
+        }
+        [StructLayout(LayoutKind.Explicit)]
+        public struct INPUTUNION
+        {
+            [FieldOffset(0)] public MOUSEINPUT mouse;
+            [FieldOffset(0)] public KEYBDINPUT keyboard;
+        }
+        [StructLayout(LayoutKind.Sequential)]
+        public struct INPUT
+        {
+            public uint type;
+            public INPUTUNION data;
         }
 
         [StructLayout(LayoutKind.Sequential)]
@@ -194,17 +222,11 @@ namespace AppHopper
         [DllImport("user32.dll")]
         public static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
         [DllImport("user32.dll")]
-        public static extern bool BringWindowToTop(IntPtr hWnd);
-        [DllImport("user32.dll")]
-        public static extern bool SetFocus(IntPtr hWnd);
+        public static extern bool ShowWindowAsync(IntPtr hWnd, int nCmdShow);
         [DllImport("user32.dll")]
         public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
         [DllImport("user32.dll")]
         public static extern uint GetWindowThreadProcessId(IntPtr hWnd, IntPtr lpdwProcessId);
-        [DllImport("user32.dll")]
-        public static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool fAttach);
-        [DllImport("kernel32.dll")]
-        public static extern uint GetCurrentThreadId();
         [DllImport("user32.dll")]
         public static extern IntPtr GetWindow(IntPtr hWnd, uint nCmd);
         [DllImport("user32.dll")]
@@ -233,12 +255,11 @@ namespace AppHopper
         public static extern bool DestroyIcon(IntPtr hIcon);
         [DllImport("user32.dll")]
         public static extern IntPtr GetParent(IntPtr hWnd);
-        // Undocumented but shipped since Windows 2000: the only call that
-        // reliably breaks the foreground lock an ApplicationFrameHost holds.
+        // Legacy game/UWP activation fallback; Windows can still deny it.
         [DllImport("user32.dll")]
         public static extern void SwitchToThisWindow(IntPtr hWnd, bool fAltTab);
-        [DllImport("user32.dll")]
-        public static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);
+        [DllImport("user32.dll", SetLastError = true)]
+        public static extern uint SendInput(uint count, INPUT[] inputs, int size);
         [DllImport("user32.dll", CharSet = CharSet.Unicode)]
         public static extern IntPtr SendMessageTimeoutW(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam, uint flags, uint timeout, out IntPtr result);
         [DllImport("user32.dll", CharSet = CharSet.Unicode)]
@@ -622,6 +643,12 @@ namespace AppHopper
         static StreamWriter _log;
         static bool _enabled = true;
         static bool _exitRequested;
+        static bool _tabHookDown;
+        static bool _tabPassedDown;
+        static bool _logVerbose;
+        const long MaxLogBytes = 8 * 1024 * 1024;
+        static long _logBytes;
+        static readonly UIntPtr ReplayInputTag = new UIntPtr(0x41504852);
 
         static PanelForm _panel;
         static ChromeForm _chrome;
@@ -647,7 +674,7 @@ namespace AppHopper
         // runs during a session; see RefreshTick.
         static System.Windows.Forms.Timer _refreshTimer;
 
-        // Product version shown to humans ("1.1.1"), read back from the
+        // Human-facing version, read from the assembly attribute.
         // [assembly: AssemblyInformationalVersion] attribute at the top of
         // this file - one literal per release, consumed everywhere.
         static readonly string AppVersion = InitVersion();
@@ -660,15 +687,105 @@ namespace AppHopper
             return attr != null ? attr.InformationalVersion : asm.GetName().Version.ToString(3);
         }
 
+        static string LogText(string text)
+        {
+            if (!_logVerbose) return "<redacted>";
+            return (text ?? "").Replace("\r", "\\r").Replace("\n", "\\n");
+        }
+
         static void Log(string msg)
         {
             if (_log == null) return;
-            try { _log.WriteLine(DateTime.Now.ToString("HH:mm:ss.fff ") + msg); _log.Flush(); }
-            catch { }
+            try
+            {
+                string line = DateTime.Now.ToString("HH:mm:ss.fff ") + msg;
+                long bytes = _log.Encoding.GetByteCount(line) + _log.Encoding.GetByteCount(_log.NewLine);
+                if (_logBytes + bytes > MaxLogBytes) return;
+                _log.WriteLine(line);
+                _log.Flush();
+                _logBytes += bytes;
+            }
+            catch
+            {
+                try { _log.BaseStream.Dispose(); } catch { } // Do not retry a partial buffered write.
+                _log = null;  // A partial write cannot be safely counted; stop logging.
+            }
         }
 
-        static void Post(int m) { NativeMethods.PostMessageW(_msg.Handle, (uint)m, IntPtr.Zero, IntPtr.Zero); }
-        static void PostAt(int m, int i) { NativeMethods.PostMessageW(_msg.Handle, (uint)m, (IntPtr)i, IntPtr.Zero); }
+        static bool Post(int m) { return PostAt(m, 0); }
+        static bool PostAt(int m, int i)
+        {
+            return _msg != null && !_msg.IsDisposed && _msg.IsHandleCreated
+                && NativeMethods.PostMessageW(_msg.Handle, (uint)m, (IntPtr)i, IntPtr.Zero);
+        }
+
+        static NativeMethods.INPUT KeyInput(int key, bool up)
+        {
+            var input = new NativeMethods.INPUT();
+            input.type = NativeMethods.INPUT_KEYBOARD;
+            input.data.keyboard.wVk = (ushort)key;
+            input.data.keyboard.dwFlags = up ? NativeMethods.KEYEVENTF_KEYUP : 0;
+            input.data.keyboard.dwExtraInfo = ReplayInputTag;
+            return input;
+        }
+
+        static NativeMethods.INPUT[] NativeTabInputs(bool addAlt, bool addShift)
+        {
+            var inputs = new NativeMethods.INPUT[2 + (addAlt ? 2 : 0) + (addShift ? 2 : 0)];
+            int i = 0;
+            if (addAlt) inputs[i++] = KeyInput(NativeMethods.VK_MENU, false);
+            if (addShift) inputs[i++] = KeyInput(NativeMethods.VK_SHIFT, false);
+            inputs[i++] = KeyInput(NativeMethods.VK_TAB, false);
+            inputs[i++] = KeyInput(NativeMethods.VK_TAB, true);
+            if (addShift) inputs[i++] = KeyInput(NativeMethods.VK_SHIFT, true);
+            if (addAlt) inputs[i++] = KeyInput(NativeMethods.VK_MENU, true);
+            return inputs;
+        }
+
+        // Recover only keys still down in the prefix actually inserted by
+        // SendInput. Never release a modifier whose down was not inserted.
+        static NativeMethods.INPUT[] ReplayReleases(NativeMethods.INPUT[] inputs, uint sent)
+        {
+            bool alt = false, shift = false, tab = false;
+            for (int i = 0; i < sent; i++)
+            {
+                var key = inputs[i].data.keyboard;
+                bool down = (key.dwFlags & NativeMethods.KEYEVENTF_KEYUP) == 0;
+                if (key.wVk == NativeMethods.VK_MENU) alt = down;
+                if (key.wVk == NativeMethods.VK_SHIFT) shift = down;
+                if (key.wVk == NativeMethods.VK_TAB) tab = down;
+            }
+            int count = (alt ? 1 : 0) + (shift ? 1 : 0) + (tab ? 1 : 0);
+            if (count == 0) return null;
+            var releases = new NativeMethods.INPUT[count];
+            int next = 0;
+            if (tab) releases[next++] = KeyInput(NativeMethods.VK_TAB, true);
+            if (shift) releases[next++] = KeyInput(NativeMethods.VK_SHIFT, true);
+            if (alt) releases[next++] = KeyInput(NativeMethods.VK_MENU, true);
+            return releases;
+        }
+
+        // Reconstruct a quick tap if Alt was released while startup ran.
+        // Release only modifiers introduced here; never swallow physical Alt-up.
+        static void ReplayNativeTab(bool reverse)
+        {
+            bool addAlt = !AltDown();
+            bool addShift = reverse && (NativeMethods.GetAsyncKeyState(NativeMethods.VK_SHIFT) & 0x8000) == 0;
+            NativeMethods.INPUT[] inputs = NativeTabInputs(addAlt, addShift);
+            int size = Marshal.SizeOf(typeof(NativeMethods.INPUT));
+            uint sent = NativeMethods.SendInput((uint)inputs.Length, inputs, size);
+            Log("alt+tab fallback: native replay " + (sent == inputs.Length ? "ok" : "FAILED")
+                + " reverse=" + reverse);
+            if (sent > 0 && sent < inputs.Length)
+            {
+                NativeMethods.INPUT[] releases = ReplayReleases(inputs, sent);
+                if (releases != null)
+                {
+                    uint released = NativeMethods.SendInput((uint)releases.Length, releases, size);
+                    Log("alt+tab fallback: partial-input cleanup " + (released == releases.Length ? "ok" : "FAILED"));
+                }
+            }
+        }
 
         // ================= windows =================
         class MsgForm : Form
@@ -1113,16 +1230,16 @@ namespace AppHopper
             switch (msg)
             {
                 case NativeMethods.WM_APP_START:
-                    // Logged here rather than in the hook callback (which
-                    // must stay I/O-free): a received message proves the
-                    // whole hook -> post -> dispatch chain.
-                    // !_committing: Commit's post-failure wait pumps messages
-                    // (Application.DoEvents) with _session already false - a
-                    // hotkey pressed in that window would otherwise start a
-                    // new session that the in-flight Commit's EndSession()
-                    // then tears right down.
-                    if (!_session && !_committing) { Log("hotkey: alt+tab -> start"); StartSession(); }
-                    if (_session && !AltDown()) Commit();  // quick tap: Alt already released
+                    bool reverse = wparam != IntPtr.Zero;
+                    if (_committing) { ReplayNativeTab(reverse); break; }
+                    if (_session) MoveIndex(reverse ? -1 : 1);
+                    else
+                    {
+                        Log("hotkey: alt+tab -> start");
+                        StartSession(reverse);
+                        if (!_session) { ReplayNativeTab(reverse); break; }
+                    }
+                    if (_session && !AltDown()) Commit();
                     break;
                 case NativeMethods.WM_APP_NEXT: if (_session) MoveIndex(1); break;
                 case NativeMethods.WM_APP_PREV: if (_session) MoveIndex(-1); break;
@@ -1170,7 +1287,7 @@ namespace AppHopper
                 {
                     if (_log != null)
                         Log("  skip 0x" + hwnd.ToInt64().ToString("X") + " [" + ClassNameOf(hwnd)
-                            + "] \"" + GetWindowTitle(hwnd) + "\" - " + why);
+                            + "] \"" + LogText(GetWindowTitle(hwnd)) + "\" - " + why);
                     return true;
                 }
                 // The predicate already vetted that an exe resolves; re-resolve
@@ -1210,14 +1327,14 @@ namespace AppHopper
                     order.Add(e);
                     if (ownEntry && _log != null)
                         Log("  own entry (WS_EX_APPWINDOW) 0x" + hwnd.ToInt64().ToString("X")
-                            + " \"" + e.Title + "\"");
+                            + " \"" + LogText(e.Title) + "\"");
                 }
                 return true;
             }, IntPtr.Zero);
             return order;
         }
 
-        static void StartSession()
+        static void StartSession(bool reverse)
         {
             IntPtr fgRaw = NativeMethods.GetForegroundWindow();
             if (fgRaw == IntPtr.Zero) { Log("start aborted: no foreground window"); return; }
@@ -1225,7 +1342,7 @@ namespace AppHopper
             if (fgExe == null)
             {
                 Log("start aborted: no exe for fg 0x" + fgRaw.ToInt64().ToString("X")
-                    + " [" + ClassNameOf(fgRaw) + "] \"" + GetWindowTitle(fgRaw) + "\"");
+                    + " [" + ClassNameOf(fgRaw) + "] \"" + LogText(GetWindowTitle(fgRaw)) + "\"");
                 return;
             }
             // Normalise the foreground window onto the one that represents it in
@@ -1236,8 +1353,8 @@ namespace AppHopper
             if (fg == IntPtr.Zero || !NativeMethods.IsWindowVisible(fg)) fg = fgRaw;
             _fgHwnd = fg;
             Log("fg 0x" + fgRaw.ToInt64().ToString("X") + " [" + ClassNameOf(fgRaw) + "] \""
-                + GetWindowTitle(fgRaw) + "\" -> repr 0x" + fg.ToInt64().ToString("X")
-                + " exe=" + Path.GetFileName(fgExe));
+                + LogText(GetWindowTitle(fgRaw)) + "\" -> repr 0x" + fg.ToInt64().ToString("X")
+                + " exe=" + LogText(Path.GetFileName(fgExe)));
 
             var order = EnumerateEntries();
             if (order.Count < 2)
@@ -1283,13 +1400,13 @@ namespace AppHopper
             // recently used other app, and starting at 1 would skip it - which
             // is exactly the "Alt+Tab goes one app too far back" symptom.
             bool fgPinned = pin != IntPtr.Zero;
-            _index = fgPinned ? 1 : 0;
-            _pageStart = 0;
+            _index = reverse ? order.Count - 1 : (fgPinned ? 1 : 0);
+            _pageStart = Logic.PageStartFor(_index, _apps.Count, _layout.pageSize);
             Log("fgPinned=" + fgPinned + " index=" + _index);
 
             var sb2 = new StringBuilder("order:");
             foreach (var e in _apps)
-                sb2.Append(' ').Append(System.IO.Path.GetFileNameWithoutExtension(e.Exe))
+                sb2.Append(' ').Append(LogText(System.IO.Path.GetFileNameWithoutExtension(e.Exe)))
                    .Append('@').Append(e.Rank).Append(e.Topmost ? "*" : "");
             Log(sb2.ToString());
 
@@ -1495,7 +1612,7 @@ namespace AppHopper
                 }
                 EndSession();
                 IntPtr now = NativeMethods.GetForegroundWindow();
-                Log("commit -> 0x" + target.ToInt64().ToString("X") + " " + Path.GetFileName(targetExe)
+                Log("commit -> 0x" + target.ToInt64().ToString("X") + " " + LogText(Path.GetFileName(targetExe))
                     + " sfw=" + (ok ? "ok" : "FAILED")
                     + " fgNow=0x" + now.ToInt64().ToString("X") + " [" + ClassNameOf(now) + "]");
             }
@@ -1532,7 +1649,6 @@ namespace AppHopper
                 IntPtr now = NativeMethods.GetForegroundWindow();
                 if (ForegroundIs(target))
                 {
-                    NativeMethods.SetFocus(target);
                     Log("  commit: late landing of 0x" + target.ToInt64().ToString("X")
                         + " after " + sw.ElapsedMilliseconds + "ms");
                     return true;
@@ -1610,7 +1726,7 @@ namespace AppHopper
                 IntPtr h = _apps[i].ReprHwnd;
                 if (!NativeMethods.IsWindow(h) || !NativeMethods.IsWindowVisible(h) || IsCloaked(h))
                 {
-                    Log("refresh: entry \"" + _apps[i].Title + "\" is gone");
+                    Log("refresh: entry \"" + LogText(_apps[i].Title) + "\" is gone");
                     RefreshEntries();
                     return;
                 }
@@ -1671,36 +1787,6 @@ namespace AppHopper
                 + " rows=" + _layout.rows + " cols=" + _layout.cols);
         }
 
-        // Hand the foreground to hwnd.
-        //
-        // Windows grants SetForegroundWindow only to a process with an input
-        // claim - the foreground process, or the one that received the last
-        // input event. Against a UWP app (any ApplicationFrameWindow pair)
-        // two things go wrong at once: the lock is held by the CoreWindow's
-        // own app thread, which may be SUSPENDED and therefore cannot help
-        // even via AttachThreadInput; and SetForegroundWindow lies about it,
-        // reporting success while the frame keeps the foreground (the
-        // "To Do stays in front" bug). So the handoff is driven three ways:
-        //
-        //   1. AttachThreadInput to whoever owns the foreground RIGHT NOW
-        //      (raw handle - NOT _fgHwnd, which was normalised onto the
-        //      frame whose thread owns nothing). If the foreground happens
-        //      to be one of our own windows the thread is ours and the
-        //      fgThread != myThread check skips the attach by itself.
-        //   2. StakeInputClaim before every attempt: injecting an F24 makes
-        //      us the last-input process, which satisfies SetForegroundWindow
-        //      all by itself and needs no cooperation from the frozen thread.
-        //   3. SwitchToThisWindow as the escalation, the entry point the
-        //      task switcher itself uses.
-        //
-        // BringWindowToTop/SetFocus are kept on purpose: BringWindowToTop
-        // itself pumps messages (dropping it is what broke plain switching in
-        // the previous attempt), and SetFocus finishes the keyboard handoff
-        // once the window is already in the foreground.
-        //
-        // ForegroundIs: true when the foreground really is hwnd. Either half
-        // of the UWP CoreWindow<->frame pair may be reported as foreground,
-        // so compare through RepresentativeOf on both sides.
         static bool ForegroundIs(IntPtr hwnd)
         {
             IntPtr now = NativeMethods.GetForegroundWindow();
@@ -1720,100 +1806,46 @@ namespace AppHopper
             return pid != 0 && pid == (uint)Process.GetCurrentProcess().Id;
         }
 
-        // Press and release F24. The keystroke is delivered to whatever has
-        // focus and does nothing there, but it credits US with the last
-        // input event - the condition SetForegroundWindow actually checks.
-        static void StakeInputClaim()
-        {
-            NativeMethods.keybd_event(NativeMethods.VK_F24, 0, 0, UIntPtr.Zero);
-            NativeMethods.keybd_event(NativeMethods.VK_F24, 0, NativeMethods.KEYEVENTF_KEYUP, UIntPtr.Zero);
-        }
-
         static bool ForceForeground(IntPtr hwnd)
         {
             if (!NativeMethods.IsWindow(hwnd)) return false;
-            if (NativeMethods.IsIconic(hwnd)) NativeMethods.ShowWindow(hwnd, NativeMethods.SW_RESTORE);
-
-            // ---- fast path: no cross-thread call, no attach ----
-            // BringWindowToTop (it also pumps the queue - dropping it is what
-            // broke plain switching before), stake the input claim with F24,
-            // then SetForegroundWindow. Staking the claim is what authorises
-            // us, so AttachThreadInput is NOT needed here - and it is a
-            // synchronous cross-thread call that blocks until the *other*
-            // thread processes it. Explorer's window thread is exactly the
-            // kind that can be busy for hundreds of milliseconds, which is
-            // what left the overlay hanging on screen after Alt+Tab (and made
-            // rapid back-and-forth switching feel sticky).
-            NativeMethods.BringWindowToTop(hwnd);
-            Application.DoEvents();
-            StakeInputClaim();
-            NativeMethods.SetForegroundWindow(hwnd);
-            Application.DoEvents();
-            if (ForegroundIs(hwnd))
+            if (ForegroundIs(hwnd)) return true;
+            // Do not share input queues with any foreign process, including
+            // Explorer. No injected permission keystrokes or cross-thread focus.
+            // Restore asynchronously so a busy target cannot block this step.
+            var sw = Stopwatch.StartNew();
+            if (NativeMethods.IsIconic(hwnd)) NativeMethods.ShowWindowAsync(hwnd, NativeMethods.SW_RESTORE);
+            bool accepted = false;
+            for (int i = 0; i < 8 && sw.ElapsedMilliseconds < 200; i++)
             {
-                NativeMethods.SetFocus(hwnd);
-                Log("  force-fg 0x" + hwnd.ToInt64().ToString("X") + " via sfw-fast");
-                return true;
-            }
-
-            // ---- slow path ----
-            // The fast attempt failed, so this is going to take a few more
-            // round-trips. Get the overlay off the screen FIRST: the user is
-            // waiting on the switch, not on our window, and a bar that lingers
-            // for several hundred milliseconds reads as a hang.
-            HideOverlay();
-
-            IntPtr fgRaw = NativeMethods.GetForegroundWindow();
-            uint fgThread = fgRaw != IntPtr.Zero ? NativeMethods.GetWindowThreadProcessId(fgRaw, IntPtr.Zero) : 0;
-            uint myThread = NativeMethods.GetCurrentThreadId();
-            // Mid-transition the foreground is 0 and there is no current owner
-            // to attach to - attach the TARGET's thread instead (the classic
-            // taskbar recipe). Skipping the attach entirely is what left the
-            // game switch with no weapon at all: the 2026-09-10 log shows the
-            // old code ran all three attempts against LoL without ever
-            // calling AttachThreadInput.
-            if (fgThread == 0) fgThread = NativeMethods.GetWindowThreadProcessId(hwnd, IntPtr.Zero);
-            bool attached = fgThread != 0 && fgThread != myThread && NativeMethods.AttachThreadInput(myThread, fgThread, true);
-            try
-            {
-                string how = null;
-                // Bounded by attempts AND by wall clock: a wedged target
-                // thread must not be able to stall the switcher. The Sleep
-                // between attempts is load-bearing: activation of a busy
-                // window (a game restoring its swap chain) lands 20-110ms
-                // after the call, and with no sleep the whole loop finished
-                // in 6ms and declared failure while fg was still 0.
-                var sw = Stopwatch.StartNew();
-                for (int i = 0; i < 8 && !ForegroundIs(hwnd) && sw.ElapsedMilliseconds < 200; i++)
+                accepted = NativeMethods.SetForegroundWindow(hwnd);
+                Application.DoEvents();
+                if (ForegroundIs(hwnd))
                 {
-                    StakeInputClaim();
-                    NativeMethods.SetForegroundWindow(hwnd);
-                    Application.DoEvents();
-                    if (ForegroundIs(hwnd)) { how = "sfw#" + (i + 1); break; }
-                    NativeMethods.SwitchToThisWindow(hwnd, true);
-                    Application.DoEvents();
-                    if (ForegroundIs(hwnd)) { how = "sttw#" + (i + 1); break; }
-                    System.Threading.Thread.Sleep(15);
-                }
-                if (how == null && ForegroundIs(hwnd)) how = "settled";   // landed between attempts - the loop-top check ended the for
-                if (how != null)
-                {
-                    NativeMethods.SetFocus(hwnd);
-                    Log("  force-fg 0x" + hwnd.ToInt64().ToString("X") + " via " + how
-                        + (attached ? " (attached)" : "") + " after " + sw.ElapsedMilliseconds + "ms");
+                    Log("  force-fg 0x" + hwnd.ToInt64().ToString("X") + " via sfw#" + (i + 1)
+                        + " accepted=" + accepted + " after " + sw.ElapsedMilliseconds + "ms");
                     return true;
                 }
-                IntPtr stuck = NativeMethods.GetForegroundWindow();
-                Log("  force-fg 0x" + hwnd.ToInt64().ToString("X") + " FAILED, fg stuck at 0x"
-                    + stuck.ToInt64().ToString("X") + " [" + ClassNameOf(stuck) + "] \""
-                    + GetWindowTitle(stuck) + "\" after " + sw.ElapsedMilliseconds + "ms");
-                return false;
+                HideOverlay();
+                // Retain the existing game/UWP fallback, without attached queues.
+                // The deadline bounds retries, not the duration of Win32 calls.
+                NativeMethods.SwitchToThisWindow(hwnd, true);
+                Application.DoEvents();
+                if (ForegroundIs(hwnd))
+                {
+                    Log("  force-fg 0x" + hwnd.ToInt64().ToString("X") + " via sttw#" + (i + 1)
+                        + " after " + sw.ElapsedMilliseconds + "ms");
+                    return true;
+                }
+                System.Threading.Thread.Sleep(15);
             }
-            catch { return false; }
-            finally
-            {
-                if (attached) NativeMethods.AttachThreadInput(myThread, fgThread, false);
-            }
+            if (ForegroundIs(hwnd)) return true;
+            IntPtr stuck = NativeMethods.GetForegroundWindow();
+            Log("  force-fg 0x" + hwnd.ToInt64().ToString("X") + " FAILED, fg stuck at 0x"
+                + stuck.ToInt64().ToString("X") + " [" + ClassNameOf(stuck) + "] \""
+                + LogText(GetWindowTitle(stuck)) + "\" accepted=" + accepted
+                + " after " + sw.ElapsedMilliseconds + "ms");
+            return false;
         }
 
         // ================= chrome rendering (UpdateLayeredWindow, Hopper-style) =================
@@ -2010,33 +2042,41 @@ namespace AppHopper
 
         static IntPtr KbHookProc(int nCode, IntPtr wParam, IntPtr lParam)
         {
-            if (nCode >= 0 && _enabled)
+            if (nCode >= 0)
             {
                 var s = (NativeMethods.KBDLLHOOKSTRUCT)Marshal.PtrToStructure(lParam, typeof(NativeMethods.KBDLLHOOKSTRUCT));
+                if (s.dwExtraInfo == (IntPtr)ReplayInputTag.ToUInt64())
+                    return NativeMethods.CallNextHookEx(_hook, nCode, wParam, lParam);
                 bool up = (s.flags & NativeMethods.LLKHF_UP) != 0;
-
-                if (s.vkCode == NativeMethods.VK_TAB && !up && AltDown() && !WinDown())
+                if (s.vkCode == NativeMethods.VK_TAB && up)
                 {
-                    // Nothing in this callback may do real work (file I/O in
-                    // particular): a low-level hook that exceeds
-                    // LowLevelHooksTimeout (300 ms) is silently removed by
-                    // Windows. The "hotkey" diagnostics are therefore logged
-                    // when the posted message is handled on the UI thread
-                    // (see HandleAppMsg), which also proves the whole
-                    // hook -> post -> dispatch chain, not just the hook.
-                    if (!_session) Post(NativeMethods.WM_APP_START);
-                    else Post((NativeMethods.GetAsyncKeyState(NativeMethods.VK_SHIFT) & 0x8000) != 0 ? NativeMethods.WM_APP_PREV : NativeMethods.WM_APP_NEXT);
-                    return (IntPtr)1;
+                    // If any repeat was forwarded (disable, commit or failed
+                    // post), Windows needs the release to clear that key state.
+                    bool consume = _tabHookDown && !_tabPassedDown;
+                    _tabHookDown = false;
+                    _tabPassedDown = false;
+                    if (consume) return (IntPtr)1;
                 }
-                if (_session && s.vkCode == NativeMethods.VK_ESCAPE)
+                if (_enabled && !_committing)
                 {
-                    if (up) Post(NativeMethods.WM_APP_CANCEL);
-                    return (IntPtr)1;
+                    if (s.vkCode == NativeMethods.VK_TAB && !up
+                        && ((s.flags & NativeMethods.LLKHF_ALTDOWN) != 0 || AltDown()) && !WinDown())
+                    {
+                        bool reverse = (NativeMethods.GetAsyncKeyState(NativeMethods.VK_SHIFT) & 0x8000) != 0;
+                        bool posted = !_session ? PostAt(NativeMethods.WM_APP_START, reverse ? 1 : 0)
+                            : Post(reverse ? NativeMethods.WM_APP_PREV : NativeMethods.WM_APP_NEXT);
+                        if (posted) { _tabHookDown = true; return (IntPtr)1; }
+                    }
+                    if (_session && s.vkCode == NativeMethods.VK_ESCAPE)
+                    {
+                        if (up) Post(NativeMethods.WM_APP_CANCEL);
+                        return (IntPtr)1;
+                    }
+                    if (_session && up && (s.vkCode == NativeMethods.VK_MENU
+                        || s.vkCode == NativeMethods.VK_LMENU || s.vkCode == NativeMethods.VK_RMENU))
+                        Post(NativeMethods.WM_APP_COMMIT);
                 }
-                if (_session && (s.vkCode == NativeMethods.VK_MENU || s.vkCode == NativeMethods.VK_LMENU || s.vkCode == NativeMethods.VK_RMENU) && up)
-                {
-                    Post(NativeMethods.WM_APP_COMMIT);   // let the Alt release through
-                }
+                if (s.vkCode == NativeMethods.VK_TAB && !up) _tabPassedDown = true;
             }
             return NativeMethods.CallNextHookEx(_hook, nCode, wParam, lParam);
         }
@@ -2114,17 +2154,82 @@ namespace AppHopper
         }
 
         // ================= infra =================
-        static void SetStartup(bool add)
+        static bool IsUnderDirectory(string path, string root)
+        {
+            if (string.IsNullOrEmpty(path) || string.IsNullOrEmpty(root)) return false;
+            return Path.GetFullPath(path).StartsWith(Path.GetFullPath(root).TrimEnd('\\') + "\\", StringComparison.OrdinalIgnoreCase);
+        }
+
+        static bool HasProtectedAcl(FileSystemSecurity security)
+        {
+            string owner = security.GetOwner(typeof(SecurityIdentifier)).Value;
+            if (!TrustedOwner(owner)) return false;
+            const FileSystemRights writes = FileSystemRights.WriteData | FileSystemRights.AppendData
+                | FileSystemRights.WriteExtendedAttributes | FileSystemRights.WriteAttributes
+                | FileSystemRights.Delete | FileSystemRights.DeleteSubdirectoriesAndFiles
+                | FileSystemRights.ChangePermissions | FileSystemRights.TakeOwnership
+                | (FileSystemRights)0x50000000; // GENERIC_WRITE | GENERIC_ALL
+            foreach (FileSystemAccessRule rule in security.GetAccessRules(true, true, typeof(SecurityIdentifier)))
+            {
+                if (rule.AccessControlType == AccessControlType.Allow
+                    && (rule.FileSystemRights & writes) != 0
+                    && (rule.PropagationFlags & PropagationFlags.InheritOnly) == 0
+                    && !TrustedOwner(rule.IdentityReference.Value)) return false;
+            }
+            return true;
+        }
+
+        static bool TrustedOwner(string sid)
+        {
+            return sid == "S-1-5-18" || sid == "S-1-5-32-544"
+                || sid == "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464";
+        }
+
+        static bool IsProtectedStartupPath(string path)
         {
             try
             {
-                using (var key = Microsoft.Win32.Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Run", true))
+                string root = Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles);
+                if (!IsUnderDirectory(path, root))
                 {
-                    if (add) key.SetValue("AppHopper", "\"" + Application.ExecutablePath + "\"");
-                    else if (key.GetValue("AppHopper") != null) key.DeleteValue("AppHopper");
+                    root = Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86);
+                    if (!IsUnderDirectory(path, root)) return false;
+                }
+                path = Path.GetFullPath(path);
+                root = Path.GetFullPath(root).TrimEnd('\\');
+                if ((File.GetAttributes(path) & FileAttributes.ReparsePoint) != 0
+                    || !HasProtectedAcl(File.GetAccessControl(path))) return false;
+                string dir = Path.GetDirectoryName(path);
+                while (dir != null)
+                {
+                    if ((File.GetAttributes(dir) & FileAttributes.ReparsePoint) != 0
+                        || !HasProtectedAcl(Directory.GetAccessControl(dir))) return false;
+                    if (string.Equals(dir, root, StringComparison.OrdinalIgnoreCase)) return true;
+                    dir = Path.GetDirectoryName(dir);
                 }
             }
-            catch { }
+            catch (IOException) { }
+            catch (UnauthorizedAccessException) { }
+            catch (ArgumentException) { }
+            catch (System.Security.SecurityException) { }
+            return false;
+        }
+
+        static bool SetStartup(bool add)
+        {
+            if (add && !IsProtectedStartupPath(Application.ExecutablePath)) return false;
+            try
+            {
+                using (var key = Microsoft.Win32.Registry.CurrentUser.CreateSubKey(@"Software\Microsoft\Windows\CurrentVersion\Run"))
+                {
+                    if (add) key.SetValue("AppHopper", "\"" + Application.ExecutablePath + "\"");
+                    else key.DeleteValue("AppHopper", false);
+                }
+                return true;
+            }
+            catch (UnauthorizedAccessException) { return false; }
+            catch (IOException) { return false; }
+            catch (System.Security.SecurityException) { return false; }
         }
 
         static bool StartupEnabled()
@@ -2190,14 +2295,23 @@ namespace AppHopper
             _mutex = new Mutex(true, "Local\\AppHopper", out created);
             if (!created) return;
 
+            bool logRequested = false;
             foreach (string a in args)
-                if (a == "--log")
+            {
+                if (a == "--log" || a == "--log-verbose") logRequested = true;
+                if (a == "--log-verbose") _logVerbose = true;
+            }
+            if (logRequested)
+            {
+                try
                 {
-                    _log = new StreamWriter(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "apphopper.log"), false);
-                    // First line of every log names the build, so a pasted log
-                    // is self-identifying.
+                    _log = new StreamWriter(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "apphopper.log"), false, new UTF8Encoding(false));
+                    _logBytes = 0;
                     Log("AppHopper v" + AppVersion + " starting, pid " + Process.GetCurrentProcess().Id);
                 }
+                catch (IOException) { }
+                catch (UnauthorizedAccessException) { }
+            }
 
             NativeMethods.SetProcessDPIAware();
             Application.EnableVisualStyles();
@@ -2228,7 +2342,14 @@ namespace AppHopper
             miToggle.Click += delegate { _enabled = !_enabled; miToggle.Checked = _enabled; };
             var miStartup = new MenuItem("Start with Windows");
             miStartup.Checked = StartupEnabled();
-            miStartup.Click += delegate { bool add = !StartupEnabled(); SetStartup(add); miStartup.Checked = add; };
+            miStartup.Click += delegate
+            {
+                bool add = !StartupEnabled();
+                if (!SetStartup(add))
+                    MessageBox.Show("Autostart requires a protected installation under Program Files and permission to update the Run key.",
+                        "AppHopper", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                miStartup.Checked = StartupEnabled();
+            };
             var miExit = new MenuItem("Exit");
             miExit.Click += delegate { _exitRequested = true; };
             menu.MenuItems.Add(miToggle);
