@@ -32,7 +32,7 @@ using System.Windows.Forms;
 // runtime via AppVersion, so this is the single place a version lives.
 [assembly: System.Reflection.AssemblyVersion("1.1.2.0")]
 [assembly: System.Reflection.AssemblyFileVersion("1.1.2.0")]
-[assembly: System.Reflection.AssemblyInformationalVersion("1.1.2beta1")]
+[assembly: System.Reflection.AssemblyInformationalVersion("1.1.2beta2")]
 
 namespace AppHopper
 {
@@ -85,6 +85,7 @@ namespace AppHopper
         public const int ICON_SMALL2 = 2, ICON_BIG = 1;
         public const uint WM_GETICON = 0x7F;
         public const uint SMTO_ABORTIFHUNG = 0x2;
+        public const uint SMTO_ERRORONEXIT = 0x20;
 
         public const int WM_APP_START = 0x8000 + 1;
         public const int WM_APP_NEXT = 0x8000 + 2;
@@ -101,6 +102,14 @@ namespace AppHopper
             public uint flags;
             public uint time;
             public IntPtr dwExtraInfo;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        public struct GUITHREADINFO
+        {
+            public uint cbSize, flags;
+            public IntPtr hwndActive, hwndFocus, hwndCapture, hwndMenuOwner, hwndMoveSize, hwndCaret;
+            public RECT rcCaret;
         }
 
         // The mouse member fixes INPUT's union size/alignment on both x86/x64.
@@ -219,6 +228,16 @@ namespace AppHopper
         public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
         [DllImport("user32.dll")]
         public static extern bool SetForegroundWindow(IntPtr hWnd);
+        [DllImport("user32.dll", SetLastError = true)]
+        public static extern bool AllowSetForegroundWindow(uint dwProcessId);
+        [DllImport("user32.dll", SetLastError = true)]
+        public static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool attach);
+        [DllImport("kernel32.dll")]
+        public static extern uint GetCurrentThreadId();
+        [DllImport("kernel32.dll")]
+        public static extern uint GetCurrentProcessId();
+        [DllImport("user32.dll")]
+        public static extern bool GetGUIThreadInfo(uint idThread, ref GUITHREADINFO info);
         [DllImport("user32.dll")]
         public static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
         [DllImport("user32.dll")]
@@ -255,13 +274,16 @@ namespace AppHopper
         public static extern bool DestroyIcon(IntPtr hIcon);
         [DllImport("user32.dll")]
         public static extern IntPtr GetParent(IntPtr hWnd);
-        // Legacy game/UWP activation fallback; Windows can still deny it.
-        [DllImport("user32.dll")]
-        public static extern void SwitchToThisWindow(IntPtr hWnd, bool fAltTab);
         [DllImport("user32.dll", SetLastError = true)]
         public static extern uint SendInput(uint count, INPUT[] inputs, int size);
         [DllImport("user32.dll", CharSet = CharSet.Unicode)]
         public static extern IntPtr SendMessageTimeoutW(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam, uint flags, uint timeout, out IntPtr result);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        public static extern uint RegisterWindowMessage(string text);
+        [DllImport("user32.dll")]
+        public static extern bool RegisterShellHookWindow(IntPtr hwnd);
+        [DllImport("user32.dll")]
+        public static extern bool DeregisterShellHookWindow(IntPtr hwnd);
         [DllImport("user32.dll", CharSet = CharSet.Unicode)]
         public static extern int GetWindowTextW(IntPtr hWnd, [MarshalAs(UnmanagedType.LPWStr)] StringBuilder text, int maxCount);
         [DllImport("user32.dll", CharSet = CharSet.Unicode)]
@@ -648,6 +670,7 @@ namespace AppHopper
         static bool _logVerbose;
         const long MaxLogBytes = 8 * 1024 * 1024;
         static long _logBytes;
+        static int _shellHookMessage;
         static readonly UIntPtr ReplayInputTag = new UIntPtr(0x41504852);
 
         static PanelForm _panel;
@@ -798,6 +821,9 @@ namespace AppHopper
             }
             protected override void WndProc(ref Message m)
             {
+                if (_shellHookMessage != 0 && m.Msg == _shellHookMessage && m.WParam == new IntPtr(0x8006))
+                    Log("shell flash hwnd=0x" + m.LParam.ToInt64().ToString("X")
+                        + " fg=0x" + NativeMethods.GetForegroundWindow().ToInt64().ToString("X"));
                 if (m.Msg >= NativeMethods.WM_APP_START && m.Msg <= NativeMethods.WM_APP_COMMITAT) { HandleAppMsg(m.Msg, m.WParam); return; }
                 base.WndProc(ref m);
             }
@@ -815,7 +841,7 @@ namespace AppHopper
             protected override bool ShowWithoutActivation { get { return true; } }
             protected override CreateParams CreateParams
             {
-                get { var cp = base.CreateParams; cp.ExStyle |= NativeMethods.WS_EX_TOOLWINDOW | NativeMethods.WS_EX_NOACTIVATE | NativeMethods.WS_EX_TOPMOST; return cp; }
+                get { var cp = base.CreateParams; cp.ExStyle |= NativeMethods.WS_EX_TOOLWINDOW | NativeMethods.WS_EX_TOPMOST; return cp; }
             }
         }
 
@@ -1356,10 +1382,25 @@ namespace AppHopper
                 + LogText(GetWindowTitle(fgRaw)) + "\" -> repr 0x" + fg.ToInt64().ToString("X")
                 + " exe=" + LogText(Path.GetFileName(fgExe)));
 
+            // Claim while the real Alt gesture is still current, before slow
+            // enumeration/icon work. A zero-sized tool window has no taskbar
+            // button and receives keyboard input without an unpainted popup.
+            NativeMethods.SetWindowPos(_panel.Handle, IntPtr.Zero, 0, 0, 0, 0,
+                0x0040 /*SWP_SHOWWINDOW*/ | 0x0010 /*SWP_NOACTIVATE*/);
+            _panel.Show(); // Synchronize WinForms visibility with the native zero-size host.
+            if (!ClaimSessionForeground())
+            {
+                Log("start aborted: session panel did not acquire foreground");
+                EndSession();
+                return;
+            }
+
             var order = EnumerateEntries();
             if (order.Count < 2)
             {
                 Log("start aborted: only " + order.Count + " app(s) in cycle");
+                ForceForeground(_fgHwnd);
+                EndSession();
                 return;
             }
 
@@ -1410,9 +1451,8 @@ namespace AppHopper
                    .Append('@').Append(e.Rank).Append(e.Topmost ? "*" : "");
             Log(sb2.ToString());
 
-            foreach (var e in _apps) e.Icon = CachedIcon(e.Exe, e.ReprHwnd);
-
             ShowPanel();
+            foreach (var e in _apps) e.Icon = CachedIcon(e.Exe, e.ReprHwnd);
             RegisterThumbnails();
             RenderChrome();
             InstallMouseHook();
@@ -1426,9 +1466,9 @@ namespace AppHopper
         static void ShowPanel()
         {
             _panel.BackColor = PanelFillC(LightTheme());
-            // SWP_NOACTIVATE: the panel must never take the foreground, or a
-            // later Commit would be handing focus back from one of our own
-            // windows instead of from the app the user started at.
+            // Positioning and refresh never activate as a side effect.
+            // StartSession claims foreground immediately after capturing the
+            // source; subsequent layout and drawing preserve that ownership.
             NativeMethods.SetWindowPos(_panel.Handle, IntPtr.Zero, _layout.panelX, _layout.panelY, _layout.panelW, _layout.panelH,
                                        0x0040 /*SWP_SHOWWINDOW*/ | 0x0010 /*SWP_NOACTIVATE*/);
             IntPtr rgn = NativeMethods.CreateRoundRectRgn(0, 0, _layout.panelW + 1, _layout.panelH + 1, 2 * Logic.Scaled(_scale, 8), 2 * Logic.Scaled(_scale, 8));
@@ -1540,10 +1580,8 @@ namespace AppHopper
             foreach (var e in _apps) e.Thumb = IntPtr.Zero;
         }
 
-        // Take the overlay off screen (thumbnails included) without touching
-        // the entry list. Called by EndSession and - importantly - by
-        // ForceForeground as soon as a switch needs more than the fast path,
-        // so a slow activation is never something the user has to watch.
+        // Hide only after foreground transfer (or during teardown). Hiding the
+        // foreground panel before activation would discard our activation rights.
         static void HideOverlay()
         {
             UnregisterThumbnails();
@@ -1810,42 +1848,105 @@ namespace AppHopper
         {
             if (!NativeMethods.IsWindow(hwnd)) return false;
             if (ForegroundIs(hwnd)) return true;
-            // Do not share input queues with any foreign process, including
-            // Explorer. No injected permission keystrokes or cross-thread focus.
-            // Restore asynchronously so a busy target cannot block this step.
+            // Only the active session panel may transfer foreground. A denied
+            // request from a background process flashes the target's taskbar.
+            if (!SessionOwnsForeground())
+            {
+                Log("  activation skipped: session does not own foreground");
+                return false;
+            }
+            bool permitted = NativeMethods.AllowSetForegroundWindow(NativeMethods.GetCurrentProcessId());
+            Log("  activation permission preflight allowed=" + permitted
+                + " error=" + (permitted ? 0 : Marshal.GetLastWin32Error()));
+            if (!permitted) return false;
             var sw = Stopwatch.StartNew();
             if (NativeMethods.IsIconic(hwnd)) NativeMethods.ShowWindowAsync(hwnd, NativeMethods.SW_RESTORE);
-            bool accepted = false;
-            for (int i = 0; i < 8 && sw.ElapsedMilliseconds < 200; i++)
-            {
-                accepted = NativeMethods.SetForegroundWindow(hwnd);
-                Application.DoEvents();
-                if (ForegroundIs(hwnd))
-                {
-                    Log("  force-fg 0x" + hwnd.ToInt64().ToString("X") + " via sfw#" + (i + 1)
-                        + " accepted=" + accepted + " after " + sw.ElapsedMilliseconds + "ms");
-                    return true;
-                }
-                HideOverlay();
-                // Retain the existing game/UWP fallback, without attached queues.
-                // The deadline bounds retries, not the duration of Win32 calls.
-                NativeMethods.SwitchToThisWindow(hwnd, true);
-                Application.DoEvents();
-                if (ForegroundIs(hwnd))
-                {
-                    Log("  force-fg 0x" + hwnd.ToInt64().ToString("X") + " via sttw#" + (i + 1)
-                        + " after " + sw.ElapsedMilliseconds + "ms");
-                    return true;
-                }
-                System.Threading.Thread.Sleep(15);
-            }
             if (ForegroundIs(hwnd)) return true;
+            if (!SessionOwnsForeground())
+            {
+                Log("  activation skipped: foreground changed during restore");
+                return false;
+            }
+            if (_log != null)
+            {
+                var gui = new NativeMethods.GUITHREADINFO();
+                gui.cbSize = (uint)Marshal.SizeOf(typeof(NativeMethods.GUITHREADINFO));
+                if (NativeMethods.GetGUIThreadInfo(0, ref gui))
+                    Log("  activation foreground queue flags=0x" + gui.flags.ToString("X")
+                        + " active=0x" + gui.hwndActive.ToInt64().ToString("X")
+                        + " focus=0x" + gui.hwndFocus.ToInt64().ToString("X")
+                        + " menu=0x" + gui.hwndMenuOwner.ToInt64().ToString("X"));
+            }
+            bool accepted = NativeMethods.SetForegroundWindow(hwnd);
+            Log("  activation request sfw target=0x" + hwnd.ToInt64().ToString("X")
+                + " accepted=" + accepted + " fg=0x" + NativeMethods.GetForegroundWindow().ToInt64().ToString("X"));
+            if (!ForegroundIs(hwnd) && sw.ElapsedMilliseconds < 200)
+            {
+                uint remaining = (uint)Math.Max(1L, 200L - sw.ElapsedMilliseconds);
+                bool processed = WaitForForegroundNotification(hwnd, remaining);
+                Log("  activation sync target=0x" + hwnd.ToInt64().ToString("X")
+                    + " processed=" + processed + " after " + sw.ElapsedMilliseconds + "ms");
+            }
+            Application.DoEvents();
+            if (ForegroundIs(hwnd))
+            {
+                Log("  force-fg 0x" + hwnd.ToInt64().ToString("X") + " via foreground-handoff"
+                    + " accepted=" + accepted + " after " + sw.ElapsedMilliseconds + "ms");
+                return true;
+            }
             IntPtr stuck = NativeMethods.GetForegroundWindow();
             Log("  force-fg 0x" + hwnd.ToInt64().ToString("X") + " FAILED, fg stuck at 0x"
                 + stuck.ToInt64().ToString("X") + " [" + ClassNameOf(stuck) + "] \""
-                + LogText(GetWindowTitle(stuck)) + "\" accepted=" + accepted
+                + LogText(GetWindowTitle(stuck)) + "\""
                 + " after " + sw.ElapsedMilliseconds + "ms");
             return false;
+        }
+
+        static bool SessionOwnsForeground()
+        {
+            return _panel != null && _panel.IsHandleCreated
+                && NativeMethods.IsWindowVisible(_panel.Handle)
+                && NativeMethods.GetForegroundWindow() == _panel.Handle;
+        }
+
+        static bool ClaimSessionForeground()
+        {
+            bool accepted;
+            bool owns = TryClaimFromForegroundQueue(out accepted);
+            Log("session foreground request hwnd=0x" + _panel.Handle.ToInt64().ToString("X")
+                + " accepted=" + accepted + " owns=" + owns
+                + " fg=0x" + NativeMethods.GetForegroundWindow().ToInt64().ToString("X"));
+            return owns;
+        }
+
+        static bool TryClaimFromForegroundQueue(out bool accepted)
+        {
+            accepted = false;
+            IntPtr source = NativeMethods.GetForegroundWindow();
+            uint current = NativeMethods.GetCurrentThreadId();
+            uint foreground = NativeMethods.GetWindowThreadProcessId(source, IntPtr.Zero);
+            if (source == IntPtr.Zero || foreground == 0 || foreground == current)
+            {
+                accepted = NativeMethods.SetForegroundWindow(_panel.Handle);
+                return SessionOwnsForeground();
+            }
+            if (!WaitForForegroundNotification(source, 50)
+                || NativeMethods.GetForegroundWindow() != source) return SessionOwnsForeground();
+            if (!NativeMethods.AttachThreadInput(current, foreground, true)) return false;
+            bool detached;
+            // Only our own responsive window is activated; never attach a target.
+            // Detach before enumeration, drawing, logging, or target activation.
+            try { accepted = NativeMethods.SetForegroundWindow(_panel.Handle); }
+            finally { detached = NativeMethods.AttachThreadInput(current, foreground, false); }
+            Log("session input-queue handoff accepted=" + accepted + " detached=" + detached);
+            return detached && SessionOwnsForeground();
+        }
+
+        static bool WaitForForegroundNotification(IntPtr hwnd, uint timeoutMs)
+        {
+            IntPtr unused;
+            return NativeMethods.SendMessageTimeoutW(hwnd, 0 /*WM_NULL*/, IntPtr.Zero, IntPtr.Zero,
+                NativeMethods.SMTO_ABORTIFHUNG | NativeMethods.SMTO_ERRORONEXIT, timeoutMs, out unused) != IntPtr.Zero;
         }
 
         // ================= chrome rendering (UpdateLayeredWindow, Hopper-style) =================
@@ -1983,6 +2084,7 @@ namespace AppHopper
                 {
                     // UpdateLayeredWindow does NOT make a hidden window visible;
                     // Hopper shows both windows explicitly (SWP_SHOWWINDOW).
+                    _chrome.Show();
                     NativeMethods.SetWindowPos(_chrome.Handle, IntPtr.Zero, 0, 0, 0, 0,
                                  0x1 | 0x2 | 0x10 | 0x40 /*NOSIZE|NOMOVE|NOACTIVATE|SHOWWINDOW*/);
                     // keep the opaque panel strictly below the chrome layer
@@ -2319,8 +2421,16 @@ namespace AppHopper
 
             _msg = new MsgForm();
             IntPtr hMsg = _msg.Handle;
+            if (_log != null)
+            {
+                uint shellMessage = NativeMethods.RegisterWindowMessage("SHELLHOOK");
+                bool watching = shellMessage != 0 && NativeMethods.RegisterShellHookWindow(hMsg);
+                if (watching) _shellHookMessage = (int)shellMessage;
+                Log("shell flash observer=" + watching + "; activation=foreground-handoff");
+            }
             _panel = new PanelForm();
             _chrome = new ChromeForm();
+            _chrome.Owner = _panel; // Keep card chrome above its activatable host.
             // Record our own handles so a stray foreground window in the commit
             // log can be told apart from one of ours.
             Log("our windows: msg=0x" + hMsg.ToInt64().ToString("X")
@@ -2409,6 +2519,11 @@ namespace AppHopper
             Application.Run();
 
             EndSession();
+            if (_shellHookMessage != 0)
+            {
+                NativeMethods.DeregisterShellHookWindow(hMsg);
+                _shellHookMessage = 0;
+            }
             icon.Visible = false;
             if (_log != null) _log.Dispose();
         }

@@ -9,7 +9,12 @@ set "CSC=C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe"
 if errorlevel 1 goto compile_failed
 "%CSC%" -nologo -target:exe -r:System.dll -r:System.Core.dll -out:"%TEST_DIR%\RegressionTests.exe" tests\RegressionTests.cs
 if errorlevel 1 goto compile_failed
+"%CSC%" -nologo -target:exe -r:System.dll -r:System.Core.dll -r:System.Windows.Forms.dll -out:"%TEST_DIR%\ActivationTests.exe" tests\ActivationTests.cs
+if errorlevel 1 goto compile_failed
 "%TEST_DIR%\RegressionTests.exe" "%TEST_DIR%\AppHopper.exe"
+set "RESULT=%errorlevel%"
+if not "%RESULT%"=="0" goto cleanup
+"%TEST_DIR%\ActivationTests.exe" "%TEST_DIR%\AppHopper.exe"
 set "RESULT=%errorlevel%"
 goto cleanup
 

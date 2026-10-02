@@ -19,10 +19,18 @@ No more "walking through" five Explorer windows to reach the browser: `Alt+Tab` 
 - If disable, commit or a failed post forwards a held `Tab` repeat, its release also passes through so Windows can clear the key state.
 - Honor the first `Alt+Shift+Tab` and its selected page. Partial input insertion releases only keys actually introduced by the replay and still held.
 - Redact window titles and executable names by default. `--log-verbose` alone enables detailed diagnostics. Complete UTF-8 records are limited to 8 MiB.
-- Remove F24 injection and all `AttachThreadInput` queue sharing. Restore minimized targets asynchronously; retain foreground landing checks and the game/UWP switching fallback.
+- Remove F24 permission-key injection and input-queue attachment to activation targets. Restore minimized targets asynchronously and retain actual foreground landing checks.
 - Check autostart paths, reparse points, file and ancestor ACLs. Reject locations writable by untrusted identities and report registration failure instead of marking the menu enabled.
 
 This beta does not guarantee elimination of taskbar flashing. Regression tests cover input, logging and autostart protection; isolated-desktop smoke runs do not replace rapid switching, game or UWP checks on the input desktop.
+
+## 1.1.2beta2
+
+- Capture the original foreground, then claim a zero-sized, activatable, taskbar-free host before enumeration and rendering. Check the current foreground window's responsiveness with a 50ms timeout, briefly join its input queue to activate our host, and detach in `finally` before proceeding. Do not make a rejected background activation first or attach the target thread.
+- Keep WinForms and native visibility synchronized for both layers. Own the card chrome with the host so titles, card borders and selection remain above the activated thumbnail host.
+- Before committing, require our host to remain foreground and preflight this process with `AllowSetForegroundWindow`. Without eligibility, do not restore or request the target. Otherwise restore minimized targets asynchronously, request `SetForegroundWindow` once, synchronize with bounded `WM_NULL`, and verify the actual foreground. Remove the `SwitchToThisWindow` fallback.
+- `--log` records host acquisition, queue detachment, permission preflight, target acceptance and read-only `HSHELL_FLASH` HWNDs. Startup reports `shell flash observer=True; activation=foreground-handoff`. Failed observer registration, a full log or an unwritable log invalidates a no-notifications conclusion.
+- Windows 10 input-desktop smoke: 20 system-input-injected Alt+Tab gestures between Orca and ZCode, all handled by AppHopper without native fallback; every target request accepted, Alt released after every gesture, zero target Shell flash notifications, and the starting application restored. This does not cover every application, physical hardware input, games or UWP.
 
 ## Highlights
 
@@ -61,7 +69,7 @@ Run `AppHopper.exe` — a tray icon appears (right-click: *Enabled*, *Start with
 
 The app list is computed each time the switcher opens; there is nothing to configure. Launch with `--log` for an 8 MiB log that redacts window titles and executable names while retaining HWNDs, window classes and timing. Use `--log-verbose` for full enumeration details; inspect sensitive content before sharing it. `hotkey: alt+tab -> start`, `start aborted:`, and `alt+tab fallback:` identify message dispatch, startup failure and intentional fallback. Missing records alone do not prove a hook miss: the log may also be full or unwritable.
 
-`AppHopper.exe --self-test` runs pure layout checks. `self-test.bat` compiles the current source and `tests/RegressionTests.cs` into a temporary directory, runs input-state, log-boundary and ACL regressions, then removes the outputs. It does not replace the running exe, install hooks, change foreground focus or write an autostart registration. Exit code 0 means success.
+`AppHopper.exe --self-test` runs pure layout checks. `self-test.bat` compiles the current source, `tests/RegressionTests.cs` and `tests/ActivationTests.cs` into a temporary directory, runs input-state, log-boundary, ACL and real cross-thread synchronization regressions, then removes the outputs. Synchronization uses hidden windows on a non-input desktop. It does not replace the running exe, install hooks, change foreground focus or write an autostart registration. Exit code 0 means success.
 
 `Start with Windows` requires a protected installation under `Program Files` or `Program Files (x86)`, without reparse points or file/ancestor ACLs permitting untrusted modification. HKCU Run registration does not bypass UAC; Windows may block elevated startup, so unattended launch is not guaranteed.
 
@@ -70,7 +78,7 @@ The app list is computed each time the switcher opens; there is nothing to confi
 - The keyboard hook consumes `Alt+Tab` only after posting succeeds and consumes its matching `Tab` release. Aborted startup replays tagged input to the native switcher; physical `Alt` releases are never intercepted.
 - Top-level windows are enumerated in Z-order, filtered by the classic Alt-Tab eligibility rules plus a current-desktop check, then grouped by process image path (UWP windows are attributed to their hosted app via the child `Windows.UI.Core.CoreWindow`).
 - Live previews are `DwmRegisterThumbnail` composites rendered into an opaque rounded panel; the card chrome (headers, strokes, focus ring, page indicator) is drawn with GDI+ into a premultiplied-alpha DIB and composited with `UpdateLayeredWindow` — the same two-layer design as the PowerToys module it was ported from.
-- Activation uses `SetForegroundWindow` without sharing foreign input queues or injecting permission keystrokes; minimized targets are restored via `ShowWindowAsync`. Failure retains `SwitchToThisWindow` and foreground landing checks. The 200ms/300ms budgets bound retries and waiting, not Win32 calls or message processing, and cannot override Windows foreground restrictions.
+- Activation hands off from our foreground host without injecting permission keys. Only acquisition of our host briefly joins the current foreground thread; the queues are detached before target activation. Minimized targets restore via `ShowWindowAsync`. A bounded `WM_NULL` synchronizes cross-queue activation before checking the actual foreground; see [Microsoft's explanation](https://devblogs.microsoft.com/oldnewthing/20161118-00/?p=94745/). The 50ms responsiveness check and 200ms/300ms synchronization/landing budgets are not hard timeouts for every Win32 call. The foreground thread can still hang between its check and queue attachment, and Windows foreground restrictions still apply.
 
 ## Acknowledgements
 
