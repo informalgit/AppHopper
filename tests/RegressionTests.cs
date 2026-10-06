@@ -83,6 +83,12 @@ static class RegressionTests
         if (args.Length != 1) { Console.Error.WriteLine("Usage: RegressionTests.exe <AppHopper build>"); return 2; }
         program = Assembly.LoadFile(Path.GetFullPath(args[0])).GetType("AppHopper.Program");
         Test("existing layout, crop, paging and ordering checks", delegate { Check((bool)Call("RunSelfTests"), "self-test failed"); });
+        Test("cloak filtering keeps transient desktop-switch windows eligible", delegate
+        {
+            Check((string)Call("CloakIneligibilityReason", 1, true) == "cloaked", "app cloak accepted");
+            Check((string)Call("CloakIneligibilityReason", 2, false) == "other-desktop", "other-desktop cloak accepted");
+            Check(Call("CloakIneligibilityReason", 2, true) == null, "current-desktop shell cloak rejected");
+        });
         Test("default sensitive-field redaction", delegate
         {
             Set("_logVerbose", false);

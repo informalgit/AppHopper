@@ -1084,10 +1084,22 @@ namespace AppHopper
             return count == 1 ? found : IntPtr.Zero;
         }
 
-        static bool IsCloaked(IntPtr hwnd)
+        static int CloakState(IntPtr hwnd)
         {
             int v;
-            return NativeMethods.DwmGetWindowAttribute(hwnd, 14 /*DWMWA_CLOAKED*/, out v, 4) == 0 && v != 0;
+            return NativeMethods.DwmGetWindowAttribute(hwnd, 14 /*DWMWA_CLOAKED*/, out v, 4) == 0 ? v : 0;
+        }
+
+        static bool IsCloaked(IntPtr hwnd) { return CloakState(hwnd) != 0; }
+
+        static string CloakIneligibilityReason(int cloak, bool onCurrentDesktop)
+        {
+            // DWM_CLOAKED_APP (1): app explicitly hid its own content.
+            // DWM_CLOAKED_SHELL (2): shell parked window on another desktop,
+            // but this flag can transiently linger while switching desktops.
+            if ((cloak & 1) != 0) return "cloaked";
+            if ((cloak & 2) != 0 && !onCurrentDesktop) return "other-desktop";
+            return null;
         }
 
         // A layered window with alpha 0 is "visible" and uncloaked but shows
@@ -1161,14 +1173,10 @@ namespace AppHopper
             if (cn == ClassCoreWindow) return "corewindow";
             if (cn == "Progman" || cn == "WorkerW") return "desktop";
 
-            // Cloak rule (native/Hopper parity): any cloaked window is out.
-            // DWM_CLOAKED_SHELL (2) covers windows parked on other virtual
-            // desktops (Windows implements virtual desktops by cloaking);
-            // DWM_CLOAKED_APP (1) covers windows an app hid itself (suspended
-            // UWP helper windows, background UI). A suspended UWP app's frame
-            // itself stays uncloaked, so suspended apps remain listed - and
-            // activating one wakes it.
-            if (IsCloaked(hwnd)) return "cloaked";
+            bool onCurrentDesktop = OnCurrentDesktop(hwnd);
+            int cloak = CloakState(hwnd);
+            string cloakWhy = CloakIneligibilityReason(cloak, onCurrentDesktop);
+            if (cloakWhy != null) return cloakWhy;
 
             // Fully transparent (opacity 0) - see IsAlphaInvisible. Same
             // user-visible effect as cloaked/invisible: nothing to show, no
@@ -1181,7 +1189,7 @@ namespace AppHopper
             string title = GetWindowTitle(hwnd);
             if (title.Length == 0) return "no-title";
             if (title == "Windows Input Experience") return "input-experience";
-            if (!OnCurrentDesktop(hwnd)) return "other-desktop";
+            if (!onCurrentDesktop) return "other-desktop";
 
             NativeMethods.RECT r;
             if (NativeMethods.GetWindowRect(hwnd, out r) && r.Right - r.Left <= 1 && r.Bottom - r.Top <= 1) return "tiny";
@@ -1509,9 +1517,10 @@ namespace AppHopper
                 // so they thumbnail just like any other window; skipping them
                 // is what left most tiles blank on a machine where most
                 // windows sit minimized.
-                if (IsCloaked(app.ReprHwnd))
+                string cloakWhy = CloakIneligibilityReason(CloakState(app.ReprHwnd), OnCurrentDesktop(app.ReprHwnd));
+                if (cloakWhy != null)
                 {
-                    Log("  thumb: no content (cloaked) for 0x" + app.ReprHwnd.ToInt64().ToString("X"));
+                    Log("  thumb: no content (" + cloakWhy + ") for 0x" + app.ReprHwnd.ToInt64().ToString("X"));
                     continue;
                 }
                 IntPtr tid;
@@ -1523,16 +1532,8 @@ namespace AppHopper
                 }
                 _thumbs.Add(tid);
 
-                NativeMethods.RECT client = new NativeMethods.RECT();
                 NativeMethods.SIZE srcSize;
-                bool clientOnly = !NativeMethods.IsIconic(app.ReprHwnd) && NativeMethods.GetClientRect(app.ReprHwnd, out client);
-                if (clientOnly) clientOnly = client.Right - client.Left > 0 && client.Bottom - client.Top > 0;
-                if (clientOnly)
-                {
-                    srcSize.cx = client.Right - client.Left;
-                    srcSize.cy = client.Bottom - client.Top;
-                }
-                else if (NativeMethods.DwmQueryThumbnailSourceSize(tid, out srcSize) != 0)
+                if (NativeMethods.DwmQueryThumbnailSourceSize(tid, out srcSize) != 0)
                 {
                     srcSize.cx = 0; srcSize.cy = 0;
                 }
@@ -1549,23 +1550,16 @@ namespace AppHopper
                 app.Thumb = tid;
 
                 NativeMethods.RECT avail = new NativeMethods.RECT { Left = 0, Top = 0, Right = srcSize.cx, Bottom = srcSize.cy };
-                if (clientOnly)
-                {
-                    int ix = Math.Min(2, (avail.Right - avail.Left) / 4);
-                    int iy = Math.Min(2, (avail.Bottom - avail.Top) / 4);
-                    avail.Left += ix; avail.Right -= ix;
-                    avail.Top += iy; avail.Bottom -= iy;
-                }
                 NativeMethods.RECT rcSrc = Logic.CoverSource(pv, avail);
 
                 var props = new NativeMethods.DWM_THUMBNAIL_PROPERTIES
                 {
-                    dwFlags = 0x1 | 0x2 | 0x4 | 0x8 | 0x10, // DEST|SOURCE|OPACITY|VISIBLE|CLIENTONLY
+                    dwFlags = 0x1 | 0x2 | 0x4 | 0x8, // DEST|SOURCE|OPACITY|VISIBLE
                     rcDestination = pv,
                     rcSource = rcSrc,
                     opacity = 255,
                     fVisible = true,
-                    fSourceClientAreaOnly = clientOnly
+                    fSourceClientAreaOnly = false
                 };
                 NativeMethods.DwmUpdateThumbnailProperties(tid, ref props);
             }
@@ -1762,7 +1756,8 @@ namespace AppHopper
             for (int i = 0; i < _apps.Count; i++)
             {
                 IntPtr h = _apps[i].ReprHwnd;
-                if (!NativeMethods.IsWindow(h) || !NativeMethods.IsWindowVisible(h) || IsCloaked(h))
+                if (!NativeMethods.IsWindow(h) || !NativeMethods.IsWindowVisible(h)
+                    || CloakIneligibilityReason(CloakState(h), OnCurrentDesktop(h)) != null)
                 {
                     Log("refresh: entry \"" + LogText(_apps[i].Title) + "\" is gone");
                     RefreshEntries();
@@ -2371,6 +2366,9 @@ namespace AppHopper
                     new NativeMethods.RECT { Left = 0, Top = 0, Right = 160, Bottom = 90 },
                     new NativeMethods.RECT { Left = 0, Top = 0, Right = 400, Bottom = 300 });
                 if ((crop.Right - crop.Left) * 90 != (crop.Bottom - crop.Top) * 160) return false;
+                if (CloakIneligibilityReason(1, true) != "cloaked") return false;
+                if (CloakIneligibilityReason(2, false) != "other-desktop") return false;
+                if (CloakIneligibilityReason(2, true) != null) return false;
 
                 AppEntry pinned = new AppEntry { ReprHwnd = new IntPtr(1), Rank = 20, Topmost = false };
                 AppEntry topmost = new AppEntry { ReprHwnd = new IntPtr(2), Rank = 1, Topmost = true };
