@@ -32,7 +32,7 @@ using System.Windows.Forms;
 // runtime via AppVersion, so this is the single place a version lives.
 [assembly: System.Reflection.AssemblyVersion("1.1.2.0")]
 [assembly: System.Reflection.AssemblyFileVersion("1.1.2.0")]
-[assembly: System.Reflection.AssemblyInformationalVersion("1.1.2beta2")]
+[assembly: System.Reflection.AssemblyInformationalVersion("1.1.2beta5")]
 
 namespace AppHopper
 {
@@ -218,6 +218,8 @@ namespace AppHopper
         public static extern IntPtr GetModuleHandle(string lpModuleName);
         [DllImport("user32.dll")]
         public static extern IntPtr GetForegroundWindow();
+        [DllImport("user32.dll")]
+        public static extern IntPtr GetDesktopWindow();
         [DllImport("user32.dll")]
         public static extern short GetAsyncKeyState(int vKey);
         [DllImport("user32.dll")]
@@ -689,6 +691,9 @@ namespace AppHopper
         static int _index;
         static int _pageStart;
         static IntPtr _fgHwnd;
+        // Foreground handover that Cancel deferred because the Alt gesture was
+        // still running; completed by FinishCancelHandover after the release.
+        static IntPtr _cancelRestore;
         static Logic.OverlayLayout _layout;
         static NativeMethods.RECT _panelRect;
         static NativeMethods.RECT _work;    // work area of the monitor the overlay lives on
@@ -1311,7 +1316,13 @@ namespace AppHopper
                 string why = AltTabIneligibilityReason(hwnd);
                 if (why != null)
                 {
-                    if (_log != null)
+                    // Verbose only: this fires for EVERY top-level window on the
+                    // machine (~900 here) on EVERY Alt+Tab, and each Log is a
+                    // Flush() to disk on the startup path - which pushed the
+                    // first paint past 300ms and exhausted the 8MB log cap
+                    // within minutes. Without --log-verbose these lines carry
+                    // no information anyway (titles are redacted).
+                    if (_logVerbose)
                         Log("  skip 0x" + hwnd.ToInt64().ToString("X") + " [" + ClassNameOf(hwnd)
                             + "] \"" + LogText(GetWindowTitle(hwnd)) + "\" - " + why);
                     return true;
@@ -1378,16 +1389,38 @@ namespace AppHopper
             IntPtr fg = RepresentativeOf(fgRaw);
             if (fg == IntPtr.Zero || !NativeMethods.IsWindowVisible(fg)) fg = fgRaw;
             _fgHwnd = fg;
+            // Claiming foreground can close a transient system switcher window.
+            // Preserve its monitor geometry while the source handle is still valid.
+            NativeMethods.RECT work;
+            double scale = MonitorScale(fg, out work);
             Log("fg 0x" + fgRaw.ToInt64().ToString("X") + " [" + ClassNameOf(fgRaw) + "] \""
                 + LogText(GetWindowTitle(fgRaw)) + "\" -> repr 0x" + fg.ToInt64().ToString("X")
                 + " exe=" + LogText(Path.GetFileName(fgExe)));
 
             // Claim while the real Alt gesture is still current, before slow
-            // enumeration/icon work. A zero-sized tool window has no taskbar
-            // button and receives keyboard input without an unpainted popup.
-            NativeMethods.SetWindowPos(_panel.Handle, IntPtr.Zero, 0, 0, 0, 0,
-                0x0040 /*SWP_SHOWWINDOW*/ | 0x0010 /*SWP_NOACTIVATE*/);
-            _panel.Show(); // Synchronize WinForms visibility with the native zero-size host.
+            // enumeration/icon work.
+            //
+            // The host must have a REAL size while it claims the foreground.
+            // A zero-sized window still becomes GetForegroundWindow(), but
+            // Windows then refuses to let it hand the foreground on: every
+            // SetForegroundWindow issued from the session was rejected, and
+            // the rejection is what flashes the target's taskbar button.
+            // The log showed exactly that - host foreground, focus=0x0,
+            // accepted=False. So size it from the source window, which is
+            // already known good, and park it exactly where that window is so
+            // the host is never briefly visible somewhere else. The real
+            // panel geometry is applied right after the layout is computed.
+            //
+            // Measured: keeping the previous position instead (SWP_NOMOVE)
+            // makes no difference to activation - both configurations refused
+            // the same requests on the same targets.
+            NativeMethods.RECT host;
+            bool sized = NativeMethods.GetWindowRect(fgRaw, out host) && host.Right > host.Left && host.Bottom > host.Top;
+            if (!sized) host = new NativeMethods.RECT { Left = 0, Top = 0, Right = 1, Bottom = 1 };
+            NativeMethods.SetWindowPos(_panel.Handle, IntPtr.Zero, host.Left, host.Top,
+                host.Right - host.Left, host.Bottom - host.Top,
+                0x0040 /*SWP_SHOWWINDOW*/ | 0x0010 /*SWP_NOACTIVATE*/ | 0x0004 /*SWP_NOZORDER*/);
+            _panel.Show(); // Synchronize WinForms visibility with the native host.
             if (!ClaimSessionForeground())
             {
                 Log("start aborted: session panel did not acquire foreground");
@@ -1404,8 +1437,7 @@ namespace AppHopper
                 return;
             }
 
-            NativeMethods.RECT work;
-            _scale = MonitorScale(fg, out work);
+            _scale = scale;
             _work = work;
             Logic.ComputeLayout(work, order.Count, _scale, ref _layout);
 
@@ -1476,6 +1508,10 @@ namespace AppHopper
             {
                 if (!NativeMethods.SetWindowRgn(_panel.Handle, rgn, false)) NativeMethods.DeleteObject(rgn);
             }
+            // Resize/region changes queue background paint, while the layered
+            // cards are submitted immediately. Complete paint before the cards
+            // can expose the previous session's background surface.
+            _panel.Refresh();
         }
 
         static void MoveIndex(int delta)
@@ -1715,11 +1751,56 @@ namespace AppHopper
                 // Hand the foreground back to the window that had it when the
                 // cycle opened, so hiding our topmost windows cannot park the
                 // foreground on a hidden window of ours.
-                if (NativeMethods.IsWindow(_fgHwnd)) { NativeMethods.SetForegroundWindow(_fgHwnd); Application.DoEvents(); }
+                //
+                // But NOT while Alt is still held: releasing the foreground in
+                // the middle of the Alt+Tab gesture is recorded by Windows as
+                // a foreground ownership change, which flashes the restored
+                // window's taskbar button (the "press ESC without releasing
+                // Alt and the taskbar blinks" report). The watchdog commits
+                // within 30ms of the Alt release, so the handover happens
+                // then instead - by which point the gesture is over and the
+                // handback is silent.
+                if (NativeMethods.IsWindow(_fgHwnd) && !AltDown())
+                {
+                    NativeMethods.SetForegroundWindow(_fgHwnd);
+                    Application.DoEvents();
+                }
+                else if (NativeMethods.IsWindow(_fgHwnd))
+                {
+                    Log("  cancel: alt still held, deferring the foreground handback");
+                    _cancelRestore = _fgHwnd;
+                }
                 EndSession();
                 Log("cancel");
             }
             finally { _committing = false; }
+        }
+
+        // Completes a deferred Cancel handover once the Alt gesture is over.
+        // Driven by the watchdog tick, which fires within 30ms of the release.
+        static void FinishCancelHandover()
+        {
+            IntPtr target = _cancelRestore;
+            if (target == IntPtr.Zero) return;
+            if (AltDown()) return;
+            _cancelRestore = IntPtr.Zero;
+            if (!NativeMethods.IsWindow(target)) { Log("  cancel: handback dropped, target gone"); return; }
+            // Somebody already owns the foreground - a real app the user moved
+            // to, or the source window Windows restored by itself once our
+            // overlay went away - so leave it alone.
+            IntPtr fg = NativeMethods.GetForegroundWindow();
+            if (fg != IntPtr.Zero && !IsOwnWindow(fg))
+            {
+                Log("  cancel: handback unnecessary, foreground already at 0x"
+                    + fg.ToInt64().ToString("X"));
+                return;
+            }
+            // Otherwise the foreground is parked on one of our own now-hidden
+            // windows (or nowhere), which is the case this exists to fix.
+            NativeMethods.SetForegroundWindow(target);
+            Application.DoEvents();
+            Log("  cancel: foreground handed back after the alt release fg=0x"
+                + NativeMethods.GetForegroundWindow().ToInt64().ToString("X"));
         }
 
         static void EndSession()
@@ -1855,13 +1936,22 @@ namespace AppHopper
                 Log("  activation skipped: session does not own foreground");
                 return false;
             }
-            bool permitted = NativeMethods.AllowSetForegroundWindow(NativeMethods.GetCurrentProcessId());
-            Log("  activation permission preflight allowed=" + permitted
-                + " error=" + (permitted ? 0 : Marshal.GetLastWin32Error()));
-            if (!permitted) return false;
             var sw = Stopwatch.StartNew();
-            if (NativeMethods.IsIconic(hwnd)) NativeMethods.ShowWindowAsync(hwnd, NativeMethods.SW_RESTORE);
-            if (ForegroundIs(hwnd)) return true;
+            if (NativeMethods.IsIconic(hwnd))
+            {
+                NativeMethods.ShowWindowAsync(hwnd, NativeMethods.SW_RESTORE);
+                // SW_RESTORE is asynchronous: activating while the window is
+                // still minimized is refused, and the refusal is what flashes
+                // the taskbar button. Wait for it to actually leave the
+                // minimized state, bounded so a target that refuses to restore
+                // cannot stall the commit.
+                for (int waited = 0; waited < 250 && NativeMethods.IsIconic(hwnd); waited += 10)
+                {
+                    System.Threading.Thread.Sleep(10);
+                    Application.DoEvents();
+                }
+                Log("  activation restore waited=" + sw.ElapsedMilliseconds + "ms iconic=" + NativeMethods.IsIconic(hwnd));
+            }
             if (!SessionOwnsForeground())
             {
                 Log("  activation skipped: foreground changed during restore");
@@ -1877,10 +1967,41 @@ namespace AppHopper
                         + " focus=0x" + gui.hwndFocus.ToInt64().ToString("X")
                         + " menu=0x" + gui.hwndMenuOwner.ToInt64().ToString("X"));
             }
+            // A refused SetForegroundWindow is not a veto, it is a retryable
+            // condition. On this machine 11 of 38 commits were refused on the
+            // first call and every one of those failed to switch (the accepted
+            // ones succeeded 27/27) - the old code gave up 7ms after the
+            // refusal while it still owned the foreground.
+            //
+            // Two rules keep that from turning into the taskbar flicker the
+            // refusal itself causes:
+            //   - escalate straight to the input-queue handoff instead of
+            //     repeating the plain request, which was refused N times and
+            //     flashed the target N times;
+            //   - never re-request after a handoff has run: if one did not
+            //     take, more of the same will not either.
             bool accepted = NativeMethods.SetForegroundWindow(hwnd);
             Log("  activation request sfw target=0x" + hwnd.ToInt64().ToString("X")
                 + " accepted=" + accepted + " fg=0x" + NativeMethods.GetForegroundWindow().ToInt64().ToString("X"));
-            if (!ForegroundIs(hwnd) && sw.ElapsedMilliseconds < 200)
+            bool handedOff = false;
+            if (!ForegroundIs(hwnd) && !accepted)
+            {
+                // Only the active session panel may transfer foreground, so a
+                // host that already lost it must stop rather than flash the
+                // target from the background.
+                if (SessionOwnsForeground())
+                {
+                    Log("  activation refused with the host still foreground, escalating to an input-queue handoff");
+                    handedOff = ForceForegroundViaHandoff(hwnd);
+                }
+                else
+                {
+                    Log("  activation stopped: host no longer owns foreground");
+                }
+            }
+            // A request that was accepted but has not landed yet is still in
+            // flight; synchronize with the target instead of re-requesting.
+            if (!ForegroundIs(hwnd) && accepted && !handedOff && sw.ElapsedMilliseconds < 200)
             {
                 uint remaining = (uint)Math.Max(1L, 200L - sw.ElapsedMilliseconds);
                 bool processed = WaitForForegroundNotification(hwnd, remaining);
@@ -1900,6 +2021,52 @@ namespace AppHopper
                 + LogText(GetWindowTitle(stuck)) + "\""
                 + " after " + sw.ElapsedMilliseconds + "ms");
             return false;
+        }
+
+        // Last resort for a target that refuses plain SetForegroundWindow.
+        //
+        // Hand the foreground RIGHT to the target process first. This is the
+        // documented way to grant another process the right to call
+        // SetForegroundWindow, and it is the opposite of the preflight that
+        // was removed earlier: that one passed OUR OWN pid (the API only
+        // accepts ASFW_ANY or a *different* process, so it always failed and
+        // vetoed 26 of 124 commits). Granting the target is both correct and
+        // silent - it produces no shell flash, unlike a refused request.
+        //
+        // Only then fall back to joining the target's input queue, which is
+        // what makes the request stick for a target that ignores the grant.
+        // AttachThreadInput is treated by Windows as a foreground ownership
+        // change and flashes every candidate, so it stays the last step.
+        static bool ForceForegroundViaHandoff(IntPtr hwnd)
+        {
+            uint target = NativeMethods.GetWindowThreadProcessId(hwnd, IntPtr.Zero);
+            uint current = NativeMethods.GetCurrentThreadId();
+            if (target == 0 || target == current) return false;
+
+            uint pid;
+            NativeMethods.GetWindowThreadProcessId(hwnd, out pid);
+            bool granted = false;
+            if (pid != 0 && pid != NativeMethods.GetCurrentProcessId())
+            {
+                granted = NativeMethods.AllowSetForegroundWindow(pid);
+                Log("  activation foreground grant to pid=" + pid + " ok=" + granted
+                    + " error=" + (granted ? 0 : Marshal.GetLastWin32Error()));
+            }
+            if (granted && NativeMethods.SetForegroundWindow(hwnd) && ForegroundIs(hwnd)) return true;
+
+            if (!WaitForForegroundNotification(hwnd, 50)) return false;
+            if (!NativeMethods.AttachThreadInput(current, target, true)) return false;
+            bool detached = false;
+            try
+            {
+                // No BringWindowToTop: it bypasses the foreground lock and is
+                // exactly what makes the target flash without coming up.
+                NativeMethods.SetForegroundWindow(hwnd);
+            }
+            finally { detached = NativeMethods.AttachThreadInput(current, target, false); }
+            Log("  activation input-queue handoff detached=" + detached
+                + " owns=" + NativeMethods.GetForegroundWindow().ToInt64().ToString("X"));
+            return detached && ForegroundIs(hwnd);
         }
 
         static bool SessionOwnsForeground()
@@ -1932,6 +2099,18 @@ namespace AppHopper
             }
             if (!WaitForForegroundNotification(source, 50)
                 || NativeMethods.GetForegroundWindow() != source) return SessionOwnsForeground();
+            // Normal activation first: it is the only path that does not make
+            // Windows flash every candidate window. A refused SetForegroundWindow
+            // is what flashes the target's taskbar button, so it must stay the
+            // exception rather than the routine.
+            accepted = NativeMethods.SetForegroundWindow(_panel.Handle);
+            if (SessionOwnsForeground()) return true;
+            if (NativeMethods.GetForegroundWindow() != source) return SessionOwnsForeground();
+            // UWP and other hosts that refuse plain activation: join the input
+            // queue once. Windows treats that as a foreground ownership change
+            // and flashes every candidate, which is why it is the last resort -
+            // but the claim has to succeed before the user can pick anything,
+            // so there is no alternative to it here.
             if (!NativeMethods.AttachThreadInput(current, foreground, true)) return false;
             bool detached;
             // Only our own responsive window is activated; never attach a target.
@@ -1956,6 +2135,11 @@ namespace AppHopper
             if (w <= 0 || h <= 0) return;
             bool light = LightTheme();
             Color accent = AccentColor();
+            // One font + one text brush per repaint instead of one per card.
+            // RenderChrome runs on every Tab keypress; constructing (and
+            // disposing) a Font per tile was pure overhead on the hot path.
+            var headerFont = new Font("Segoe UI", Logic.Scaled(_scale, 14), GraphicsUnit.Pixel);
+            var headerBrush = new SolidBrush(HeaderTextC(light));
 
             IntPtr screenDc = NativeMethods.GetDC(IntPtr.Zero);
             var bmi = new NativeMethods.BITMAPINFOHEADER();
@@ -1963,7 +2147,7 @@ namespace AppHopper
             bmi.biWidth = w; bmi.biHeight = -h; bmi.biPlanes = 1; bmi.biBitCount = 32; bmi.biCompression = 0;
             IntPtr bits;
             IntPtr dib = NativeMethods.CreateDIBSection(screenDc, ref bmi, 0, out bits, IntPtr.Zero, 0);
-            if (dib == IntPtr.Zero) { NativeMethods.ReleaseDC(IntPtr.Zero, screenDc); return; }
+            if (dib == IntPtr.Zero) { headerBrush.Dispose(); headerFont.Dispose(); NativeMethods.ReleaseDC(IntPtr.Zero, screenDc); return; }
 
             try
             {
@@ -1978,7 +2162,6 @@ namespace AppHopper
                         g.DrawPath(pen, panelPath);
                     panelPath.Dispose();
 
-                    Color textClr = HeaderTextC(light);
                     int pageEnd = Math.Min(_pageStart + _layout.pageSize, _apps.Count);
                     for (int i = _pageStart, slot = 0; i < pageEnd; ++i, ++slot)
                     {
@@ -2030,14 +2213,10 @@ namespace AppHopper
                             textLeft = hdr.Left + _layout.iconSize + Logic.Scaled(_scale, 8);
                         }
                         string title = string.IsNullOrEmpty(app.Title) ? Path.GetFileName(app.Exe) : app.Title;
-                        using (var f = new Font("Segoe UI", Logic.Scaled(_scale, 14), GraphicsUnit.Pixel))
-                        using (var b = new SolidBrush(textClr))
-                        {
-                            var rect = new RectangleF(textLeft, tile.Top, hdr.Right - textLeft, _layout.headerH);
-                            var sf = new StringFormat { FormatFlags = StringFormatFlags.NoWrap, Trimming = StringTrimming.EllipsisCharacter, LineAlignment = StringAlignment.Center };
-                            g.DrawString(title, f, b, rect, sf);
-                            sf.Dispose();
-                        }
+                        var rect = new RectangleF(textLeft, tile.Top, hdr.Right - textLeft, _layout.headerH);
+                        var sf = new StringFormat { FormatFlags = StringFormatFlags.NoWrap, Trimming = StringTrimming.EllipsisCharacter, LineAlignment = StringAlignment.Center };
+                        g.DrawString(title, headerFont, headerBrush, rect, sf);
+                        sf.Dispose();
 
                         if (sel)
                         {
@@ -2059,14 +2238,10 @@ namespace AppHopper
                     if (totalPages > 1)
                     {
                         int cur = _pageStart / pageSize + 1;
-                        using (var f = new Font("Segoe UI", Logic.Scaled(_scale, 14), GraphicsUnit.Pixel))
-                        using (var b = new SolidBrush(textClr))
-                        {
-                            var rect = new RectangleF(_layout.pad, h - _layout.pad, w - 2 * _layout.pad, _layout.pad);
-                            var sf = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Far };
-                            g.DrawString(cur + " / " + totalPages, f, b, rect, sf);
-                            sf.Dispose();
-                        }
+                        var rect = new RectangleF(_layout.pad, h - _layout.pad, w - 2 * _layout.pad, _layout.pad);
+                        var sf = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Far };
+                        g.DrawString(cur + " / " + totalPages, headerFont, headerBrush, rect, sf);
+                        sf.Dispose();
                     }
                     g.Flush(FlushIntention.Sync);
                 }
@@ -2098,6 +2273,8 @@ namespace AppHopper
             finally
             {
                 NativeMethods.DeleteObject(dib);
+                headerBrush.Dispose();
+                headerFont.Dispose();
                 NativeMethods.ReleaseDC(IntPtr.Zero, screenDc);
             }
         }
@@ -2344,65 +2521,383 @@ namespace AppHopper
             catch { return false; }
         }
 
-        // Pure-logic regression checks, run by self-test.bat via
-        // "AppHopper.exe --self-test". No GUI, no hooks, no windows - safe to
-        // run at any time and with an instance already running.
-        //
-        // These guard the layout/paging/sort maths specifically, because that
-        // is the part that has actually regressed before: a rewrite of
-        // ComputeLayout dropped the "clamp the column count to the window
-        // count" step, so a 2-window list still drew a 6-column-wide panel.
-        // The first assertion below fails in exactly that case.
+        // ================= self-test =================
+        // Run by `AppHopper.exe --self-test`. Everything lives in this binary:
+        // there are no separate test executables to compile, ship or keep in
+        // sync. The suite is checked in Main BEFORE the single-instance
+        // mutex, so it also runs while the switcher is already up.
+        static int _testFailures;
+
+        static void Check(bool ok, string message)
+        {
+            if (!ok) throw new Exception(message);
+        }
+
+        static void Test(string name, Action body)
+        {
+            try { body(); Console.WriteLine("PASS " + name); }
+            catch (Exception e) { _testFailures++; Console.WriteLine("FAIL " + name + ": " + e.Message); }
+        }
+
+        // Swap in a throwaway log sink so the assertions can read what would
+        // have been written, without touching the real file.
+        static string CaptureLog(Action body)
+        {
+            var bytes = new MemoryStream();
+            var writer = new StreamWriter(bytes, new UTF8Encoding(false));
+            StreamWriter previous = _log;
+            long previousBytes = _logBytes;
+            _log = writer;
+            _logBytes = 0;
+            try { body(); writer.Flush(); return Encoding.UTF8.GetString(bytes.ToArray()); }
+            finally { _log = previous; _logBytes = previousBytes; writer.Dispose(); }
+        }
+
+        // Drives the low-level hook with one synthetic keystroke and returns
+        // its raw disposition. Non-zero means "swallowed". The pass-through
+        // value itself comes from CallNextHookEx and is unspecified when no
+        // hook is installed, so assertions target our own return of 1 and the
+        // latches it maintains - never the pass-through value.
+        static IntPtr Hook(uint vk, uint flags, IntPtr tag)
+        {
+            NativeMethods.KBDLLHOOKSTRUCT data = new NativeMethods.KBDLLHOOKSTRUCT();
+            data.vkCode = vk;
+            data.flags = flags;
+            data.dwExtraInfo = tag;
+            IntPtr memory = Marshal.AllocHGlobal(Marshal.SizeOf(typeof(NativeMethods.KBDLLHOOKSTRUCT)));
+            try
+            {
+                Marshal.StructureToPtr(data, memory, false);
+                return KbHookProc(0, new IntPtr((flags & NativeMethods.LLKHF_UP) != 0 ? 0x101 : 0x100), memory);
+            }
+            finally { Marshal.FreeHGlobal(memory); }
+        }
+
+        static bool Swallowed(IntPtr disposition) { return disposition == new IntPtr(1); }
+
+        static FileSecurity TestAcl(string owner, string writer)
+        {
+            var acl = new FileSecurity();
+            acl.SetOwner(new SecurityIdentifier(owner));
+            acl.AddAccessRule(new FileSystemAccessRule(new SecurityIdentifier("S-1-5-32-544"), FileSystemRights.FullControl, AccessControlType.Allow));
+            if (writer != null) acl.AddAccessRule(new FileSystemAccessRule(new SecurityIdentifier(writer), FileSystemRights.Write, AccessControlType.Allow));
+            return acl;
+        }
+
+        // State every test restores before it exits; a failure must not leak
+        // into the next one.
+        static bool[] HeldKeys(NativeMethods.INPUT[] inputs, int count, bool[] held)
+        {
+            for (int i = 0; i < count; i++)
+            {
+                NativeMethods.INPUT input = inputs[i];
+                held[input.data.keyboard.wVk] = (input.data.keyboard.dwFlags & NativeMethods.KEYEVENTF_KEYUP) == 0;
+            }
+            return held;
+        }
+
         static bool RunSelfTests()
         {
-            try
+            _testFailures = 0;
+            Test("layout, cropping, paging and ordering", delegate
             {
                 NativeMethods.RECT work = new NativeMethods.RECT { Left = 0, Top = 0, Right = 1920, Bottom = 1080 };
                 Logic.OverlayLayout layout = new Logic.OverlayLayout();
                 Logic.ComputeLayout(work, 2, 1.0, ref layout);
-                if (layout.pageSize != 2 || layout.cols != 2 || layout.rows != 1) return false;
+                // A 2-window cycle must draw a 2-tile bar, never the 6-column
+                // maximum with four tiles of empty background either side.
+                Check(layout.pageSize == 2 && layout.cols == 2 && layout.rows == 1, "narrow cycle kept the wide panel");
 
                 Logic.ComputeLayout(work, 7, 1.0, ref layout);
-                if (layout.pageSize != 7 || layout.cols != 6 || layout.rows != 2 || layout.rowCount[1] != 1) return false;
+                Check(layout.pageSize == 7 && layout.cols == 6 && layout.rows == 2 && layout.rowCount[1] == 1, "paged layout wrong");
+
                 if (Logic.PageStartFor(-1, 7, 6) != 0 || Logic.PageStartFor(5, 7, 6) != 0
-                    || Logic.PageStartFor(6, 7, 6) != 6 || Logic.PageStartFor(8, 7, 6) != 6) return false;
+                    || Logic.PageStartFor(6, 7, 6) != 6 || Logic.PageStartFor(8, 7, 6) != 6) throw new Exception("paging wrong");
 
                 NativeMethods.RECT crop = Logic.CoverSource(
                     new NativeMethods.RECT { Left = 0, Top = 0, Right = 160, Bottom = 90 },
                     new NativeMethods.RECT { Left = 0, Top = 0, Right = 400, Bottom = 300 });
-                if ((crop.Right - crop.Left) * 90 != (crop.Bottom - crop.Top) * 160) return false;
+                Check((crop.Right - crop.Left) * 90 == (crop.Bottom - crop.Top) * 160, "crop changed the source aspect");
 
                 AppEntry pinned = new AppEntry { ReprHwnd = new IntPtr(1), Rank = 20, Topmost = false };
                 AppEntry topmost = new AppEntry { ReprHwnd = new IntPtr(2), Rank = 1, Topmost = true };
-                if (Logic.AppSortKey(pinned, new IntPtr(1)) != -1) return false;
-                if (Logic.AppSortKey(topmost, IntPtr.Zero) <= Logic.AppSortKey(pinned, IntPtr.Zero)) return false;
-                return true;
-            }
-            catch { return false; }
+                Check(Logic.AppSortKey(pinned, new IntPtr(1)) == -1, "pinned entry did not sort first");
+                Check(Logic.AppSortKey(topmost, IntPtr.Zero) > Logic.AppSortKey(pinned, IntPtr.Zero), "topmost entry not demoted");
+            });
+
+            Test("panel is centred on the monitor the source window is on", delegate
+            {
+                // A second monitor offset from the origin: the bar must land
+                // inside THAT monitor's work area, not on the primary one.
+                NativeMethods.RECT secondary = new NativeMethods.RECT { Left = 1920, Top = -200, Right = 1920 + 2560, Bottom = -200 + 1440 };
+                Logic.OverlayLayout layout = new Logic.OverlayLayout();
+                Logic.ComputeLayout(secondary, 5, 1.0, ref layout);
+                Check(layout.panelX >= secondary.Left && layout.panelX + layout.panelW <= secondary.Right, "panel left the source monitor");
+                Check(layout.panelY >= secondary.Top && layout.panelY + layout.panelH <= secondary.Bottom, "panel left the source monitor");
+                Check(layout.panelX > 0 && layout.panelY > 0, "panel fell back to the primary monitor");
+            });
+
+            Test("a single entry never draws a second tile of background", delegate
+            {
+                Logic.OverlayLayout layout = new Logic.OverlayLayout();
+                Logic.ComputeLayout(new NativeMethods.RECT { Left = 0, Top = 0, Right = 1920, Bottom = 1080 }, 1, 1.0, ref layout);
+                Check(layout.cols == 1 && layout.rows == 1, "one app reserved more than one slot");
+                Check(layout.panelW == 2 * layout.pad + layout.tileW, "panel wider than its only tile");
+            });
+
+            Test("sensitive fields are redacted unless verbose", delegate
+            {
+                bool previous = _logVerbose;
+                try
+                {
+                    _logVerbose = false;
+                    string plain = CaptureLog(delegate { Log("title=" + LogText("private document")); });
+                    Check(!plain.Contains("private document") && plain.Contains("<redacted>"), "private field leaked");
+                    _logVerbose = true;
+                    string verbose = CaptureLog(delegate { Log("title=" + LogText("secret\r\ninjected")); });
+                    Check(verbose.Contains("secret\\r\\ninjected"), "verbose title not escaped");
+                    Check(verbose.Split(new string[] { Environment.NewLine }, StringSplitOptions.None).Length == 2, "title forged another log record");
+                }
+                finally { _logVerbose = previous; }
+            });
+
+            Test("plain runs log no per-window enumeration detail", delegate
+            {
+                // The skip lines fire for every top-level window on the
+                // machine on every Alt+Tab, and each one was a flushed disk
+                // write. They must therefore only appear under --log-verbose.
+                bool previous = _logVerbose;
+                try
+                {
+                    _logVerbose = false;
+                    string plain = CaptureLog(delegate { EnumerateEntries(); });
+                    Check(!plain.Contains("  skip 0x"), "plain run logged per-window skip detail");
+                    _logVerbose = true;
+                    string verbose = CaptureLog(delegate { EnumerateEntries(); });
+                    Check(verbose.Contains("  skip 0x"), "verbose run lost the enumeration detail");
+                }
+                finally { _logVerbose = previous; }
+            });
+
+            Test("the 8 MiB log cap holds at its exact boundary", delegate
+            {
+                const int cap = 8 * 1024 * 1024;
+                int overhead = Encoding.UTF8.GetByteCount(DateTime.Now.ToString("HH:mm:ss.fff ") + Environment.NewLine);
+                string output = CaptureLog(delegate
+                {
+                    Log(new string('x', cap - overhead));
+                    Log("overflow");
+                });
+                Check(Encoding.UTF8.GetByteCount(output) == cap && !output.Contains("overflow"), "byte cap violated at exact boundary");
+            });
+
+            Test("multibyte records respect the byte cap", delegate
+            {
+                const int cap = 8 * 1024 * 1024;
+                int overhead = Encoding.UTF8.GetByteCount(DateTime.Now.ToString("HH:mm:ss.fff ") + Environment.NewLine);
+                string output = CaptureLog(delegate
+                {
+                    Log(new string('x', cap - overhead * 2 - 2));
+                    Log(new string('\u6d4b', 9));
+                    Log("ok");
+                });
+                Check(Encoding.UTF8.GetByteCount(output) <= cap && !output.Contains("\u6d4b") && output.Contains("ok"), "UTF-8 overflow or later record lost");
+            });
+
+            Test("a failed log stream stops writing without duplicating records", delegate
+            {
+                string path = Path.GetTempFileName();
+                StreamWriter writer = null;
+                try
+                {
+                    writer = new StreamWriter(path, false, new UTF8Encoding(false));
+                    _log = writer; _logBytes = 0;
+                    Log("retained-record");
+                    writer.BaseStream.Dispose();
+                    string before = File.ReadAllText(path);
+                    Log("failed-record");
+                    Check(_log == null, "failed writer still active");
+                    Log("later-record");
+                    Check(File.ReadAllText(path) == before && before.Contains("retained-record"), "failure duplicated the last persisted record");
+                }
+                finally
+                {
+                    _log = null;
+                    if (writer != null) { try { writer.Dispose(); } catch (ObjectDisposedException) { } }
+                    File.Delete(path);
+                }
+            });
+
+            Test("autostart rejects sibling prefixes, traversal and reparse escapes", delegate
+            {
+                string root = Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles);
+                Check(IsUnderDirectory(Path.Combine(root, "AppHopper", "app.exe"), root), "valid descendant rejected");
+                Check(!IsUnderDirectory(root + " Evil\\app.exe", root), "prefix bypass");
+                Check(!IsUnderDirectory(Path.Combine(root, "..", "Users", "app.exe"), root), "traversal bypass");
+                Check(!IsProtectedStartupPath(Application.ExecutablePath), "unprotected build accepted for autostart");
+            });
+
+            Test("autostart ACL permits only trusted mutation", delegate
+            {
+                Check(HasProtectedAcl(TestAcl("S-1-5-32-544", null)), "admin ACL rejected");
+                Check(!HasProtectedAcl(TestAcl("S-1-5-32-544", "S-1-5-32-545")), "Users write accepted");
+                Check(!HasProtectedAcl(TestAcl("S-1-5-32-544", "S-1-1-0")), "Everyone write accepted");
+                Check(!HasProtectedAcl(TestAcl("S-1-5-32-545", null)), "untrusted owner accepted");
+                foreach (string rights in new string[] { "GW", "GA" })
+                {
+                    var security = new FileSecurity();
+                    security.SetSecurityDescriptorSddlForm("O:BAG:BAD:(A;;FA;;;BA)(A;;" + rights + ";;;BU)");
+                    Check(!HasProtectedAcl(security), "untrusted " + rights + " accepted");
+                }
+            });
+
+            Test("a rejected autostart leaves the Run key untouched", delegate
+            {
+                object before;
+                using (var key = Microsoft.Win32.Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Run"))
+                    before = key == null ? null : key.GetValue("AppHopper");
+                Check(!SetStartup(true), "unprotected build registered itself");
+                object after;
+                using (var key = Microsoft.Win32.Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Run"))
+                    after = key == null ? null : key.GetValue("AppHopper");
+                Check(object.Equals(before, after), "rejected autostart changed the registry");
+            });
+
+            Test("native replay preserves the physical modifiers", delegate
+            {
+                foreach (bool addAlt in new bool[] { false, true })
+                foreach (bool addShift in new bool[] { false, true })
+                {
+                    NativeMethods.INPUT[] inputs = NativeTabInputs(addAlt, addShift);
+                    for (int sent = 0; sent <= inputs.Length; sent++)
+                    {
+                        var held = new bool[256];
+                        held[NativeMethods.VK_MENU] = !addAlt;
+                        held[NativeMethods.VK_SHIFT] = !addShift;
+                        HeldKeys(inputs, sent, held);
+                        NativeMethods.INPUT[] recovery = ReplayReleases(inputs, (uint)sent);
+                        if (recovery != null) HeldKeys(recovery, recovery.Length, held);
+                        Check(!held[NativeMethods.VK_TAB]
+                            && held[NativeMethods.VK_MENU] == !addAlt
+                            && held[NativeMethods.VK_SHIFT] == !addShift,
+                            "replay prefix " + sent + " left a synthetic key held or released a physical modifier");
+                    }
+                }
+            });
+
+            Test("hook routing: failures, repeats, modifiers and replay tags", delegate
+            {
+                bool session = _session, enabled = _enabled, committing = _committing;
+                MsgForm previousMsg = _msg;
+                try
+                {
+                    // A Tab the app cannot post must reach the system and must
+                    // not latch: the switcher never took it over.
+                    _msg = null; _session = false; _enabled = true; _committing = false; _tabHookDown = false;
+                    Check(!Swallowed(Hook(NativeMethods.VK_TAB, 0x20, IntPtr.Zero)), "an unpostable Alt+Tab was swallowed");
+                    Check(!_tabHookDown, "an unpostable Alt+Tab was latched as consumed");
+                    Check(!Swallowed(Hook(NativeMethods.VK_TAB, NativeMethods.LLKHF_UP, IntPtr.Zero)), "its release was swallowed");
+                    Check(!_tabHookDown && !_tabPassedDown, "the Tab latches survived its release");
+
+                    // A Tab we latched must have its release consumed too, or
+                    // the system keeps Tab logically held after the overlay.
+                    _tabHookDown = true; _tabPassedDown = false; _enabled = false;
+                    Check(Swallowed(Hook(NativeMethods.VK_TAB, NativeMethods.LLKHF_UP, IntPtr.Zero)), "a latched Tab release was not swallowed");
+                    Check(!_tabHookDown && !_tabPassedDown, "Tab latches survived the release");
+
+                    // A repeat that reached the system must still clear the
+                    // latch when its release arrives (mixed disposition).
+                    _tabHookDown = true; _tabPassedDown = false;
+                    Check(!Swallowed(Hook(NativeMethods.VK_TAB, 0, IntPtr.Zero)), "a forwarded auto-repeat was swallowed");
+                    Check(_tabPassedDown, "the forwarded repeat was not recorded");
+                    Check(!Swallowed(Hook(NativeMethods.VK_TAB, NativeMethods.LLKHF_UP, IntPtr.Zero)), "the forwarded repeat's release was swallowed");
+                    Check(!_tabHookDown && !_tabPassedDown, "Tab latches survived a mixed-disposition release");
+                    _enabled = true;
+
+                    // Our own replayed input must not re-enter the switcher:
+                    // it is passed straight through, latch untouched.
+                    _tabHookDown = true;
+                    Check(!Swallowed(Hook(NativeMethods.VK_TAB, NativeMethods.LLKHF_UP, new IntPtr(unchecked((int)ReplayInputTag.ToUInt64())))), "our replay was swallowed");
+                    Check(_tabHookDown, "replay cleared the physical Tab latch");
+                    _tabHookDown = false;
+
+                    // Alt releases always reach the foreground app, so it sees
+                    // a clean release; the commit is posted, not swallowed.
+                    _session = true;
+                    foreach (uint vk in new uint[] { NativeMethods.VK_MENU, NativeMethods.VK_LMENU, NativeMethods.VK_RMENU })
+                        Check(!Swallowed(Hook(vk, NativeMethods.LLKHF_UP, IntPtr.Zero)), "an Alt release " + vk + " was swallowed");
+
+                    // Nothing is consumed mid-commit, or a second switch fires.
+                    _committing = true;
+                    Check(!Swallowed(Hook(NativeMethods.VK_TAB, 0x20, IntPtr.Zero)), "Alt+Tab was consumed during a commit");
+                    Check(!_tabHookDown, "Alt+Tab latched during a commit");
+                    _enabled = true;
+                }
+                finally
+                {
+                    _session = session; _enabled = enabled; _committing = committing;
+                    _tabHookDown = false; _msg = previousMsg;
+                }
+            });
+
+            Test("activation refuses an invalid handle and a caller without the foreground", delegate
+            {
+                Check(!ForceForeground(IntPtr.Zero), "invalid HWND accepted");
+                // This process holds no foreground here, so a real window must
+                // be left alone instead of being activated behind the user's
+                // back (a denied request from a background process flashes the
+                // target's taskbar). The desktop window is the cheapest
+                // always-present, never-focusable stand-in.
+                string output = CaptureLog(delegate { Check(!ForceForeground(NativeMethods.GetDesktopWindow()), "background caller activated a target"); });
+                Check(output.Contains("session does not own foreground"), "the missing-foreground guard did not fire");
+            });
+
+            Test("activation notification survives a blocked and a dead target", delegate
+            {
+                // WM_NULL to our own message window is the same cross-thread
+                // barrier the session claim uses, without a second process.
+                IntPtr hwnd = _msg != null && _msg.IsHandleCreated ? _msg.Handle : IntPtr.Zero;
+                Check(hwnd != IntPtr.Zero, "no message window to synchronize with");
+                Check(WaitForForegroundNotification(hwnd, 1000), "responsive target was not synchronized");
+                Check(!WaitForForegroundNotification(IntPtr.Zero, 50), "invalid HWND treated as synchronized");
+            });
+
+            Console.WriteLine("failures=" + _testFailures);
+            return _testFailures == 0;
         }
 
         [STAThread]
         static void Main(string[] args)
         {
-            // Checked BEFORE the single-instance mutex, so a self-test still
-            // runs while the switcher is already up.
+            bool selfTest = false, logRequested = false;
             foreach (string a in args)
-                if (a == "--self-test")
-                {
-                    Environment.ExitCode = RunSelfTests() ? 0 : 1;
-                    return;
-                }
+            {
+                if (a == "--self-test") selfTest = true;
+                if (a == "--log" || a == "--log-verbose") logRequested = true;
+                if (a == "--log-verbose") _logVerbose = true;
+            }
+
+            NativeMethods.SetProcessDPIAware();
+            Application.EnableVisualStyles();
+            Application.SetCompatibleTextRenderingDefault(false);
+
+            // The suite drives the low-level hook directly and needs a real
+            // message window for the activation barrier, but no tray, no
+            // hooks and no second instance: it runs ahead of the mutex so it
+            // stays available while the switcher itself is running.
+            if (selfTest)
+            {
+                _msg = new MsgForm();
+                IntPtr probe = _msg.Handle;   // force handle creation before the suite runs
+                try { Environment.ExitCode = RunSelfTests() ? 0 : 1; }
+                finally { _msg.Dispose(); GC.KeepAlive(probe); }
+                return;
+            }
 
             bool created;
             _mutex = new Mutex(true, "Local\\AppHopper", out created);
             if (!created) return;
 
-            bool logRequested = false;
-            foreach (string a in args)
-            {
-                if (a == "--log" || a == "--log-verbose") logRequested = true;
-                if (a == "--log-verbose") _logVerbose = true;
-            }
             if (logRequested)
             {
                 try
@@ -2414,10 +2909,6 @@ namespace AppHopper
                 catch (IOException) { }
                 catch (UnauthorizedAccessException) { }
             }
-
-            NativeMethods.SetProcessDPIAware();
-            Application.EnableVisualStyles();
-            Application.SetCompatibleTextRenderingDefault(false);
 
             _msg = new MsgForm();
             IntPtr hMsg = _msg.Handle;
@@ -2496,6 +2987,10 @@ namespace AppHopper
             sessionWatchdog.Tick += delegate
             {
                 if (_session && !AltDown()) Commit();
+                // Completes a Cancel that deferred its handover because the
+                // user was still holding Alt. Runs after Commit so a live
+                // session never competes with a pending handback.
+                else FinishCancelHandover();
             };
             sessionWatchdog.Start();
 
@@ -2508,6 +3003,7 @@ namespace AppHopper
             {
                 if (!_exitRequested) return;
                 if (_committing) return;   // a commit is mid-flight; retry next tick
+                _cancelRestore = IntPtr.Zero;   // never hand the foreground back during teardown
                 EndSession();
                 exitTimer.Stop();
                 icon.Visible = false;
