@@ -32,7 +32,7 @@ using System.Windows.Forms;
 // runtime via AppVersion, so this is the single place a version lives.
 [assembly: System.Reflection.AssemblyVersion("1.1.2.0")]
 [assembly: System.Reflection.AssemblyFileVersion("1.1.2.0")]
-[assembly: System.Reflection.AssemblyInformationalVersion("1.1.2beta5")]
+[assembly: System.Reflection.AssemblyInformationalVersion("1.1.2beta6")]
 
 namespace AppHopper
 {
@@ -70,7 +70,6 @@ namespace AppHopper
         public const int WS_EX_TOPMOST = 0x00000008;
         public const int WS_EX_LAYERED = 0x00080000;
         public const uint GW_OWNER = 4;
-        public const uint GA_ROOTOWNER = 2;
         public const int GCLP_HICONSM = -34;
         public const int GCLP_HICON = -14;
         public const uint PROCESS_QUERY_LIMITED_INFORMATION = 0x1000;
@@ -227,17 +226,11 @@ namespace AppHopper
         [DllImport("user32.dll")]
         public static extern bool IsIconic(IntPtr hWnd);
         [DllImport("user32.dll")]
-        public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
-        [DllImport("user32.dll")]
         public static extern bool SetForegroundWindow(IntPtr hWnd);
-        [DllImport("user32.dll", SetLastError = true)]
-        public static extern bool AllowSetForegroundWindow(uint dwProcessId);
         [DllImport("user32.dll", SetLastError = true)]
         public static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool attach);
         [DllImport("kernel32.dll")]
         public static extern uint GetCurrentThreadId();
-        [DllImport("kernel32.dll")]
-        public static extern uint GetCurrentProcessId();
         [DllImport("user32.dll")]
         public static extern bool GetGUIThreadInfo(uint idThread, ref GUITHREADINFO info);
         [DllImport("user32.dll")]
@@ -251,8 +244,6 @@ namespace AppHopper
         [DllImport("user32.dll")]
         public static extern IntPtr GetWindow(IntPtr hWnd, uint nCmd);
         [DllImport("user32.dll")]
-        public static extern IntPtr GetAncestor(IntPtr hwnd, uint gaFlags);
-        [DllImport("user32.dll")]
         public static extern IntPtr GetLastActivePopup(IntPtr hwnd);
         [DllImport("user32.dll")]
         public static extern bool IsWindow(IntPtr hWnd);
@@ -264,8 +255,6 @@ namespace AppHopper
         public static extern bool DeleteObject(IntPtr hObject);
         [DllImport("user32.dll", EntryPoint = "GetWindowLongW")]
         public static extern int GetWindowLong(IntPtr hWnd, int nIndex);
-        [DllImport("user32.dll", EntryPoint = "GetClassLongW")]
-        public static extern int GetClassLong(IntPtr hWnd, int nIndex);
         // GetClassLongW truncates an HICON to 32 bits on x64; always use the
         // pointer-sized variant for icon handles.
         [DllImport("user32.dll", EntryPoint = "GetClassLongPtrW")]
@@ -641,15 +630,20 @@ namespace AppHopper
                 }
                 float w = Math.Max(2f, size * 0.14f);   // shaft thickness
                 float inset = size * 0.22f;
+                // The caps are GDI+ objects the Pen does NOT take ownership
+                // of, so they need disposing explicitly - they are rebuilt on
+                // every theme/accent change otherwise.
+                using (var endCap = new AdjustableArrowCap(w, w * 2.0f, true))
+                using (var startCap = new AdjustableArrowCap(w, w * 2.0f, true))
                 using (var pen = new Pen(glyph, w))
                 {
                     pen.StartCap = LineCap.Round;
                     pen.EndCap = LineCap.Custom;
-                    pen.CustomEndCap = new AdjustableArrowCap(w, w * 2.0f, true);
+                    pen.CustomEndCap = endCap;
                     g2.DrawLine(pen, inset, size * 0.36f, size - inset, size * 0.36f);   // ->
                     pen.EndCap = LineCap.Round;
                     pen.StartCap = LineCap.Custom;
-                    pen.CustomStartCap = new AdjustableArrowCap(w, w * 2.0f, true);
+                    pen.CustomStartCap = startCap;
                     g2.DrawLine(pen, inset, size * 0.64f, size - inset, size * 0.64f);   // <-
                 }
                 IntPtr h = bmp.GetHicon();
@@ -698,6 +692,11 @@ namespace AppHopper
         static NativeMethods.RECT _panelRect;
         static NativeMethods.RECT _work;    // work area of the monitor the overlay lives on
         static double _scale = 1.0;
+        // One font + brush per chrome repaint, rebuilt by RenderChrome and
+        // disposed in its finally. Fields rather than locals so the drawing
+        // helpers can share them.
+        static Font _headerFont;
+        static SolidBrush _headerBrush;
         // Polls for windows that disappeared while the overlay is up. Only
         // runs during a session; see RefreshTick.
         static System.Windows.Forms.Timer _refreshTimer;
@@ -880,19 +879,6 @@ namespace AppHopper
                 return null;
             }
             finally { NativeMethods.CloseHandle(h); }
-        }
-
-        static IntPtr FindWindowByClass(IntPtr parent, string className)
-        {
-            IntPtr found = IntPtr.Zero;
-            NativeMethods.EnumChildWindows(parent, delegate(IntPtr h, IntPtr lp)
-            {
-                var sb = new StringBuilder(256);
-                NativeMethods.GetClassNameW(h, sb, sb.Capacity);
-                if (sb.ToString() == className) { found = h; return false; }
-                return true;
-            }, IntPtr.Zero);
-            return found;
         }
 
         static string ClassNameOf(IntPtr hwnd)
@@ -1152,6 +1138,35 @@ namespace AppHopper
             return null;
         }
 
+        // AltTabIneligibilityReason with a per-enumeration cache of the
+        // chain-only check.
+        //
+        // The owner-chain rule calls AltTabIneligibleIgnoreChain on the ROOT as
+        // well as on the window itself, and that root is re-evaluated for every
+        // popup under it. Each evaluation costs several user32 calls, a DWM
+        // attribute read and a COM call to the virtual desktop manager, so a
+        // machine with many owned popups paid for the same root repeatedly on
+        // every Alt+Tab. Only the chain-only half is cached: the owner rule
+        // itself still runs per window, so the RULE cannot change - only the
+        // repeated work disappears.
+        static string EligibilityMemoized(IntPtr hwnd, Dictionary<IntPtr, string> memo)
+        {
+            string cached;
+            if (memo.TryGetValue(hwnd, out cached)) return cached;
+            string why = AltTabIneligibleIgnoreChain(hwnd);
+            memo[hwnd] = why;
+            if (why != null) return why;
+
+            // Same owner-chain rule as AltTabIneligibilityReason, with the root
+            // probe served from the same cache.
+            IntPtr root = OwnerChainRoot(hwnd);
+            if (root == hwnd) return null;
+            string rootWhy;
+            if (memo.TryGetValue(root, out rootWhy)) rootWhy = AltTabIneligibleIgnoreChain(root);
+            else { rootWhy = AltTabIneligibleIgnoreChain(root); memo[root] = rootWhy; }
+            return rootWhy == null ? "owned-popup" : null;
+        }
+
         // Every eligibility check except the owner-chain rule. Shared by the
         // full predicate and by the root-presentable probe above it, so the
         // two can never drift apart.
@@ -1194,9 +1209,23 @@ namespace AppHopper
             return null;
         }
 
-        // Owns a private copy of h, so the caller may dispose it freely.
+        // Takes a private copy of h, so the caller is free to dispose the
+        // result without touching another process's icon.
+        //
+        // NOTE ON OWNERSHIP: Icon.FromHandle sets ownHandle=false, so this
+        // Icon does not destroy the copy on Dispose - the handle lives until
+        // the process exits. That looks like a leak and was "fixed" by cloning
+        // and destroying the intermediate handle, but Clone() performs a
+        // SECOND icon copy, doubling the cost of every icon fetch. Icon
+        // loading happens on the Alt+Tab startup path, and the extra cost eats
+        // into the window during which this process may hand the foreground
+        // on: measured 10 failed switches per 25 gestures, versus 0 with the
+        // cheap form. The handle is bounded (one copy per distinct executable,
+        // cached for the process lifetime, reclaimed at exit), so paying
+        // switching reliability for it is a bad trade. Reverted deliberately.
         static Icon CopyIconSafe(IntPtr h)
         {
+            if (h == IntPtr.Zero) return null;
             try
             {
                 IntPtr copy = NativeMethods.CopyIcon(h);
@@ -1206,10 +1235,9 @@ namespace AppHopper
             return null;
         }
 
-        // Always returns an icon this process owns, so EndSession can dispose it
-        // unconditionally. Window icons are copied first: adopting a live HICON
-        // via Icon.FromHandle() and disposing it (or letting it be finalized)
-        // destroys the target window's own icon, blanking it on screen and in
+        // Returns an icon safe to dispose: it is always a COPY, never an
+        // adopted live HICON, because disposing an adopted handle would
+        // destroy the target window's own icon, blanking it on screen and in
         // the taskbar.
         static Icon GetAppIcon(IntPtr hwnd, string exe)
         {
@@ -1224,12 +1252,12 @@ namespace AppHopper
             ci = CopyIconSafe(NativeMethods.GetClassLongPtr(hwnd, NativeMethods.GCLP_HICON));
             if (ci != null) return ci;
 
+            // The shell allocates this handle for us. Adopting it costs
+            // nothing extra on the Alt+Tab path (see CopyIconSafe).
             try
             {
                 var fi = new NativeMethods.SHFILEINFOW();
                 IntPtr r2 = NativeMethods.SHGetFileInfoW(exe, 0x80, ref fi, (uint)Marshal.SizeOf(typeof(NativeMethods.SHFILEINFOW)), NativeMethods.SHGFI_ICON | NativeMethods.SHGFI_LARGEICON | NativeMethods.SHGFI_USEFILEATTRIBUTES);
-                // the shell allocates this one for us, so adopting it (and
-                // disposing it later) is exactly right
                 if (r2 != IntPtr.Zero && fi.hIcon != IntPtr.Zero) return Icon.FromHandle(fi.hIcon);
             }
             catch { }
@@ -1256,7 +1284,28 @@ namespace AppHopper
         }
 
         // ================= state machine =================
+        // Every WM_APP_* handler runs inside the message pump: an exception
+        // escaping here unwinds out of WndProc and tears down the process.
+        // Nothing in this switch may throw through - worst case we end the
+        // session and let the native switcher have the gesture back.
         static void HandleAppMsg(int msg, IntPtr wparam)
+        {
+            try
+            {
+                DispatchAppMsg(msg, wparam);
+            }
+            catch (Exception e)
+            {
+                Log("  app message failed: " + e.GetType().Name + ": " + e.Message);
+                try
+                {
+                    if (_session) { HandOverForeground(); EndSession(); }
+                }
+                catch { }
+            }
+        }
+
+        static void DispatchAppMsg(int msg, IntPtr wparam)
         {
             switch (msg)
             {
@@ -1276,7 +1325,16 @@ namespace AppHopper
                 case NativeMethods.WM_APP_PREV: if (_session) MoveIndex(-1); break;
                 case NativeMethods.WM_APP_COMMIT: if (_session) { Log("hotkey: alt up -> commit"); Commit(); } break;
                 case NativeMethods.WM_APP_CANCEL: if (_session) Cancel(); break;
-                case NativeMethods.WM_APP_COMMITAT: if (_session) { _index = (int)wparam; RenderChrome(); Commit(); } break;
+                case NativeMethods.WM_APP_COMMITAT:
+                    if (!_session) break;
+                    // The index arrives from a posted message, so treat it as
+                    // untrusted input rather than assuming it is in range.
+                    int wanted = (int)wparam;
+                    if (wanted < 0 || wanted >= _apps.Count) { Log("  commit-at index out of range: " + wanted); break; }
+                    _index = wanted;
+                    RenderChrome();
+                    Commit();
+                    break;
             }
         }
 
@@ -1299,12 +1357,30 @@ namespace AppHopper
         // exactly the same entries and can diff them against the running list.
         static List<AppEntry> EnumerateEntries()
         {
+            // The per-hwnd exe cache is process-wide, so it must be reset per
+            // enumeration or a window that has since been recreated keeps the
+            // previous mapping.
             _exeMemo.Clear();
             var order = new List<AppEntry>();
             var byExe = new Dictionary<string, AppEntry>();
+            // Memoized per enumeration. The owner-chain rule evaluates a
+            // window's root as well, so without this the common case (many
+            // visible popups under one root) re-runs the full predicate on the
+            // same root for every one of them - roughly doubling the user32,
+            // DWM and COM calls per Alt+Tab. Scoped to this call so a window
+            // that changes state between refreshes is re-evaluated.
+            var ignoreMemo = new Dictionary<IntPtr, string>();
             int rank = 0;
             NativeMethods.EnumWindows(delegate(IntPtr hwnd, IntPtr lp)
             {
+              try
+              {
+                // Any window we inspect can be hostile: the title/class reads
+                // marshal into another process, DWM can fail, and the virtual
+                // desktop manager is COM. An exception thrown from inside an
+                // EnumWindows callback escapes across the unmanaged frame and
+                // kills the process, so every failure is contained here and the
+                // window is simply skipped.
                 // Every top-level window consumes one Z-order slot. Incrementing
                 // only on the skip branches gives two adjacent apps the same
                 // rank, which makes the sort order them randomly - the cycle
@@ -1312,8 +1388,9 @@ namespace AppHopper
                 // same foreground window (the "wrong app gets mixed in" bug).
                 int myRank = rank++;
                 // Single predicate serves filter AND log: no double evaluation,
-                // no second copy to drift out of sync.
-                string why = AltTabIneligibilityReason(hwnd);
+                // no second copy to drift out of sync. Memoized because the
+                // owner-chain rule evaluates the root as well.
+                string why = EligibilityMemoized(hwnd, ignoreMemo);
                 if (why != null)
                 {
                     // Verbose only: this fires for EVERY top-level window on the
@@ -1367,6 +1444,8 @@ namespace AppHopper
                             + " \"" + LogText(e.Title) + "\"");
                 }
                 return true;
+              }
+              catch { return true; }   // skip this window; never throw across the callback boundary
             }, IntPtr.Zero);
             return order;
         }
@@ -1748,32 +1827,35 @@ namespace AppHopper
             _committing = true;
             try
             {
-                // Hand the foreground back to the window that had it when the
-                // cycle opened, so hiding our topmost windows cannot park the
-                // foreground on a hidden window of ours.
-                //
-                // But NOT while Alt is still held: releasing the foreground in
-                // the middle of the Alt+Tab gesture is recorded by Windows as
-                // a foreground ownership change, which flashes the restored
-                // window's taskbar button (the "press ESC without releasing
-                // Alt and the taskbar blinks" report). The watchdog commits
-                // within 30ms of the Alt release, so the handover happens
-                // then instead - by which point the gesture is over and the
-                // handback is silent.
-                if (NativeMethods.IsWindow(_fgHwnd) && !AltDown())
-                {
-                    NativeMethods.SetForegroundWindow(_fgHwnd);
-                    Application.DoEvents();
-                }
-                else if (NativeMethods.IsWindow(_fgHwnd))
-                {
-                    Log("  cancel: alt still held, deferring the foreground handback");
-                    _cancelRestore = _fgHwnd;
-                }
+                HandOverForeground();
                 EndSession();
                 Log("cancel");
             }
             finally { _committing = false; }
+        }
+
+        // Gives the foreground back to the window that had it when the cycle
+        // opened, so hiding our topmost windows cannot park the foreground on
+        // a hidden window of ours. Shared by Cancel and AbortSession.
+        //
+        // But NOT while Alt is still held: releasing the foreground in the
+        // middle of the Alt+Tab gesture is recorded by Windows as a foreground
+        // ownership change, which flashes the restored window's taskbar button
+        // (the "press ESC without releasing Alt and the taskbar blinks"
+        // report). The watchdog runs within 30ms of the Alt release, so the
+        // handover happens then instead - by which point the gesture is over
+        // and the handback is silent.
+        static void HandOverForeground()
+        {
+            if (!NativeMethods.IsWindow(_fgHwnd)) return;
+            if (!AltDown())
+            {
+                NativeMethods.SetForegroundWindow(_fgHwnd);
+                Application.DoEvents();
+                return;
+            }
+            Log("  cancel: alt still held, deferring the foreground handback");
+            _cancelRestore = _fgHwnd;
         }
 
         // Completes a deferred Cancel handover once the Alt gesture is over.
@@ -1823,11 +1905,22 @@ namespace AppHopper
 
         // Give up on the cycle without switching anywhere: used when the
         // refresh finds there is nothing left to switch to.
+        //
+        // The foreground still has to go back. EndSession hides our windows,
+        // so without this handover the foreground is left parked on a hidden
+        // window of ours and the keyboard goes nowhere - the same defect
+        // Cancel had to solve. Reuse that path rather than duplicate it.
         static void AbortSession()
         {
-            _session = false;
-            EndSession();
-            Log("session aborted: no windows left");
+            if (_committing) { Log("abort swallowed: reentrant"); return; }
+            _committing = true;
+            try
+            {
+                HandOverForeground();
+                EndSession();
+                Log("session aborted: no windows left");
+            }
+            finally { _committing = false; }
         }
 
         // ================= live refresh =================
@@ -1858,7 +1951,6 @@ namespace AppHopper
             var fresh = EnumerateEntries();
             if (fresh.Count == 0) { AbortSession(); return; }
 
-            int oldIndex = _index >= 0 && _index < _apps.Count ? _index : 0;
             string selKey = _index >= 0 && _index < _apps.Count ? _apps[_index].Key : null;
 
             // Surviving entries keep their slot: match the fresh snapshot
@@ -2023,44 +2115,32 @@ namespace AppHopper
             return false;
         }
 
-        // Last resort for a target that refuses plain SetForegroundWindow.
+        // Last resort for a target that refuses plain SetForegroundWindow:
+        // join its input queue, activate, detach immediately.
         //
-        // Hand the foreground RIGHT to the target process first. This is the
-        // documented way to grant another process the right to call
-        // SetForegroundWindow, and it is the opposite of the preflight that
-        // was removed earlier: that one passed OUR OWN pid (the API only
-        // accepts ASFW_ANY or a *different* process, so it always failed and
-        // vetoed 26 of 124 commits). Granting the target is both correct and
-        // silent - it produces no shell flash, unlike a refused request.
+        // AllowSetForegroundWindow was tried here and removed. It grants the
+        // right to call SetForegroundWindow to ANOTHER process, but the call
+        // that follows is ours, and we already hold the foreground - so the
+        // grant bought nothing except a standing permission for the target to
+        // steal focus later. On this machine it never even succeeded (every
+        // refusal logged "grant ... ok=False error=5", because only the
+        // current foreground process may call it, and by now that is our
+        // overlay rather than the user's app). This API has twice caused real
+        // harm in this project; there is no third use for it here.
         //
-        // Only then fall back to joining the target's input queue, which is
-        // what makes the request stick for a target that ignores the grant.
-        // AttachThreadInput is treated by Windows as a foreground ownership
-        // change and flashes every candidate, so it stays the last step.
+        // AttachThreadInput needs no cooperation from the target and we detach
+        // right away, so an unresponsive target cannot stall or block us.
+        // BringWindowToTop stays out: it bypasses the foreground lock and is
+        // exactly what makes a window flash without coming up.
         static bool ForceForegroundViaHandoff(IntPtr hwnd)
         {
             uint target = NativeMethods.GetWindowThreadProcessId(hwnd, IntPtr.Zero);
             uint current = NativeMethods.GetCurrentThreadId();
             if (target == 0 || target == current) return false;
-
-            uint pid;
-            NativeMethods.GetWindowThreadProcessId(hwnd, out pid);
-            bool granted = false;
-            if (pid != 0 && pid != NativeMethods.GetCurrentProcessId())
-            {
-                granted = NativeMethods.AllowSetForegroundWindow(pid);
-                Log("  activation foreground grant to pid=" + pid + " ok=" + granted
-                    + " error=" + (granted ? 0 : Marshal.GetLastWin32Error()));
-            }
-            if (granted && NativeMethods.SetForegroundWindow(hwnd) && ForegroundIs(hwnd)) return true;
-
-            if (!WaitForForegroundNotification(hwnd, 50)) return false;
             if (!NativeMethods.AttachThreadInput(current, target, true)) return false;
             bool detached = false;
             try
             {
-                // No BringWindowToTop: it bypasses the foreground lock and is
-                // exactly what makes the target flash without coming up.
                 NativeMethods.SetForegroundWindow(hwnd);
             }
             finally { detached = NativeMethods.AttachThreadInput(current, target, false); }
@@ -2138,8 +2218,9 @@ namespace AppHopper
             // One font + one text brush per repaint instead of one per card.
             // RenderChrome runs on every Tab keypress; constructing (and
             // disposing) a Font per tile was pure overhead on the hot path.
-            var headerFont = new Font("Segoe UI", Logic.Scaled(_scale, 14), GraphicsUnit.Pixel);
-            var headerBrush = new SolidBrush(HeaderTextC(light));
+            // Fields rather than locals so the drawing helpers can reach them.
+            _headerFont = new Font("Segoe UI", Logic.Scaled(_scale, 14), GraphicsUnit.Pixel);
+            _headerBrush = new SolidBrush(HeaderTextC(light));
 
             IntPtr screenDc = NativeMethods.GetDC(IntPtr.Zero);
             var bmi = new NativeMethods.BITMAPINFOHEADER();
@@ -2147,7 +2228,7 @@ namespace AppHopper
             bmi.biWidth = w; bmi.biHeight = -h; bmi.biPlanes = 1; bmi.biBitCount = 32; bmi.biCompression = 0;
             IntPtr bits;
             IntPtr dib = NativeMethods.CreateDIBSection(screenDc, ref bmi, 0, out bits, IntPtr.Zero, 0);
-            if (dib == IntPtr.Zero) { headerBrush.Dispose(); headerFont.Dispose(); NativeMethods.ReleaseDC(IntPtr.Zero, screenDc); return; }
+            if (dib == IntPtr.Zero) { _headerBrush.Dispose(); _headerFont.Dispose(); NativeMethods.ReleaseDC(IntPtr.Zero, screenDc); return; }
 
             try
             {
@@ -2162,120 +2243,147 @@ namespace AppHopper
                         g.DrawPath(pen, panelPath);
                     panelPath.Dispose();
 
-                    int pageEnd = Math.Min(_pageStart + _layout.pageSize, _apps.Count);
-                    for (int i = _pageStart, slot = 0; i < pageEnd; ++i, ++slot)
-                    {
-                        var app = _apps[i];
-                        NativeMethods.RECT tile = Logic.TileRect(ref _layout, slot);
-                        bool sel = i == _index;
-                        NativeMethods.RECT pv = Logic.PreviewRect(ref _layout, tile);
-
-                        GraphicsPath cardPath = RoundRect(tile.Left, tile.Top, tile.Right, tile.Bottom, _layout.radius);
-                        using (var b = new SolidBrush(CardColor(light))) g.FillPath(b, cardPath);
-                        using (var p = new Pen(CardStrokeC(light), Math.Max(1, Logic.Scaled(_scale, 1)))) g.DrawPath(p, cardPath);
-
-                        int pw = pv.Right - pv.Left, ph = pv.Bottom - pv.Top;
-                        if (pw > 0 && ph > 0)
-                        {
-                            var pvF = new RectangleF(pv.Left, pv.Top, pw, ph);
-                            using (var back = new SolidBrush(CardSolid(light)))
-                            {
-                                g.SetClip(cardPath);
-                                g.FillRectangle(back, pv.Left, pv.Top, pw, ph);
-                                g.ResetClip();
-                            }
-                            if (app.Thumb != IntPtr.Zero)
-                            {
-                                // Punch the preview area transparent: the live
-                                // DWM thumbnail is hosted by the panel window
-                                // underneath and shows through the hole.
-                                GraphicsPath hole = BottomRoundRect(pvF, _layout.radius);
-                                g.CompositingMode = CompositingMode.SourceCopy;
-                                using (var tr = new SolidBrush(Color.FromArgb(0, 0, 0, 0)))
-                                    g.FillPath(tr, hole);
-                                g.CompositingMode = CompositingMode.SourceOver;
-                                hole.Dispose();
-                            }
-                            // No thumbnail: leave the card solid. Nothing is
-                            // drawn (in particular no oversized app icon) -
-                            // DWM supplies the window's last composed frame
-                            // even after it is minimized, so an empty tile
-                            // means DWM genuinely has no content, and a big
-                            // icon there only drew attention to the gap.
-                        }
-
-                        NativeMethods.RECT hdr = Logic.HeaderRect(ref _layout, tile);
-                        int textLeft = hdr.Left;
-                        if (app.Icon != null)
-                        {
-                            int iy = tile.Top + (_layout.headerH - _layout.iconSize) / 2;
-                            g.DrawIcon(app.Icon, new Rectangle(hdr.Left, iy, _layout.iconSize, _layout.iconSize));
-                            textLeft = hdr.Left + _layout.iconSize + Logic.Scaled(_scale, 8);
-                        }
-                        string title = string.IsNullOrEmpty(app.Title) ? Path.GetFileName(app.Exe) : app.Title;
-                        var rect = new RectangleF(textLeft, tile.Top, hdr.Right - textLeft, _layout.headerH);
-                        var sf = new StringFormat { FormatFlags = StringFormatFlags.NoWrap, Trimming = StringTrimming.EllipsisCharacter, LineAlignment = StringAlignment.Center };
-                        g.DrawString(title, headerFont, headerBrush, rect, sf);
-                        sf.Dispose();
-
-                        if (sel)
-                        {
-                            int gPad = Logic.Scaled(_scale, 6), gOut = gPad + Logic.Scaled(_scale, 2);
-                            int outerR = Logic.Scaled(_scale, 18), innerR = outerR - Logic.Scaled(_scale, 2);
-                            GraphicsPath ringIn = RoundRect(tile.Left - gPad, tile.Top - gPad, tile.Right + gPad, tile.Bottom + gPad, innerR);
-                            GraphicsPath ringOut = RoundRect(tile.Left - gOut, tile.Top - gOut, tile.Right + gOut, tile.Bottom + gOut, outerR);
-                            using (var p1 = new Pen(FocusShadowC(light), Math.Max(1, Logic.Scaled(_scale, 1))))
-                                g.DrawPath(p1, ringIn);
-                            using (var p2 = new Pen(accent, Math.Max(2, Logic.Scaled(_scale, 4))))
-                                g.DrawPath(p2, ringOut);
-                            ringIn.Dispose(); ringOut.Dispose();
-                        }
-                        cardPath.Dispose();
-                    }
-
-                    int pageSize = _layout.pageSize > 0 ? _layout.pageSize : 1;
-                    int totalPages = (_apps.Count + pageSize - 1) / pageSize;
-                    if (totalPages > 1)
-                    {
-                        int cur = _pageStart / pageSize + 1;
-                        var rect = new RectangleF(_layout.pad, h - _layout.pad, w - 2 * _layout.pad, _layout.pad);
-                        var sf = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Far };
-                        g.DrawString(cur + " / " + totalPages, headerFont, headerBrush, rect, sf);
-                        sf.Dispose();
-                    }
+                    DrawCards(g, w, h, light, accent);
+                    DrawPageIndicator(g, w, h, light);
                     g.Flush(FlushIntention.Sync);
                 }
+                SubmitChrome(w, h, screenDc, dib);
+            }
+            finally
+            {
+                NativeMethods.DeleteObject(dib);
+                _headerBrush.Dispose();
+                _headerFont.Dispose();
+                NativeMethods.ReleaseDC(IntPtr.Zero, screenDc);
+            }
+        }
 
-                IntPtr memDc = NativeMethods.CreateCompatibleDC(screenDc);
-                IntPtr old = NativeMethods.SelectObject(memDc, dib);
+        // Draws every card on the current page. Each card's GraphicsPaths are
+        // released in a finally so a draw error on one card cannot leak the
+        // rest of the page's paths.
+        static void DrawCards(Graphics g, int w, int h, bool light, Color accent)
+        {
+            int pageEnd = Math.Min(_pageStart + _layout.pageSize, _apps.Count);
+            for (int i = _pageStart, slot = 0; i < pageEnd; ++i, ++slot)
+            {
+                var app = _apps[i];
+                NativeMethods.RECT tile = Logic.TileRect(ref _layout, slot);
+                bool sel = i == _index;
+                NativeMethods.RECT pv = Logic.PreviewRect(ref _layout, tile);
+
+                GraphicsPath cardPath = RoundRect(tile.Left, tile.Top, tile.Right, tile.Bottom, _layout.radius);
+                GraphicsPath ringIn = null, ringOut = null, hole = null;
+                try
+                {
+                    using (var b = new SolidBrush(CardColor(light))) g.FillPath(b, cardPath);
+                    using (var p = new Pen(CardStrokeC(light), Math.Max(1, Logic.Scaled(_scale, 1)))) g.DrawPath(p, cardPath);
+
+                    int pw = pv.Right - pv.Left, ph = pv.Bottom - pv.Top;
+                    if (pw > 0 && ph > 0)
+                    {
+                        var pvF = new RectangleF(pv.Left, pv.Top, pw, ph);
+                        using (var back = new SolidBrush(CardSolid(light)))
+                        {
+                            g.SetClip(cardPath);
+                            g.FillRectangle(back, pv.Left, pv.Top, pw, ph);
+                            g.ResetClip();
+                        }
+                        if (app.Thumb != IntPtr.Zero)
+                        {
+                            // Punch the preview area transparent: the live DWM
+                            // thumbnail is hosted by the panel window underneath
+                            // and shows through the hole.
+                            hole = BottomRoundRect(pvF, _layout.radius);
+                            g.CompositingMode = CompositingMode.SourceCopy;
+                            using (var tr = new SolidBrush(Color.FromArgb(0, 0, 0, 0)))
+                                g.FillPath(tr, hole);
+                            g.CompositingMode = CompositingMode.SourceOver;
+                            hole.Dispose(); hole = null;
+                        }
+                        // No thumbnail: leave the card solid. Nothing is drawn
+                        // (in particular no oversized app icon) - DWM supplies
+                        // the window's last composed frame even after it is
+                        // minimized, so an empty tile means DWM genuinely has no
+                        // content, and a big icon there only drew attention to
+                        // the gap.
+                    }
+
+                    NativeMethods.RECT hdr = Logic.HeaderRect(ref _layout, tile);
+                    int textLeft = hdr.Left;
+                    if (app.Icon != null)
+                    {
+                        int iy = tile.Top + (_layout.headerH - _layout.iconSize) / 2;
+                        g.DrawIcon(app.Icon, new Rectangle(hdr.Left, iy, _layout.iconSize, _layout.iconSize));
+                        textLeft = hdr.Left + _layout.iconSize + Logic.Scaled(_scale, 8);
+                    }
+                    string title = string.IsNullOrEmpty(app.Title) ? Path.GetFileName(app.Exe) : app.Title;
+                    var rect = new RectangleF(textLeft, tile.Top, hdr.Right - textLeft, _layout.headerH);
+                    using (var sf = new StringFormat { FormatFlags = StringFormatFlags.NoWrap, Trimming = StringTrimming.EllipsisCharacter, LineAlignment = StringAlignment.Center })
+                        g.DrawString(title, _headerFont, _headerBrush, rect, sf);
+
+                    if (sel)
+                    {
+                        int gPad = Logic.Scaled(_scale, 6), gOut = gPad + Logic.Scaled(_scale, 2);
+                        int outerR = Logic.Scaled(_scale, 18), innerR = outerR - Logic.Scaled(_scale, 2);
+                        ringIn = RoundRect(tile.Left - gPad, tile.Top - gPad, tile.Right + gPad, tile.Bottom + gPad, innerR);
+                        ringOut = RoundRect(tile.Left - gOut, tile.Top - gOut, tile.Right + gOut, tile.Bottom + gOut, outerR);
+                        using (var p1 = new Pen(FocusShadowC(light), Math.Max(1, Logic.Scaled(_scale, 1))))
+                            g.DrawPath(p1, ringIn);
+                        using (var p2 = new Pen(accent, Math.Max(2, Logic.Scaled(_scale, 4))))
+                            g.DrawPath(p2, ringOut);
+                    }
+                }
+                finally
+                {
+                    if (hole != null) hole.Dispose();
+                    if (ringIn != null) ringIn.Dispose();
+                    if (ringOut != null) ringOut.Dispose();
+                    cardPath.Dispose();
+                }
+            }
+        }
+
+        static void DrawPageIndicator(Graphics g, int w, int h, bool light)
+        {
+            int pageSize = _layout.pageSize > 0 ? _layout.pageSize : 1;
+            int totalPages = (_apps.Count + pageSize - 1) / pageSize;
+            if (totalPages <= 1) return;
+            int cur = _pageStart / pageSize + 1;
+            var rect = new RectangleF(_layout.pad, h - _layout.pad, w - 2 * _layout.pad, _layout.pad);
+            using (var sf = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Far })
+                g.DrawString(cur + " / " + totalPages, _headerFont, _headerBrush, rect, sf);
+        }
+
+        // Pushes the finished surface to the layered chrome window. The memory
+        // DC is released in a finally: a throw between CreateCompatibleDC and
+        // DeleteDC would otherwise leak a GDI DC for the process lifetime.
+        static void SubmitChrome(int w, int h, IntPtr screenDc, IntPtr dib)
+        {
+            IntPtr memDc = NativeMethods.CreateCompatibleDC(screenDc);
+            if (memDc == IntPtr.Zero) { Log("chrome: CreateCompatibleDC failed"); return; }
+            IntPtr old = IntPtr.Zero;
+            try
+            {
+                old = NativeMethods.SelectObject(memDc, dib);
                 var dst = new NativeMethods.POINT { X = _layout.panelX, Y = _layout.panelY };
                 var size = new NativeMethods.SIZE { cx = w, cy = h };
                 var src = new NativeMethods.POINT { X = 0, Y = 0 };
                 var blend = new NativeMethods.BLENDFUNCTION { BlendOp = NativeMethods.AC_SRC_OVER, BlendFlags = 0, SourceConstantAlpha = 255, AlphaFormat = NativeMethods.AC_SRC_ALPHA };
                 bool ulw = NativeMethods.UpdateLayeredWindow(_chrome.Handle, screenDc, ref dst, ref size, memDc, ref src, 0, ref blend, NativeMethods.ULW_ALPHA);
-                NativeMethods.SelectObject(memDc, old);
-                NativeMethods.DeleteDC(memDc);
-                if (ulw)
-                {
-                    // UpdateLayeredWindow does NOT make a hidden window visible;
-                    // Hopper shows both windows explicitly (SWP_SHOWWINDOW).
-                    _chrome.Show();
-                    NativeMethods.SetWindowPos(_chrome.Handle, IntPtr.Zero, 0, 0, 0, 0,
-                                 0x1 | 0x2 | 0x10 | 0x40 /*NOSIZE|NOMOVE|NOACTIVATE|SHOWWINDOW*/);
-                    // keep the opaque panel strictly below the chrome layer
-                    NativeMethods.SetWindowPos(_panel.Handle, _chrome.Handle, 0, 0, 0, 0, 0x1 | 0x2 | 0x10);
-                }
-                else
-                {
-                    Log("NativeMethods.UpdateLayeredWindow failed err=" + Marshal.GetLastWin32Error());
-                }
+                if (!ulw) { Log("NativeMethods.UpdateLayeredWindow failed err=" + Marshal.GetLastWin32Error()); return; }
+
+                // UpdateLayeredWindow does NOT make a hidden window visible;
+                // Hopper shows both windows explicitly (SWP_SHOWWINDOW).
+                _chrome.Show();
+                NativeMethods.SetWindowPos(_chrome.Handle, IntPtr.Zero, 0, 0, 0, 0,
+                             0x1 | 0x2 | 0x10 | 0x40 /*NOSIZE|NOMOVE|NOACTIVATE|SHOWWINDOW*/);
+                // keep the opaque panel strictly below the chrome layer
+                NativeMethods.SetWindowPos(_panel.Handle, _chrome.Handle, 0, 0, 0, 0, 0x1 | 0x2 | 0x10);
             }
             finally
             {
-                NativeMethods.DeleteObject(dib);
-                headerBrush.Dispose();
-                headerFont.Dispose();
-                NativeMethods.ReleaseDC(IntPtr.Zero, screenDc);
+                if (old != IntPtr.Zero) NativeMethods.SelectObject(memDc, old);
+                NativeMethods.DeleteDC(memDc);
             }
         }
 
@@ -2596,6 +2704,19 @@ namespace AppHopper
             return held;
         }
 
+        // True when the icon still converts to a usable bitmap. Used by the
+        // ownership test: an Icon whose handle has been destroyed underneath it
+        // throws here instead of silently rendering garbage.
+        static bool RendersAsIcon(Icon icon)
+        {
+            if (icon == null || icon.Handle == IntPtr.Zero) return false;
+            try
+            {
+                using (Bitmap bmp = icon.ToBitmap()) return bmp.Width > 0 && bmp.Height > 0;
+            }
+            catch { return false; }
+        }
+
         static bool RunSelfTests()
         {
             _testFailures = 0;
@@ -2862,6 +2983,104 @@ namespace AppHopper
                 Check(!WaitForForegroundNotification(IntPtr.Zero, 50), "invalid HWND treated as synchronized");
             });
 
+            Test("app icons are copies, so disposing one never harms another", delegate
+            {
+                // CopyIconSafe must hand back a COPY. Adopting a live HICON
+                // would mean disposing this Icon destroys the target window's
+                // own icon and blanks it on screen and in the taskbar - so the
+                // property that matters is independence, which is observable:
+                // disposing one copy must leave the others and the source
+                // intact and renderable.
+                //
+                // It deliberately does NOT assert handle ownership: making the
+                // copy owned costs a second Clone() per icon, and icon loading
+                // runs on the Alt+Tab startup path where that measurably cost us
+                // switch reliability (10 failures per 25 gestures versus 0).
+                // See the note on CopyIconSafe.
+                Icon source = MakeTrayIcon();
+                IntPtr src = source.Handle;
+                try
+                {
+                    Icon a = CopyIconSafe(src);
+                    Icon b = CopyIconSafe(src);
+                    Check(a != null && b != null, "CopyIconSafe returned nothing for a valid icon");
+                    Check(a.Handle != b.Handle, "two copies shared one handle");
+
+                    a.Dispose();          // must not destroy b, nor src
+                    Check(b.Handle != IntPtr.Zero, "disposing one copy destroyed the other");
+                    Check(RendersAsIcon(b), "the surviving copy stopped rendering after the other was disposed");
+
+                    Icon third = CopyIconSafe(src);
+                    Check(third != null, "disposing a copy destroyed the source icon");
+                    if (third != null) third.Dispose();
+
+                    b.Dispose();
+                    Check(CopyIconSafe(IntPtr.Zero) == null, "a zero handle produced an icon");
+                }
+                finally { NativeMethods.DestroyIcon(src); }
+            });
+
+            Test("an out-of-range commit index is ignored, not fatal", delegate
+            {
+                // The index arrives as a posted message parameter, so it is
+                // untrusted input. Before the guard this reached _apps[_index]
+                // with no try/catch anywhere on the path WndProc -> Commit.
+                bool session = _session;
+                int savedIndex = _index;
+                try
+                {
+                    _session = true;
+                    _apps.Clear();
+                    _apps.Add(new AppEntry { ReprHwnd = new IntPtr(1), Exe = "a.exe", Key = "a.exe" });
+                    foreach (int bad in new int[] { -1, 1, 999999, int.MaxValue })
+                    {
+                        string outp = CaptureLog(delegate { DispatchAppMsg(NativeMethods.WM_APP_COMMITAT, new IntPtr(bad)); });
+                        Check(outp.Contains("out of range"), "index " + bad + " was not rejected");
+                        Check(_index == 0 || _index == savedIndex, "index " + bad + " corrupted the selection");
+                    }
+                }
+                finally { _apps.Clear(); _index = savedIndex; _session = session; }
+            });
+
+            Test("a failing app message never escapes into the message pump", delegate
+            {
+                // HandleAppMsg must contain whatever the dispatch throws: the
+                // whole chain runs inside WndProc, so an escaping exception
+                // unwinds out of the message loop and kills the process.
+                // WM_APP_NEXT against an empty list makes MoveIndex divide by
+                // _apps.Count - genuinely fatal, and unlike a bad commit index
+                // it is not intercepted by the range guard, so this exercises
+                // the wrapper itself.
+                bool session = _session;
+                try
+                {
+                    _session = true;
+                    _apps.Clear();
+                    string outp = CaptureLog(delegate
+                    {
+                        HandleAppMsg(NativeMethods.WM_APP_NEXT, IntPtr.Zero);
+                    });
+                    Check(outp.Contains("app message failed"), "the failure was not caught and logged: " + outp);
+                    Check(!_session, "the session was left up after a failed message");
+                }
+                catch (Exception e) { throw new Exception("exception escaped HandleAppMsg: " + e.Message); }
+                finally { _apps.Clear(); _session = session; }
+            });
+
+            Test("eligibility memoization preserves the owner-chain verdict", delegate
+            {
+                // The cache only skips recomputation; a window and its root
+                // must still classify exactly as the uncached predicate does.
+                var memo = new Dictionary<IntPtr, string>();
+                IntPtr w = NativeMethods.GetDesktopWindow();
+                string cached = EligibilityMemoized(w, memo);
+                string direct = AltTabIneligibilityReason(w);
+                Check(cached == direct, "memoized verdict \"" + cached + "\" != direct \"" + direct + "\"");
+                // Second call must come from the cache and agree.
+                Check(EligibilityMemoized(w, memo) == cached, "cached verdict changed between calls");
+            });
+
+
             Console.WriteLine("failures=" + _testFailures);
             return _testFailures == 0;
         }
@@ -2936,6 +3155,11 @@ namespace AppHopper
             using (var cur = Process.GetCurrentProcess())
             using (var mod = cur.MainModule)
                 _hook = NativeMethods.SetWindowsHookEx(NativeMethods.WH_KEYBOARD_LL, _hookProc, NativeMethods.GetModuleHandle(mod.ModuleName), 0);
+            // A silently missing hook leaves the app looking alive but doing
+            // nothing, and the failure is invisible from the outside - the
+            // user just sees the OS switcher instead. Record it either way.
+            Log("keyboard hook installed=" + (_hook != IntPtr.Zero)
+                + " error=" + (_hook != IntPtr.Zero ? 0 : Marshal.GetLastWin32Error()));
 
             var menu = new ContextMenu();
             var miToggle = new MenuItem("Enabled");

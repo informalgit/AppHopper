@@ -25,6 +25,18 @@ No more "walking through" five Explorer windows to reach the browser: `Alt+Tab` 
 This beta does not guarantee elimination of taskbar flashing. Regression tests cover input, logging and autostart protection; isolated-desktop smoke runs do not replace rapid switching, game or UWP checks on the input desktop.
 
 
+## 1.1.2beta6
+
+- The message-handling chain now contains exceptions: `WndProc -> HandleAppMsg -> Commit` had no try/catch at all, so a throw from window enumeration, a cross-process title read or a COM call unwound out of the message loop and took the process with it. It is now caught centrally and ends the session safely; the `EnumWindows` callback is guarded too, because an exception there crosses the unmanaged frame.
+- The index that arrives with a mouse click is treated as untrusted input: `WM_APP_COMMITAT`'s parameter was written straight into `_index` and `Commit()` immediately used it as `_apps[_index]`. It is range-checked now, and an invalid index is logged and ignored.
+- `AbortSession` (every entry disappeared mid-cycle) used to just hide the overlay, leaving the foreground parked on one of our now-hidden windows with the keyboard going nowhere; it now shares `Cancel`'s handover path.
+- Startup records whether the keyboard hook actually installed. A refused hook previously left the app running and completely unresponsive to Alt+Tab with no visible symptom.
+- Each enumeration reuses the owner-chain verdict instead of re-querying the same root (DWM plus a virtual-desktop COM call) for every popup under it. Panel-up latency is unaffected (p50 59ms -> 61ms).
+- Card drawing and the layered-window submission are separate methods now, so `GraphicsPath`, `StringFormat` and the memory DC are released on the exception path too; likewise the tray icon's arrow caps.
+- Dead code removed: `AllowSetForegroundWindow` (it granted the target process while the call was ours, so it did nothing for this activation), `ShowWindow`, `GetClassLong`, `GetAncestor`, `FindWindowByClass`, and an unused `oldIndex`.
+- Regressions grew from 14 to 18, adding out-of-range index, message-exception containment, icon independence and memoized eligibility - each verified by mutation testing (breaking the implementation fails the test).
+- **Deliberately reverted**: review found that `Icon.FromHandle` does not take ownership and `Dispose` does not destroy, so icons leak slowly, one per executable. Fixing it costs an extra `Clone()` per icon fetch, and icon loading sits on the Alt+Tab startup path: measured, that raised switch failures from 0/25 to 10/25. The handle count is bounded (one per executable, reclaimed at process exit), so paying switch reliability for it is a bad trade - kept as is, with the reason recorded in the code.
+
 ## 1.1.2beta5
 
 - Fixed the taskbar blink when the switcher is closed with ESC while Alt is still held: `Cancel` used to hand the foreground back to the source window mid-gesture. Releasing the foreground in the middle of the Alt+Tab gesture is recorded by Windows as a foreground ownership change, and the blink comes from exactly that. The handover is now deferred until Alt is released and completed by the watchdog (within 30ms); if the foreground has already returned by then - to the system or because the user moved on - nothing is forced.
