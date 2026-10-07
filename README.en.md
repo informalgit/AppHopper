@@ -27,8 +27,12 @@ This beta does not guarantee elimination of taskbar flashing. Regression tests c
 
 ## 1.1.2beta6
 
-## 1.1.2beta7
+## 1.1.2beta8
 
+- Fixed Foxmail being absent from the switcher entirely: its main frame (`TFoxMainFrm.UnicodeClass`) never calls `SetWindowText`, so its title is empty, and the eligibility rule treated "no title" as not switchable - the whole application was silently dropped, as if it were not installed. The rule now judges whether the window has a real on-screen size rather than whether it has a title; the hairline helpers this used to catch (tooltips, tray icons, input strips) are a few pixels and most were already excluded as toolwindows. Verified against a real enumeration: Foxmail appears, everything else stays a real application, nothing spurious got in.
+- Also closed a latent hole: the desktop's real class is `#32769` (not `Progman`); it has no title, no TOOLWINDOW bit and full-screen size, and was previously excluded only because it happened to have an empty title. It is now excluded by class name explicitly.
+- Regressions grew to 20.
+- **Flashing and failure are two faces of the same cause**: measurement shows every refused `SetForegroundWindow` comes with one taskbar flash, and the refusal is why the switch failed. Removing the flash means removing the failure, at the cost of switching reliability. Current measured failure rate is about 2%, with zero leftover flashes (nothing lingers once the switch completes). Going lower on flashing means accepting failed switches.
 
 - **Regression fix**: beta6 removed `AllowSetForegroundWindow`, which took switch failures from about 3% to about 28%. That call always returns ERROR_ACCESS_DENIED here and grants nothing by its documented meaning, so it reads like pure waste - but the few milliseconds it costs are what keep the host's foreground alive long enough for the handoff that follows. Alternating measurement: without it 8/20 and 7/20 failures; with it 1/20, 2/20 and 0/20. Restored, with the reason recorded at the call site: its value is timing, not permission, and it is not the same thing as the self-pid preflight that genuinely was wrong.
 - Also confirmed the bounded `WM_NULL` barrier before the handoff must stay: removing it pins failures at 6/20, keeping it gives 1-4/20.

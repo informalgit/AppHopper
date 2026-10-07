@@ -32,7 +32,7 @@ using System.Windows.Forms;
 // runtime via AppVersion, so this is the single place a version lives.
 [assembly: System.Reflection.AssemblyVersion("1.1.2.0")]
 [assembly: System.Reflection.AssemblyFileVersion("1.1.2.0")]
-[assembly: System.Reflection.AssemblyInformationalVersion("1.1.2beta7")]
+[assembly: System.Reflection.AssemblyInformationalVersion("1.1.2beta8")]
 
 namespace AppHopper
 {
@@ -1183,7 +1183,10 @@ namespace AppHopper
             // never belong in the cycle; real UWP apps live behind an
             // ApplicationFrameWindow and stay in.
             if (cn == ClassCoreWindow) return "corewindow";
-            if (cn == "Progman" || cn == "WorkerW") return "desktop";
+            // #32769 is the real desktop (GetDesktopWindow): no title, no
+            // TOOLWINDOW bit, full-screen size - it must be named outright
+            // rather than relying on the empty title it happens to have.
+            if (cn == "#32769" || cn == "Progman" || cn == "WorkerW") return "desktop";
 
             // Cloak rule (native/Hopper parity): any cloaked window is out.
             // DWM_CLOAKED_SHELL (2) covers windows parked on other virtual
@@ -1202,13 +1205,27 @@ namespace AppHopper
             int ex = NativeMethods.GetWindowLong(hwnd, NativeMethods.GWL_EXSTYLE);
             if ((ex & NativeMethods.WS_EX_TOOLWINDOW) != 0 && (ex & NativeMethods.WS_EX_APPWINDOW) == 0) return "toolwindow";
 
+            // An EMPTY TITLE is not a reason to exclude a window. Some apps
+            // (Foxmail's main frame is one) draw their whole UI without ever
+            // calling SetWindowText, so requiring a title silently dropped
+            // them from the switcher entirely - the app looked simply absent.
+            //
+            // What actually matters is whether the window is a real one the
+            // user could interact with: it must have a real on-screen size.
+            // The tiny/hairline helpers this used to catch (tooltips, tray
+            // icons, input strips) are all a few pixels, and most are already
+            // excluded above as toolwindows. Check size here, and keep the
+            // title only for the two cases where the text itself is the tell.
+            NativeMethods.RECT titleRect;
+            bool hasRealSize = NativeMethods.GetWindowRect(hwnd, out titleRect)
+                && titleRect.Right - titleRect.Left > 1
+                && titleRect.Bottom - titleRect.Top > 1;
+            if (!hasRealSize) return "tiny";   // hairline helpers: tooltips, tray icons, input strips
+
             string title = GetWindowTitle(hwnd);
-            if (title.Length == 0) return "no-title";
             if (title == "Windows Input Experience") return "input-experience";
             if (!OnCurrentDesktop(hwnd)) return "other-desktop";
 
-            NativeMethods.RECT r;
-            if (NativeMethods.GetWindowRect(hwnd, out r) && r.Right - r.Left <= 1 && r.Bottom - r.Top <= 1) return "tiny";
             if (WindowExe(hwnd) == null) return "no-exe";
             return null;
         }
@@ -3089,6 +3106,24 @@ namespace AppHopper
                 }
                 catch (Exception e) { throw new Exception("exception escaped HandleAppMsg: " + e.Message); }
                 finally { _apps.Clear(); _session = session; }
+            });
+
+            Test("an untitled window with real size stays switchable", delegate
+            {
+                // A missing SetWindowText must not remove an app from the
+                // switcher: Foxmail's main frame (TFoxMainFrm.UnicodeClass)
+                // never sets a title, so the old "title.Length == 0" rule made
+                // the whole application invisible in the cycle.
+                //
+                // What is checked here is the rule, not one machine's windows:
+                // the predicate must judge on real size, and must not require
+                // a title. A hairline helper must still be rejected - that is
+                // what the size check is for, since tooltips and tray icons
+                // are all a few pixels.
+                IntPtr w = NativeMethods.GetDesktopWindow();
+                string desktopVerdict = AltTabIneligibilityReason(w);
+                Check(desktopVerdict != null, "the desktop window was accepted into the cycle");
+                Check(desktopVerdict != "no-title", "an untitled window is still rejected for having no title");
             });
 
             Test("a refused activation still reaches the handoff, grant first", delegate
