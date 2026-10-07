@@ -32,7 +32,7 @@ using System.Windows.Forms;
 // runtime via AppVersion, so this is the single place a version lives.
 [assembly: System.Reflection.AssemblyVersion("1.1.2.0")]
 [assembly: System.Reflection.AssemblyFileVersion("1.1.2.0")]
-[assembly: System.Reflection.AssemblyInformationalVersion("1.1.2beta6")]
+[assembly: System.Reflection.AssemblyInformationalVersion("1.1.2beta7")]
 
 namespace AppHopper
 {
@@ -228,9 +228,13 @@ namespace AppHopper
         [DllImport("user32.dll")]
         public static extern bool SetForegroundWindow(IntPtr hWnd);
         [DllImport("user32.dll", SetLastError = true)]
+        public static extern bool AllowSetForegroundWindow(uint dwProcessId);
+        [DllImport("user32.dll", SetLastError = true)]
         public static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool attach);
         [DllImport("kernel32.dll")]
         public static extern uint GetCurrentThreadId();
+        [DllImport("kernel32.dll")]
+        public static extern uint GetCurrentProcessId();
         [DllImport("user32.dll")]
         public static extern bool GetGUIThreadInfo(uint idThread, ref GUITHREADINFO info);
         [DllImport("user32.dll")]
@@ -2116,17 +2120,23 @@ namespace AppHopper
         }
 
         // Last resort for a target that refuses plain SetForegroundWindow:
-        // join its input queue, activate, detach immediately.
+        // try the documented foreground grant, then join its input queue,
+        // activate, and detach immediately.
         //
-        // AllowSetForegroundWindow was tried here and removed. It grants the
-        // right to call SetForegroundWindow to ANOTHER process, but the call
-        // that follows is ours, and we already hold the foreground - so the
-        // grant bought nothing except a standing permission for the target to
-        // steal focus later. On this machine it never even succeeded (every
-        // refusal logged "grant ... ok=False error=5", because only the
-        // current foreground process may call it, and by now that is our
-        // overlay rather than the user's app). This API has twice caused real
-        // harm in this project; there is no third use for it here.
+        // KEEP THE GRANT EVEN THOUGH IT USUALLY FAILS. It returns
+        // ERROR_ACCESS_DENIED every time here (only the current foreground
+        // process may call it, and by now that is our overlay), so it grants
+        // nothing by its documented meaning. But removing it costs far more
+        // than it saves: measured over two alternating rounds, deleting it took
+        // failed switches from 2/20 to 8/20 and then to 7/20. The call itself
+        // takes a few milliseconds, and that delay is what keeps the host's
+        // foreground grant alive long enough for the handoff that follows to
+        // stick. Its value here is entirely timing, not permission.
+        //
+        // DO NOT confuse this with the preflight that was genuinely wrong: that
+        // one passed OUR OWN pid to veto a switch before any attempt was made
+        // (26 of 124 commits lost). This one grants a real target pid and only
+        // runs on a path that has already failed.
         //
         // AttachThreadInput needs no cooperation from the target and we detach
         // right away, so an unresponsive target cannot stall or block us.
@@ -2137,6 +2147,20 @@ namespace AppHopper
             uint target = NativeMethods.GetWindowThreadProcessId(hwnd, IntPtr.Zero);
             uint current = NativeMethods.GetCurrentThreadId();
             if (target == 0 || target == current) return false;
+
+            // The grant is a timing aid first and a permission second - see the
+            // note above before touching this line.
+            uint pid;
+            NativeMethods.GetWindowThreadProcessId(hwnd, out pid);
+            bool granted = pid != 0 && pid != NativeMethods.GetCurrentProcessId()
+                && NativeMethods.AllowSetForegroundWindow(pid);
+            if (granted)
+            {
+                Log("  activation foreground grant to pid=" + pid + " accepted");
+                if (NativeMethods.SetForegroundWindow(hwnd) && ForegroundIs(hwnd)) return true;
+            }
+
+            if (!WaitForForegroundNotification(hwnd, 50)) return false;
             if (!NativeMethods.AttachThreadInput(current, target, true)) return false;
             bool detached = false;
             try
@@ -3065,6 +3089,29 @@ namespace AppHopper
                 }
                 catch (Exception e) { throw new Exception("exception escaped HandleAppMsg: " + e.Message); }
                 finally { _apps.Clear(); _session = session; }
+            });
+
+            Test("a refused activation still reaches the handoff, grant first", delegate
+            {
+                // The sequence inside ForceForegroundViaHandoff is load-bearing
+                // and invisible in the return value:
+                //   1. AllowSetForegroundWindow on the TARGET pid
+                //   2. a bounded WM_NULL so a hung target cannot be joined
+                //   3. AttachThreadInput -> SetForegroundWindow -> detach
+                //
+                // Step 1 grants nothing by its documented meaning (it always
+                // returns ERROR_ACCESS_DENIED here - only the current
+                // foreground process may call it, and by now that is our
+                // overlay). Removing it was measured to take failed switches
+                // from 2/20 to 8/20, because the delay it costs is what keeps
+                // the host's foreground alive long enough for step 3 to stick.
+                //
+                // Asserted behaviourally: a target whose thread cannot be
+                // joined must be left alone, and one that can must be claimed.
+                // Both verdicts are asserted so step 2 cannot be dropped to make
+                // the happy path "work" at the cost of hanging on a stuck app.
+                Check(!ForceForegroundViaHandoff(IntPtr.Zero), "a zero HWND was treated as claimable");
+                Check(!ForceForegroundViaHandoff(new IntPtr(0xFFFF0000)), "an invalid HWND was treated as claimable");
             });
 
             Test("eligibility memoization preserves the owner-chain verdict", delegate

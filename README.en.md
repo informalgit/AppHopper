@@ -27,6 +27,15 @@ This beta does not guarantee elimination of taskbar flashing. Regression tests c
 
 ## 1.1.2beta6
 
+## 1.1.2beta7
+
+
+- **Regression fix**: beta6 removed `AllowSetForegroundWindow`, which took switch failures from about 3% to about 28%. That call always returns ERROR_ACCESS_DENIED here and grants nothing by its documented meaning, so it reads like pure waste - but the few milliseconds it costs are what keep the host's foreground alive long enough for the handoff that follows. Alternating measurement: without it 8/20 and 7/20 failures; with it 1/20, 2/20 and 0/20. Restored, with the reason recorded at the call site: its value is timing, not permission, and it is not the same thing as the self-pid preflight that genuinely was wrong.
+- Also confirmed the bounded `WM_NULL` barrier before the handoff must stay: removing it pins failures at 6/20, keeping it gives 1-4/20.
+- beta6's other changes (message-chain exception containment, out-of-range click index guard, foreground handover on abort, hook-installation logging, drawing-resource safety on exception, owner-chain verdict reuse) showed no regression and are kept.
+- Regressions grew to 19, adding boundary assertions for the handoff path.
+
+
 - The message-handling chain now contains exceptions: `WndProc -> HandleAppMsg -> Commit` had no try/catch at all, so a throw from window enumeration, a cross-process title read or a COM call unwound out of the message loop and took the process with it. It is now caught centrally and ends the session safely; the `EnumWindows` callback is guarded too, because an exception there crosses the unmanaged frame.
 - The index that arrives with a mouse click is treated as untrusted input: `WM_APP_COMMITAT`'s parameter was written straight into `_index` and `Commit()` immediately used it as `_apps[_index]`. It is range-checked now, and an invalid index is logged and ignored.
 - `AbortSession` (every entry disappeared mid-cycle) used to just hide the overlay, leaving the foreground parked on one of our now-hidden windows with the keyboard going nowhere; it now shares `Cancel`'s handover path.
