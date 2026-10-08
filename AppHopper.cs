@@ -30,9 +30,9 @@ using System.Windows.Forms;
 // "Properties -> Details") without any build.bat change. Bump once per
 // release - the tray tooltip and the startup log line read it back at
 // runtime via AppVersion, so this is the single place a version lives.
-[assembly: System.Reflection.AssemblyVersion("1.1.2.0")]
-[assembly: System.Reflection.AssemblyFileVersion("1.1.2.0")]
-[assembly: System.Reflection.AssemblyInformationalVersion("1.1.2beta8")]
+[assembly: System.Reflection.AssemblyVersion("1.2.0.0")]
+[assembly: System.Reflection.AssemblyFileVersion("1.2.0.0")]
+[assembly: System.Reflection.AssemblyInformationalVersion("1.2")]
 
 namespace AppHopper
 {
@@ -228,15 +228,17 @@ namespace AppHopper
         [DllImport("user32.dll")]
         public static extern bool SetForegroundWindow(IntPtr hWnd);
         [DllImport("user32.dll", SetLastError = true)]
-        public static extern bool AllowSetForegroundWindow(uint dwProcessId);
-        [DllImport("user32.dll", SetLastError = true)]
         public static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool attach);
-        [DllImport("kernel32.dll")]
-        public static extern uint GetCurrentThreadId();
-        [DllImport("kernel32.dll")]
-        public static extern uint GetCurrentProcessId();
+        [DllImport("user32.dll")]
+        public static extern bool BringWindowToTop(IntPtr hWnd);
+        [DllImport("user32.dll")]
+        public static extern IntPtr SetFocus(IntPtr hWnd);
         [DllImport("user32.dll")]
         public static extern bool GetGUIThreadInfo(uint idThread, ref GUITHREADINFO info);
+        [DllImport("user32.dll")]
+        public static extern bool IsChild(IntPtr parent, IntPtr child);
+        [DllImport("kernel32.dll")]
+        public static extern uint GetCurrentThreadId();
         [DllImport("user32.dll")]
         public static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
         [DllImport("user32.dll")]
@@ -688,10 +690,6 @@ namespace AppHopper
         static bool _committing;
         static int _index;
         static int _pageStart;
-        static IntPtr _fgHwnd;
-        // Foreground handover that Cancel deferred because the Alt gesture was
-        // still running; completed by FinishCancelHandover after the release.
-        static IntPtr _cancelRestore;
         static Logic.OverlayLayout _layout;
         static NativeMethods.RECT _panelRect;
         static NativeMethods.RECT _work;    // work area of the monitor the overlay lives on
@@ -838,6 +836,9 @@ namespace AppHopper
         }
 
         // opaque rounded panel hosting the live DWM thumbnails (thumbHost role)
+        //
+        // Both overlay windows show without activation. Input arrives through
+        // low-level hooks, not through keyboard focus on either window.
         class PanelForm : Form
         {
             public PanelForm()
@@ -849,7 +850,7 @@ namespace AppHopper
             protected override bool ShowWithoutActivation { get { return true; } }
             protected override CreateParams CreateParams
             {
-                get { var cp = base.CreateParams; cp.ExStyle |= NativeMethods.WS_EX_TOOLWINDOW | NativeMethods.WS_EX_TOPMOST; return cp; }
+                get { var cp = base.CreateParams; cp.ExStyle |= NativeMethods.WS_EX_TOOLWINDOW | NativeMethods.WS_EX_NOACTIVATE | NativeMethods.WS_EX_TOPMOST; return cp; }
             }
         }
 
@@ -1320,7 +1321,7 @@ namespace AppHopper
                 Log("  app message failed: " + e.GetType().Name + ": " + e.Message);
                 try
                 {
-                    if (_session) { HandOverForeground(); EndSession(); }
+                    if (_session) EndSession();
                 }
                 catch { }
             }
@@ -1488,51 +1489,17 @@ namespace AppHopper
             // its owned popup. Matching on the raw handle alone fails in both.
             IntPtr fg = RepresentativeOf(fgRaw);
             if (fg == IntPtr.Zero || !NativeMethods.IsWindowVisible(fg)) fg = fgRaw;
-            _fgHwnd = fg;
-            // Claiming foreground can close a transient system switcher window.
-            // Preserve its monitor geometry while the source handle is still valid.
+            // Capture the source monitor before enumerating windows.
             NativeMethods.RECT work;
             double scale = MonitorScale(fg, out work);
             Log("fg 0x" + fgRaw.ToInt64().ToString("X") + " [" + ClassNameOf(fgRaw) + "] \""
                 + LogText(GetWindowTitle(fgRaw)) + "\" -> repr 0x" + fg.ToInt64().ToString("X")
                 + " exe=" + LogText(Path.GetFileName(fgExe)));
 
-            // Claim while the real Alt gesture is still current, before slow
-            // enumeration/icon work.
-            //
-            // The host must have a REAL size while it claims the foreground.
-            // A zero-sized window still becomes GetForegroundWindow(), but
-            // Windows then refuses to let it hand the foreground on: every
-            // SetForegroundWindow issued from the session was rejected, and
-            // the rejection is what flashes the target's taskbar button.
-            // The log showed exactly that - host foreground, focus=0x0,
-            // accepted=False. So size it from the source window, which is
-            // already known good, and park it exactly where that window is so
-            // the host is never briefly visible somewhere else. The real
-            // panel geometry is applied right after the layout is computed.
-            //
-            // Measured: keeping the previous position instead (SWP_NOMOVE)
-            // makes no difference to activation - both configurations refused
-            // the same requests on the same targets.
-            NativeMethods.RECT host;
-            bool sized = NativeMethods.GetWindowRect(fgRaw, out host) && host.Right > host.Left && host.Bottom > host.Top;
-            if (!sized) host = new NativeMethods.RECT { Left = 0, Top = 0, Right = 1, Bottom = 1 };
-            NativeMethods.SetWindowPos(_panel.Handle, IntPtr.Zero, host.Left, host.Top,
-                host.Right - host.Left, host.Bottom - host.Top,
-                0x0040 /*SWP_SHOWWINDOW*/ | 0x0010 /*SWP_NOACTIVATE*/ | 0x0004 /*SWP_NOZORDER*/);
-            _panel.Show(); // Synchronize WinForms visibility with the native host.
-            if (!ClaimSessionForeground())
-            {
-                Log("start aborted: session panel did not acquire foreground");
-                EndSession();
-                return;
-            }
-
             var order = EnumerateEntries();
             if (order.Count < 2)
             {
                 Log("start aborted: only " + order.Count + " app(s) in cycle");
-                ForceForeground(_fgHwnd);
                 EndSession();
                 return;
             }
@@ -1598,11 +1565,10 @@ namespace AppHopper
         static void ShowPanel()
         {
             _panel.BackColor = PanelFillC(LightTheme());
-            // Positioning and refresh never activate as a side effect.
-            // StartSession claims foreground immediately after capturing the
-            // source; subsequent layout and drawing preserve that ownership.
+            // Showing or refreshing either overlay must not activate it.
             NativeMethods.SetWindowPos(_panel.Handle, IntPtr.Zero, _layout.panelX, _layout.panelY, _layout.panelW, _layout.panelH,
                                        0x0040 /*SWP_SHOWWINDOW*/ | 0x0010 /*SWP_NOACTIVATE*/);
+            _panel.Show(); // Keep WinForms visibility in sync so Hide() works.
             IntPtr rgn = NativeMethods.CreateRoundRectRgn(0, 0, _layout.panelW + 1, _layout.panelH + 1, 2 * Logic.Scaled(_scale, 8), 2 * Logic.Scaled(_scale, 8));
             if (rgn != IntPtr.Zero)
             {
@@ -1716,8 +1682,7 @@ namespace AppHopper
             foreach (var e in _apps) e.Thumb = IntPtr.Zero;
         }
 
-        // Hide only after foreground transfer (or during teardown). Hiding the
-        // foreground panel before activation would discard our activation rights.
+        // The overlay never owns foreground; hiding it needs no handback.
         static void HideOverlay()
         {
             UnregisterThumbnails();
@@ -1753,37 +1718,11 @@ namespace AppHopper
                 var app = _apps[_index];
                 IntPtr target = app.ReprHwnd;
                 string targetExe = app.Exe;
-                // Activate the target BEFORE hiding the overlay. Hiding first
-                // would park the foreground on a hidden window of ours and the
-                // switch would then start from there; and (worse for a UWP
-                // source) an intermediate SetForegroundWindow back to the
-                // source would re-arm its foreground lock.
+                // Like Window Hopper, hide the non-activating overlay first.
+                HideOverlay();
                 bool ok = ForceForeground(target);
                 if (!ok) ok = ForegroundIs(target);   // FF's verdict can lag the real foreground; trust the latter
                 if (!ok) ok = WaitForForegroundLanding(target);   // see below: fg==0 is a transition, not a failure
-                if (!ok)
-                {
-                    IntPtr nowFg = NativeMethods.GetForegroundWindow();
-                    if (nowFg == IntPtr.Zero || IsOwnWindow(nowFg))
-                    {
-                        // Nothing (or only our own dying overlay) holds the
-                        // foreground: restore the source so the desktop is
-                        // never left focus-dead. If a FOREIGN window already
-                        // holds it, leave it alone - grabbing it back is
-                        // precisely what re-armed the UWP foreground lock and
-                        // reverted successful switches.
-                        if (NativeMethods.IsWindow(_fgHwnd) && _fgHwnd != target)
-                        {
-                            Log("  commit fallback: restoring source 0x" + _fgHwnd.ToInt64().ToString("X"));
-                            NativeMethods.SetForegroundWindow(_fgHwnd);
-                        }
-                    }
-                    else
-                    {
-                        Log("  commit: fg held by 0x" + nowFg.ToInt64().ToString("X")
-                            + " [" + ClassNameOf(nowFg) + "], source restore skipped");
-                    }
-                }
                 EndSession();
                 IntPtr now = NativeMethods.GetForegroundWindow();
                 Log("commit -> 0x" + target.ToInt64().ToString("X") + " " + LogText(Path.GetFileName(targetExe))
@@ -1848,63 +1787,12 @@ namespace AppHopper
             _committing = true;
             try
             {
-                HandOverForeground();
                 EndSession();
                 Log("cancel");
             }
             finally { _committing = false; }
         }
 
-        // Gives the foreground back to the window that had it when the cycle
-        // opened, so hiding our topmost windows cannot park the foreground on
-        // a hidden window of ours. Shared by Cancel and AbortSession.
-        //
-        // But NOT while Alt is still held: releasing the foreground in the
-        // middle of the Alt+Tab gesture is recorded by Windows as a foreground
-        // ownership change, which flashes the restored window's taskbar button
-        // (the "press ESC without releasing Alt and the taskbar blinks"
-        // report). The watchdog runs within 30ms of the Alt release, so the
-        // handover happens then instead - by which point the gesture is over
-        // and the handback is silent.
-        static void HandOverForeground()
-        {
-            if (!NativeMethods.IsWindow(_fgHwnd)) return;
-            if (!AltDown())
-            {
-                NativeMethods.SetForegroundWindow(_fgHwnd);
-                Application.DoEvents();
-                return;
-            }
-            Log("  cancel: alt still held, deferring the foreground handback");
-            _cancelRestore = _fgHwnd;
-        }
-
-        // Completes a deferred Cancel handover once the Alt gesture is over.
-        // Driven by the watchdog tick, which fires within 30ms of the release.
-        static void FinishCancelHandover()
-        {
-            IntPtr target = _cancelRestore;
-            if (target == IntPtr.Zero) return;
-            if (AltDown()) return;
-            _cancelRestore = IntPtr.Zero;
-            if (!NativeMethods.IsWindow(target)) { Log("  cancel: handback dropped, target gone"); return; }
-            // Somebody already owns the foreground - a real app the user moved
-            // to, or the source window Windows restored by itself once our
-            // overlay went away - so leave it alone.
-            IntPtr fg = NativeMethods.GetForegroundWindow();
-            if (fg != IntPtr.Zero && !IsOwnWindow(fg))
-            {
-                Log("  cancel: handback unnecessary, foreground already at 0x"
-                    + fg.ToInt64().ToString("X"));
-                return;
-            }
-            // Otherwise the foreground is parked on one of our own now-hidden
-            // windows (or nowhere), which is the case this exists to fix.
-            NativeMethods.SetForegroundWindow(target);
-            Application.DoEvents();
-            Log("  cancel: foreground handed back after the alt release fg=0x"
-                + NativeMethods.GetForegroundWindow().ToInt64().ToString("X"));
-        }
 
         static void EndSession()
         {
@@ -1926,18 +1814,12 @@ namespace AppHopper
 
         // Give up on the cycle without switching anywhere: used when the
         // refresh finds there is nothing left to switch to.
-        //
-        // The foreground still has to go back. EndSession hides our windows,
-        // so without this handover the foreground is left parked on a hidden
-        // window of ours and the keyboard goes nowhere - the same defect
-        // Cancel had to solve. Reuse that path rather than duplicate it.
         static void AbortSession()
         {
             if (_committing) { Log("abort swallowed: reentrant"); return; }
             _committing = true;
             try
             {
-                HandOverForeground();
                 EndSession();
                 Log("session aborted: no windows left");
             }
@@ -2038,26 +1920,20 @@ namespace AppHopper
             return pid != 0 && pid == (uint)Process.GetCurrentProcess().Id;
         }
 
+        // Window Hopper activation: attach to the current foreground thread
+        // before raising the target; detach before pumping messages or logging.
         static bool ForceForeground(IntPtr hwnd)
         {
             if (!NativeMethods.IsWindow(hwnd)) return false;
             if (ForegroundIs(hwnd)) return true;
-            // Only the active session panel may transfer foreground. A denied
-            // request from a background process flashes the target's taskbar.
-            if (!SessionOwnsForeground())
-            {
-                Log("  activation skipped: session does not own foreground");
-                return false;
-            }
             var sw = Stopwatch.StartNew();
+
             if (NativeMethods.IsIconic(hwnd))
             {
                 NativeMethods.ShowWindowAsync(hwnd, NativeMethods.SW_RESTORE);
-                // SW_RESTORE is asynchronous: activating while the window is
-                // still minimized is refused, and the refusal is what flashes
-                // the taskbar button. Wait for it to actually leave the
-                // minimized state, bounded so a target that refuses to restore
-                // cannot stall the commit.
+                // SW_RESTORE is asynchronous; activating while the window is
+                // still minimized is refused. Bounded so a target that never
+                // restores cannot stall the commit.
                 for (int waited = 0; waited < 250 && NativeMethods.IsIconic(hwnd); waited += 10)
                 {
                     System.Threading.Thread.Sleep(10);
@@ -2065,181 +1941,78 @@ namespace AppHopper
                 }
                 Log("  activation restore waited=" + sw.ElapsedMilliseconds + "ms iconic=" + NativeMethods.IsIconic(hwnd));
             }
-            if (!SessionOwnsForeground())
+
+            IntPtr source = NativeMethods.GetForegroundWindow();
+            // Commit is posted by the input hook. Synchronize with the source
+            // before transferring foreground so it can process the Alt release.
+            IntPtr inputSource = source;
+            if (ClassNameOf(source) == ClassAppFrame)
             {
-                Log("  activation skipped: foreground changed during restore");
-                return false;
+                IntPtr core = UwpCoreWindowOf(source);
+                if (core != IntPtr.Zero) inputSource = core;
             }
-            if (_log != null)
+            WaitForForegroundNotification(inputSource, 50);
+            uint fgThread = NativeMethods.GetWindowThreadProcessId(NativeMethods.GetForegroundWindow(), IntPtr.Zero);
+            uint myThread = NativeMethods.GetCurrentThreadId();
+            uint targetThread = NativeMethods.GetWindowThreadProcessId(hwnd, IntPtr.Zero);
+            // Joining queues changes their shared focus. Preserve the selected
+            // window's existing child focus before attaching either queue.
+            IntPtr focus = hwnd;
+            var gui = new NativeMethods.GUITHREADINFO();
+            gui.cbSize = (uint)Marshal.SizeOf(typeof(NativeMethods.GUITHREADINFO));
+            if (NativeMethods.GetGUIThreadInfo(targetThread, ref gui)
+                && gui.hwndFocus != IntPtr.Zero
+                && (gui.hwndFocus == hwnd || NativeMethods.IsChild(hwnd, gui.hwndFocus)))
+                focus = gui.hwndFocus;
+            bool targetJoined = false;
+            bool joined = fgThread != 0 && fgThread != myThread;
+            if (joined && !NativeMethods.AttachThreadInput(myThread, fgThread, true))
             {
-                var gui = new NativeMethods.GUITHREADINFO();
-                gui.cbSize = (uint)Marshal.SizeOf(typeof(NativeMethods.GUITHREADINFO));
-                if (NativeMethods.GetGUIThreadInfo(0, ref gui))
-                    Log("  activation foreground queue flags=0x" + gui.flags.ToString("X")
-                        + " active=0x" + gui.hwndActive.ToInt64().ToString("X")
-                        + " focus=0x" + gui.hwndFocus.ToInt64().ToString("X")
-                        + " menu=0x" + gui.hwndMenuOwner.ToInt64().ToString("X"));
+                joined = false;
+                Log("  activation attach failed err=" + Marshal.GetLastWin32Error());
             }
-            // A refused SetForegroundWindow is not a veto, it is a retryable
-            // condition. On this machine 11 of 38 commits were refused on the
-            // first call and every one of those failed to switch (the accepted
-            // ones succeeded 27/27) - the old code gave up 7ms after the
-            // refusal while it still owned the foreground.
-            //
-            // Two rules keep that from turning into the taskbar flicker the
-            // refusal itself causes:
-            //   - escalate straight to the input-queue handoff instead of
-            //     repeating the plain request, which was refused N times and
-            //     flashed the target N times;
-            //   - never re-request after a handoff has run: if one did not
-            //     take, more of the same will not either.
-            bool accepted = NativeMethods.SetForegroundWindow(hwnd);
-            Log("  activation request sfw target=0x" + hwnd.ToInt64().ToString("X")
-                + " accepted=" + accepted + " fg=0x" + NativeMethods.GetForegroundWindow().ToInt64().ToString("X"));
-            bool handedOff = false;
-            if (!ForegroundIs(hwnd) && !accepted)
+            try
             {
-                // Only the active session panel may transfer foreground, so a
-                // host that already lost it must stop rather than flash the
-                // target from the background.
-                if (SessionOwnsForeground())
+                // Window Hopper cycles within an app. Our target can own a
+                // different input queue, so join it as well before activation.
+                if (targetThread != 0 && targetThread != myThread && targetThread != fgThread)
                 {
-                    Log("  activation refused with the host still foreground, escalating to an input-queue handoff");
-                    handedOff = ForceForegroundViaHandoff(hwnd);
+                    targetJoined = NativeMethods.AttachThreadInput(myThread, targetThread, true);
+                    if (!targetJoined)
+                    {
+                        Log("  activation target attach failed err=" + Marshal.GetLastWin32Error());
+                    }
                 }
-                else
-                {
-                    Log("  activation stopped: host no longer owns foreground");
-                }
+                // Restore focus in the joined queue before requesting foreground.
+                // The reverse order was refused after long-held gestures from
+                // a console source with no GUI focus; short MRU taps hid it.
+                NativeMethods.SetFocus(focus);
+                NativeMethods.BringWindowToTop(hwnd);
+                NativeMethods.SetForegroundWindow(hwnd);
             }
-            // A request that was accepted but has not landed yet is still in
-            // flight; synchronize with the target instead of re-requesting.
-            if (!ForegroundIs(hwnd) && accepted && !handedOff && sw.ElapsedMilliseconds < 200)
+            finally
+            {
+                if (targetJoined) NativeMethods.AttachThreadInput(myThread, targetThread, false);
+                if (joined) NativeMethods.AttachThreadInput(myThread, fgThread, false);
+            }
+
+            if (!ForegroundIs(hwnd) && sw.ElapsedMilliseconds < 200)
             {
                 uint remaining = (uint)Math.Max(1L, 200L - sw.ElapsedMilliseconds);
-                bool processed = WaitForForegroundNotification(hwnd, remaining);
-                Log("  activation sync target=0x" + hwnd.ToInt64().ToString("X")
-                    + " processed=" + processed + " after " + sw.ElapsedMilliseconds + "ms");
+                WaitForForegroundNotification(hwnd, remaining);
             }
             Application.DoEvents();
+
             if (ForegroundIs(hwnd))
             {
-                Log("  force-fg 0x" + hwnd.ToInt64().ToString("X") + " via foreground-handoff"
-                    + " accepted=" + accepted + " after " + sw.ElapsedMilliseconds + "ms");
+                Log("  force-fg 0x" + hwnd.ToInt64().ToString("X") + " ok after " + sw.ElapsedMilliseconds + "ms");
                 return true;
             }
             IntPtr stuck = NativeMethods.GetForegroundWindow();
             Log("  force-fg 0x" + hwnd.ToInt64().ToString("X") + " FAILED, fg stuck at 0x"
                 + stuck.ToInt64().ToString("X") + " [" + ClassNameOf(stuck) + "] \""
-                + LogText(GetWindowTitle(stuck)) + "\""
-                + " after " + sw.ElapsedMilliseconds + "ms");
+                + LogText(GetWindowTitle(stuck)) + "\" after " + sw.ElapsedMilliseconds + "ms");
             return false;
-        }
-
-        // Last resort for a target that refuses plain SetForegroundWindow:
-        // try the documented foreground grant, then join its input queue,
-        // activate, and detach immediately.
-        //
-        // KEEP THE GRANT EVEN THOUGH IT USUALLY FAILS. It returns
-        // ERROR_ACCESS_DENIED every time here (only the current foreground
-        // process may call it, and by now that is our overlay), so it grants
-        // nothing by its documented meaning. But removing it costs far more
-        // than it saves: measured over two alternating rounds, deleting it took
-        // failed switches from 2/20 to 8/20 and then to 7/20. The call itself
-        // takes a few milliseconds, and that delay is what keeps the host's
-        // foreground grant alive long enough for the handoff that follows to
-        // stick. Its value here is entirely timing, not permission.
-        //
-        // DO NOT confuse this with the preflight that was genuinely wrong: that
-        // one passed OUR OWN pid to veto a switch before any attempt was made
-        // (26 of 124 commits lost). This one grants a real target pid and only
-        // runs on a path that has already failed.
-        //
-        // AttachThreadInput needs no cooperation from the target and we detach
-        // right away, so an unresponsive target cannot stall or block us.
-        // BringWindowToTop stays out: it bypasses the foreground lock and is
-        // exactly what makes a window flash without coming up.
-        static bool ForceForegroundViaHandoff(IntPtr hwnd)
-        {
-            uint target = NativeMethods.GetWindowThreadProcessId(hwnd, IntPtr.Zero);
-            uint current = NativeMethods.GetCurrentThreadId();
-            if (target == 0 || target == current) return false;
-
-            // The grant is a timing aid first and a permission second - see the
-            // note above before touching this line.
-            uint pid;
-            NativeMethods.GetWindowThreadProcessId(hwnd, out pid);
-            bool granted = pid != 0 && pid != NativeMethods.GetCurrentProcessId()
-                && NativeMethods.AllowSetForegroundWindow(pid);
-            if (granted)
-            {
-                Log("  activation foreground grant to pid=" + pid + " accepted");
-                if (NativeMethods.SetForegroundWindow(hwnd) && ForegroundIs(hwnd)) return true;
-            }
-
-            if (!WaitForForegroundNotification(hwnd, 50)) return false;
-            if (!NativeMethods.AttachThreadInput(current, target, true)) return false;
-            bool detached = false;
-            try
-            {
-                NativeMethods.SetForegroundWindow(hwnd);
-            }
-            finally { detached = NativeMethods.AttachThreadInput(current, target, false); }
-            Log("  activation input-queue handoff detached=" + detached
-                + " owns=" + NativeMethods.GetForegroundWindow().ToInt64().ToString("X"));
-            return detached && ForegroundIs(hwnd);
-        }
-
-        static bool SessionOwnsForeground()
-        {
-            return _panel != null && _panel.IsHandleCreated
-                && NativeMethods.IsWindowVisible(_panel.Handle)
-                && NativeMethods.GetForegroundWindow() == _panel.Handle;
-        }
-
-        static bool ClaimSessionForeground()
-        {
-            bool accepted;
-            bool owns = TryClaimFromForegroundQueue(out accepted);
-            Log("session foreground request hwnd=0x" + _panel.Handle.ToInt64().ToString("X")
-                + " accepted=" + accepted + " owns=" + owns
-                + " fg=0x" + NativeMethods.GetForegroundWindow().ToInt64().ToString("X"));
-            return owns;
-        }
-
-        static bool TryClaimFromForegroundQueue(out bool accepted)
-        {
-            accepted = false;
-            IntPtr source = NativeMethods.GetForegroundWindow();
-            uint current = NativeMethods.GetCurrentThreadId();
-            uint foreground = NativeMethods.GetWindowThreadProcessId(source, IntPtr.Zero);
-            if (source == IntPtr.Zero || foreground == 0 || foreground == current)
-            {
-                accepted = NativeMethods.SetForegroundWindow(_panel.Handle);
-                return SessionOwnsForeground();
-            }
-            if (!WaitForForegroundNotification(source, 50)
-                || NativeMethods.GetForegroundWindow() != source) return SessionOwnsForeground();
-            // Normal activation first: it is the only path that does not make
-            // Windows flash every candidate window. A refused SetForegroundWindow
-            // is what flashes the target's taskbar button, so it must stay the
-            // exception rather than the routine.
-            accepted = NativeMethods.SetForegroundWindow(_panel.Handle);
-            if (SessionOwnsForeground()) return true;
-            if (NativeMethods.GetForegroundWindow() != source) return SessionOwnsForeground();
-            // UWP and other hosts that refuse plain activation: join the input
-            // queue once. Windows treats that as a foreground ownership change
-            // and flashes every candidate, which is why it is the last resort -
-            // but the claim has to succeed before the user can pick anything,
-            // so there is no alternative to it here.
-            if (!NativeMethods.AttachThreadInput(current, foreground, true)) return false;
-            bool detached;
-            // Only our own responsive window is activated; never attach a target.
-            // Detach before enumeration, drawing, logging, or target activation.
-            try { accepted = NativeMethods.SetForegroundWindow(_panel.Handle); }
-            finally { detached = NativeMethods.AttachThreadInput(current, foreground, false); }
-            Log("session input-queue handoff accepted=" + accepted + " detached=" + detached);
-            return detached && SessionOwnsForeground();
         }
 
         static bool WaitForForegroundNotification(IntPtr hwnd, uint timeoutMs)
@@ -3002,17 +2775,6 @@ namespace AppHopper
                 }
             });
 
-            Test("activation refuses an invalid handle and a caller without the foreground", delegate
-            {
-                Check(!ForceForeground(IntPtr.Zero), "invalid HWND accepted");
-                // This process holds no foreground here, so a real window must
-                // be left alone instead of being activated behind the user's
-                // back (a denied request from a background process flashes the
-                // target's taskbar). The desktop window is the cheapest
-                // always-present, never-focusable stand-in.
-                string output = CaptureLog(delegate { Check(!ForceForeground(NativeMethods.GetDesktopWindow()), "background caller activated a target"); });
-                Check(output.Contains("session does not own foreground"), "the missing-foreground guard did not fire");
-            });
 
             Test("activation notification survives a blocked and a dead target", delegate
             {
@@ -3126,27 +2888,35 @@ namespace AppHopper
                 Check(desktopVerdict != "no-title", "an untitled window is still rejected for having no title");
             });
 
-            Test("a refused activation still reaches the handoff, grant first", delegate
+            Test("overlay display and cancellation preserve foreground", delegate
             {
-                // The sequence inside ForceForegroundViaHandoff is load-bearing
-                // and invisible in the return value:
-                //   1. AllowSetForegroundWindow on the TARGET pid
-                //   2. a bounded WM_NULL so a hung target cannot be joined
-                //   3. AttachThreadInput -> SetForegroundWindow -> detach
-                //
-                // Step 1 grants nothing by its documented meaning (it always
-                // returns ERROR_ACCESS_DENIED here - only the current
-                // foreground process may call it, and by now that is our
-                // overlay). Removing it was measured to take failed switches
-                // from 2/20 to 8/20, because the delay it costs is what keeps
-                // the host's foreground alive long enough for step 3 to stick.
-                //
-                // Asserted behaviourally: a target whose thread cannot be
-                // joined must be left alone, and one that can must be claimed.
-                // Both verdicts are asserted so step 2 cannot be dropped to make
-                // the happy path "work" at the cost of hanging on a stuck app.
-                Check(!ForceForegroundViaHandoff(IntPtr.Zero), "a zero HWND was treated as claimable");
-                Check(!ForceForegroundViaHandoff(new IntPtr(0xFFFF0000)), "an invalid HWND was treated as claimable");
+                IntPtr before = NativeMethods.GetForegroundWindow();
+                using (var panel = new PanelForm())
+                using (var chrome = new ChromeForm())
+                {
+                    chrome.Owner = panel;
+                    foreach (Form window in new Form[] { panel, chrome })
+                    {
+                        window.SetBounds(40, 40, 200, 100);
+                        window.Show();
+                        Application.DoEvents();
+                        Check(NativeMethods.IsWindowVisible(window.Handle), "overlay did not show");
+                        Check(NativeMethods.GetForegroundWindow() == before, "show changed foreground");
+                    }
+                    panel.Hide();
+                    chrome.Hide();
+                    Application.DoEvents();
+                    Check(!NativeMethods.IsWindowVisible(panel.Handle)
+                        && !NativeMethods.IsWindowVisible(chrome.Handle), "cancel left an overlay visible");
+                    Check(NativeMethods.GetForegroundWindow() == before, "cancel changed foreground");
+                }
+            });
+
+
+            Test("activation refuses handles it cannot claim", delegate
+            {
+                Check(!ForceForeground(IntPtr.Zero), "a zero HWND was treated as claimable");
+                Check(!ForceForeground(new IntPtr(0xFFFF0000)), "an invalid HWND was treated as claimable");
             });
 
             Test("eligibility memoization preserves the owner-chain verdict", delegate
@@ -3222,7 +2992,7 @@ namespace AppHopper
             }
             _panel = new PanelForm();
             _chrome = new ChromeForm();
-            _chrome.Owner = _panel; // Keep card chrome above its activatable host.
+            _chrome.Owner = _panel; // Keep chrome above the non-activating host.
             // Record our own handles so a stray foreground window in the commit
             // log can be told apart from one of ours.
             Log("our windows: msg=0x" + hMsg.ToInt64().ToString("X")
@@ -3293,10 +3063,6 @@ namespace AppHopper
             sessionWatchdog.Tick += delegate
             {
                 if (_session && !AltDown()) Commit();
-                // Completes a Cancel that deferred its handover because the
-                // user was still holding Alt. Runs after Commit so a live
-                // session never competes with a pending handback.
-                else FinishCancelHandover();
             };
             sessionWatchdog.Start();
 
@@ -3309,7 +3075,6 @@ namespace AppHopper
             {
                 if (!_exitRequested) return;
                 if (_committing) return;   // a commit is mid-flight; retry next tick
-                _cancelRestore = IntPtr.Zero;   // never hand the foreground back during teardown
                 EndSession();
                 exitTimer.Stop();
                 icon.Visible = false;

@@ -1,56 +1,42 @@
-# 接力提示词：AppHopper 仓库复核
+# 接力提示词：AppHopper 1.2
 
-这是一个 Windows 应用级 `Alt+Tab` 切换器：单文件 `AppHopper.cs`、.NET Framework `csc.exe`、托盘常驻、PowerToys Window Hopper 风格浮层。仓库根目录就是当前项目目录，不要假设 `C:\Tools\AppHopper2` 等旧路径。
+这是 Windows 应用级 Alt+Tab 切换器：单文件 `AppHopper.cs`、Windows 自带 .NET Framework `csc.exe` 构建、托盘常驻、PowerToys Window Hopper 风格双层浮层。
 
-## 先读
+## 当前版本与架构
 
-1. `AppHopper.cs`：唯一运行时代码，当前源版本为 `1.1.2beta8`；程序集/文件版本及 Manifest 使用数值版本 `1.1.2.0`。
-2. `README.md` / `README.en.md`：构建、诊断和回退行为。
-3. `.workbuddy/memory/MEMORY.md` 与日期日志：历史证据；历史结论不能替代当前实测。
+- 源码信息版本 `1.2`，程序集、文件及 Manifest 数值版本 `1.2.0.0`。
+- `PanelForm`、`ChromeForm`、`MsgForm` 使用 `WS_EX_NOACTIVATE`。显示、刷新、取消不主动请求前台；低级键盘和鼠标钩子向消息窗投递操作。
+- `Commit` 先关闭会话触发并捕获目标，再隐藏浮层，最后激活目标。`ForceForeground` 短时连接当前前台线程及不同的目标线程，执行 `SetFocus(保存的目标焦点) → BringWindowToTop → SetForegroundWindow`，在 `finally` 中逆序断开后才泵消息和做有界落定检查。反向顺序在控制台源、长按选择时复现拒绝，短按 MRU 测试不会暴露此问题；先恢复焦点后通过相同表面验证。
+- Window Hopper 切同应用窗口，我们切跨应用窗口，不能假设源和目标队列相同。连接前用 `GetGUIThreadInfo` 保存目标子控件焦点，仅恢复属于选中窗口或其子控件的焦点，否则以目标顶层窗口作为焦点入口。必须验证实际文本输入，而不是仅检查前台 HWND。受控的两个独立应用已通过 20 次切换与目标编辑框实际输入，以及最小化目标还原后的输入验证；探针注入需真实扫描码，不能把零扫描码注入的结果当作物理键盘证据。
+- 激活前通过有界 `WM_NULL` 同步源输入窗口；UWP 源使用 CoreWindow。现场 UWP 队列连接返回 `ERROR_ACCESS_DENIED`，但 `SetForegroundWindow` 仍能成功，不能把连接失败当成切换否决。连接成功的队列才在 `finally` 中断开。
+- 已删除 `ClaimSessionForeground`、`TryClaimFromForegroundQueue`、`SessionOwnsForeground`、`ForceForegroundViaHandoff`、`AllowSetForegroundWindow`、延迟取消归还及旧诊断结构。取消/放弃会话只隐藏、释放会话资源，不重新激活源窗口。旧 beta 版本关于必须领取宿主前台、保留失败授权调用的要求不适用于此架构。
+- 必须同步 `_panel.Show()` / `_chrome.Show()` 的托管可见性。仅用原生 `SetWindowPos` 显示会让 WinForms `Hide()` 可能失效。
+- 保留应用级分组、Z-order MRU、分页、当前虚拟桌面过滤、UWP 代表窗口、DWM 缩略图、Foxmail 无标题窗口资格、异步最小化还原。这不同于 Window Hopper 的同应用窗口选择。
 
-## 当前输入链
+## 输入及异常约束
 
-- `WH_KEYBOARD_LL` 回调通过静态委托字段保持存活；主线程消息窗接收 `WM_APP_START/NEXT/PREV/COMMIT/CANCEL/COMMITAT`。
-- `Tab` 按下只在消息投递成功后被消费，投递失败直接放行；只有整次按住过程都被消费的 `Tab` 松开才被消费，若任一重复按下已放行，松开也放行。物理 `Alt` 松开始终放行。
-- 会话启动失败时，通过带 `ReplayInputTag` 的 `SendInput` 回放这次原生切换；只绕过自己的回放，不忽略所有注入事件。回放部分插入时，只清理确实插入且仍按下的键。
-- 首次反向切换及对应分页已处理；提交期间的新输入直接放行。
-- beta2 起先捕获原前台，在枚举前领取可激活、无任务栏的宿主（尺寸见 beta4：不可为零）。提交只要求宿主仍占前台，再异步还原、单次请求目标、有界同步及实际前台检查。不使用 F24、跨线程 `SetFocus`、`BringWindowToTop` 或 `SwitchToThisWindow`。
-- 不要重新引入 `AllowSetForegroundWindow` 自进程预检：该 API 只接受 `ASFW_ANY` 或其他进程 id，传本进程返回 ERROR_ACCESS_DENIED，现场 124 次提交中 26 次因此被否决且从未调用 `SetForegroundWindow`（即“有时 Alt+Tab 切不过去”）。真正的资格条件就是“宿主仍是前台”，由 `SessionOwnsForeground()` 判定。
-- beta4 **根因**：领取前台时宿主被设为 0×0 零尺寸窗口。它确实成为 `GetForegroundWindow()`，但 Windows 拒绝让它转交前台——会话内每次 `SetForegroundWindow` 都被拒，而**拒绝正是任务栏闪烁的来源**。日志证据：`focus=0x0`、`accepted=False`、宿主却是前台。现改为按源窗口尺寸显示（`SWP_NOZORDER`）。**不要再把宿主设回零尺寸**，那会同时带回闪烁和切换失败。
-- 提交时激活被拒不等于否决：宿主仍在前台则走输入队列移交兜底，移交后不再重试。最小化目标先有界等待还原完成（上限 250ms）再激活，`SW_RESTORE` 是异步的。`BringWindowToTop` 禁止使用。
-- beta5：`Cancel` **不得**在 Alt 仍按住时把前台交还源窗口——手势中途放弃前台所有权会被 Windows 记为一次前台变更，任务栏闪烁正由此而来。改为记入 `_cancelRestore`，由看门狗在 Alt 松开（≤30ms）后完成；若那时前台已被系统交还则不干预。实测 3 次「按住 Alt + ESC」闪烁 0 次。
-- beta5 对照实验结论：宿主的**位置**不影响激活成功率。保留上次位置（`SWP_NOMOVE`）与停靠源窗口两种配置，对同一批目标的拒绝率相同（各约 16/20 成功）。不要再把位置当作激活失败的原因。
-- **仍未解决**：以提权控制台为切换目标时约 25% 提交被 Windows 拒绝，失败集中在特定目标窗口（`ConsoleWindowClass`）。已排除宿主位置因素；此项需独立分析，不要用重试或位置调整敷衍。
-- beta6：消息处理链路与 `EnumWindows` 回调均加异常兜底（此前无 try/catch，异常会穿出消息循环带走进程）；`WM_APP_COMMITAT` 的索引按不可信输入做范围检查；`AbortSession` 复用 `Cancel` 的前台归还路径；启动记录键盘钩子安装结果。回归测试由 14 项增至 18 项，均经变异测试验证。
-- beta6 **刻意回退**：不要"修复" `CopyIconSafe` / `GetAppIcon` 里 `Icon.FromHandle` 的句柄所有权。它不接管句柄、Dispose 不销毁，确实会按可执行文件数量泄漏；但修复需每取一次图标多做一次 `Clone()`，而图标加载在 Alt+Tab 启动路径上，实测失败率从 0/25 升到 10/25。句柄数量有界、进程退出即回收，不值得为此牺牲切换可靠性。原因已写在代码注释里。
-- beta7 **回归教训**：不要删除 `ForceForegroundViaHandoff` 里的 `AllowSetForegroundWindow`。它每次都返回 ERROR_ACCESS_DENIED、按文档语义不授权任何东西，但**它消耗的时延**让宿主的前台授权在移交前得以保持。实测：删除后失败 8/20、7/20，恢复后 1/20、2/20、0/20。beta6 曾把它当死代码删掉，直接把失败率从 3% 推到 28%。**判断一个"看起来没用"的 Win32 调用能否删除，必须实测时序影响，不能只看返回值**——功能等价不等于行为等价。
-- 同理，`ForceForegroundViaHandoff` 里移交前的有界 `WM_NULL` 屏障也不能删：移除后失败稳定 6/20。
-- beta8：窗口资格**不能看标题**。Foxmail 主窗口类 `TFoxMainFrm.UnicodeClass` 从不 `SetWindowText`，"无标题即不可切换"的规则让它整个应用从切换条里消失。改为看**是否有真实尺寸**；提示框/托盘图标/输入条本就只有几个像素，且多数已被 toolwindow 规则排除。注意桌面窗口真实类名是 `#32769`（不是 `Progman`），无标题、无 TOOLWINDOW、全屏尺寸，必须按类名显式排除——它过去只是靠"恰好无标题"被挡掉。
-- **闪烁与失败同源**：实测每次 `SetForegroundWindow` 被拒都伴随一次任务栏闪烁，拒绝正是失败原因。想消除闪烁只能消除失败，代价是切换可靠性。当前失败率约 2%、遗留闪烁 0。这是个取舍，不是缺陷——需要用户明确偏好后再动。
-- 环境提示：本机实测的切换失败率在 0–10/25 之间大幅波动，取决于测试时刻的前台窗口构成。单次对比无法判断回归，必须交替测量 old/new 两版；面板升起耗时（p50≈60ms）比失败率更适合作为对照指标。
-- 2026-10-07 输入桌面 A/B（同一脚本、同一前台目标，各 25 次 Alt+Tab）：修复前成功 11/失败 19/闪烁 44；修复后 **25/25 成功、0 失败、闪烁 0**，`SetForegroundWindow` 被拒由 34 次降为 0。残余风险：测试目标为提权控制台与 Notepad，未覆盖真实硬件输入、游戏/UWP。
+- `WH_KEYBOARD_LL` 静态委托保持存活，主线程消息窗接收 `WM_APP_START/NEXT/PREV/COMMIT/CANCEL/COMMITAT`。非激活浮层不需要额外 UI 线程才能接收 `PostMessage`。
+- 仅成功投递时吞 Tab；匹配释放及自动重复放行规则保持原样。物理 Alt 松开始终放行；启动失败以带专用标记的 `SendInput` 回退原生切换。
+- `Commit` / `Cancel` / `AbortSession` 保留重入保护；消息链和枚举回调捕获异常；鼠标提交索引检查范围。
+- 跨线程 Win32 调用可能阻塞。200ms/300ms 同步预算不是整个激活链的硬超时，不能保证挂起应用或 Windows 前台限制下成功。
 
-## 已知历史证据与未决问题
+## 验证与历史证据
 
-- 历史日志不能替代当前构建的运行证据，旧日志中存在当前源码没有的 `ff: enter` 等标记。
-- 测试代码已并入 `AppHopper.cs`，`AppHopper.exe --self-test` 与 `self-test.bat` 运行同一套 14 项回归（布局/分页/裁剪、单显示器居中、日志脱敏与 UTF-8 上限、日志流失败行为、自启动路径/ACL、原生回放不污染物理按键、钩子放行/吞键/自动重复/replay 标记、无前台所有权时拒绝激活）。`tests/` 目录已删除，不再维护独立测试 exe。自检在单实例互斥量之前运行，不安装钩子、不改变前台、不写自启动注册表。
-- 现场旧诊断版本首次 `SetForegroundWindow` 被拒绝后，即使后续激活成功仍收到目标 `HSHELL_FLASH`；直接使用 `SwitchToThisWindow` 的探针也在第 4 次被拒绝并闪烁。因此不能用最终成功证明无闪烁。
-- “宿主 HWND 已是前台”仍不足够：先后台请求自身、再连接队列会出现 HWND/焦点都在宿主但目标仍被拒绝。改为首次激活自身之前连接当前前台队列，再激活自身、断开。
-- 2026-10-07 三轮输入桌面 A/B（同一脚本、同一前台目标，各 25–30 次 Alt+Tab）：beta3 前成功 11/30；beta3 修复预检后 21/30；beta4 加入移交兜底后 **25/25 全成、0 失败**。残余失败集中在同一个 `ConsoleWindowClass` 窗口（测试用的提权控制台，34 次拒绝中 33 次来自它），排除后真实应用窗口 10 次会话 0 失败。
-- 输入桌面截图证实标题、卡片边框、蓝色选中框和缩略图正常。关键是让 `_panel.Show()` / `_chrome.Show()` 同步托管可见性，并让卡片层归属宿主；只通过原生 `SetWindowPos` 显示会留下 WinForms 可见性状态不一致。
-- 20 次测试不覆盖真实硬件输入、游戏/UWP、最小化或挂起应用的输入桌面场景。50ms 响应检查不能消除“检查后前台线程挂起”的连接竞态，不能把所有 Win32 调用称为硬超时。截图和原始现场证据不进入提交；现场运行文件当时标识为 beta1，beta2 仅更新版本标签，行为修正相同。
+- `self-test.bat` 编译临时输出，当前 21 项回归。显示回归短暂显示非激活窗口并检查显示/隐藏不改变前台；自检不安装钩子、不写自启动注册表。
+- 1.2 改造已在输入桌面验证双层浮层、保持源前台、Alt 按住时 Esc 取消、外部点击、反向选择、Tab/滚轮选择和卡片点击。截图确认缩略图、标题及选中框。
+- 不允许把成功提交等同于无闪烁，也不允许把 `WS_EX_NOACTIVATE` 描述为禁止显式 `SetForegroundWindow`。此前“零闪烁只能以失败换取”等推断不成立。
+- 最终构建交替 A/B（每版两轮）：beta8 39 会话、0 失败、23 次会话内闪烁；1.2 40 会话、0 失败、0 次会话内闪烁。原始输出在本机临时目录 `ab/check12-final.out`；统计排除会话外测试脚本抬升窗口造成的闪烁。
+- 最终构建受控输入验证 20 次全部命中目标并让编辑框收到文本；最小化目标还原后也收到输入。浮层交互验证含长按反向、Tab/滚轮、卡片点击、Alt 按住时 Esc、外部取消及 10 次快速切换，`errors=0`。原始输出为 `ab/input12.out` / `ab/surface12.out`。这不覆盖所有真实硬件输入、游戏、UWP 场景、挂起目标和混合 DPI 多显示器行为，不能承诺所有环境零失败或零闪烁。
 
-## 构建与验证约束
+## 构建与诊断
 
-- 当前环境可以运行 Windows 自带的 `csc.exe`；`self-test.bat` 使用临时输出，不结束用户实例。不要沿用旧的“沙箱禁止编译”结论。
-- 逐窗口 `skip` 诊断仅在 `--log-verbose` 输出：它在每次 Alt+Tab 的关键路径上逐行 `Flush()`，本机约 900 个顶层窗口会在几分钟内耗尽 8 MiB 上限；普通 `--log` 每次会话约 12 行。
-- 任何运行结论都必须绑定实际版本、实际日志或可重复的现场输出；静态推断必须明确标注为推断。
-
-## 下一步
-
-继续验证时绑定当前构建与现场日志，不要宣称所有应用的任务栏闪烁都已消除。未经授权不得切换用户桌面；不得修改系统 ACL。`Program Files` 实际权限不受保护时，自启动拒绝是预期行为，不能放宽检查或修改权限伪造通过。
+- 当前环境可以使用 Windows `csc.exe`，不要沿用旧沙箱禁止编译的结论。
+- 普通 `--log` 默认脱敏、UTF-8 完整记录最多 8 MiB；逐窗口枚举只在 `--log-verbose` 输出。不得用没有日志记录推断钩子没收到按键。
+- 自启动要求 Program Files 内受保护路径及 ACL；不放宽检查或修改系统 ACL 伪造通过。HKCU Run 不绕过 UAC。
+- 历史快照在 Git；日期记忆是历史证据，不是现行设计约束。
 
 ## 提交约定
 
-- 用户明确要求：以后本项目修复并验证完成后，主动更新 beta 版本和发布说明并本地提交，不必等待提醒；未经推送授权不执行 push。
-- 「推送 / 推吧」包含提交、push、打版本 tag、发布 GitHub Release、上传已验证的构建产物；不分步确认。beta 版本标记为预发布，附件名为 `AppHopper.exe`。
+- 按项目既有约定，修复验证完成后更新版本与发布说明并本地提交；未经推送授权不执行 push。
+- “推送 / 推吧”按原约定包含提交、push、版本 tag、GitHub Release 和已验证 exe 附件。用户已认可 1.2 简短文案并授权发布；issue #1 由用户自行回复，不代发评论、不关闭 issue。
+- Release 文档长期格式和简洁要求见根目录 `AGENTS.md`：仅 `bug fix`、`features` 两节及项目符号；相关条目注明 issue 编号并 @提出人。
