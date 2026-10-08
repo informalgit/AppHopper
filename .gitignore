@@ -13,3 +13,7 @@ Thumbs.db
 
 # local dev tools (never push)
 tools/
+
+# local agent rules and handoff
+/AGENTS.md
+/HANDOFF_PROMPT.md
