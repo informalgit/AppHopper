@@ -11,7 +11,7 @@ if exist AppHopper.exe (
   exit /b 1
 )
 
-"C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe" -nologo -target:winexe -platform:anycpu -optimize+ -win32manifest:app.manifest -r:System.dll -r:System.Core.dll -r:System.Drawing.dll -r:System.Windows.Forms.dll -out:AppHopper.exe AppHopper.cs
+"C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe" -nologo -target:winexe -platform:anycpu -optimize+ -win32manifest:app.manifest -r:System.dll -r:System.Core.dll -r:System.Drawing.dll -r:System.Windows.Forms.dll -r:System.Web.Extensions.dll -out:AppHopper.exe AppHopper.cs
 
 if %errorlevel%==0 (
   echo.

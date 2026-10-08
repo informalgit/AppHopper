@@ -13,6 +13,14 @@
 
 再也不用在五个资源管理器窗口之间"路过"才能到达浏览器：`Alt+Tab` 直接跳到下一个*应用*，``Alt+` `` 在当前应用内部循环
 
+## 1.3（尚未发布）
+
+### bug fix
+- 无独立修复。
+
+### features
+- 托盘新增 `Get updates...`：确认后从 GitHub 下载正式版，校验后原位替换并重新启动；替换或启动失败时尝试恢复旧版。
+
 ## 1.2
 
 - 前台模型改为 Window Hopper 形式：面板与卡片层均使用 `WS_EX_NOACTIVATE`，显示、刷新和取消不领取前台；键盘/鼠标输入由低级钩子投递到消息窗。
@@ -110,14 +118,14 @@
 2. 手动执行等价命令:
     ```bat
     C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe -nologo -target:winexe -platform:anycpu -optimize+ -win32manifest:app.manifest ^
-      -r:System.dll -r:System.Core.dll -r:System.Drawing.dll -r:System.Windows.Forms.dll ^
+      -r:System.dll -r:System.Core.dll -r:System.Drawing.dll -r:System.Windows.Forms.dll -r:System.Web.Extensions.dll ^
       -out:AppHopper.exe AppHopper.cs
     ```
 适用于 Windows 10 和 11。
 
 ## 使用
 
-运行 `AppHopper.exe`——托盘出现图标(右键:*Enabled*、*Start with Windows*、*Exit*)。然后:
+运行 `AppHopper.exe`——托盘出现图标（右键：*Enabled*、*Start with Windows*、*Get updates...*、*Exit*）。然后：
 
 | 输入 | 动作 |
 |---|---|
@@ -128,9 +136,17 @@
 | 点击某张卡片 | 立即切换到该应用 |
 | 鼠标滚轮 | 循环选择 |
 
+### 获取更新
+
+右键托盘 → `Get updates...`。仅在点击时检查 GitHub 最新正式版；发现更高版本后询问是否下载、替换并重启。检查、确认和下载期间不允许重复发起更新。下载过程中切换器仍可使用，不运行常驻更新服务，也不需要单独服务器。
+
+下载必须匹配 GitHub 附件的大小、SHA-256 和 exe 版本；缺少校验信息、网络错误或下载不完整时不退出旧程序。更新助手临时存放在仅管理员/SYSTEM 可修改的 `ProgramData` 目录；安装在其他盘符时，先在安装目录内创建并锁住同卷受保护暂存目录。确认准备成功后，让旧进程退出、原子替换原路径并启动新版；新版未在 15 秒内完成启动则尝试恢复并启动旧版。恢复也失败时弹窗保留备份位置，供手动恢复。
+
+原路径和自启动注册项不变，保留 Enabled 状态及日志模式。不支持网络路径或经过重解析点的安装目录；文件被占用或无法安全替换时报告失败。运行中的临时助手无法立即删除，安排下次 Windows 重启时清理。1.2 没有此菜单，需要先手动安装带更新功能的版本，之后才能原位更新。
+
 应用列表每次打开切换器时实时计算，没有任何需要配置的选项。诊断：以 `--log` 参数启动；日志最多 8 MiB，默认隐藏窗口标题和可执行文件名，仍保留 HWND、窗口类和时序。需要完整枚举细节时使用 `--log-verbose`，分享详细日志前请检查敏感内容。日志中的 `hotkey: alt+tab -> start`、`start aborted:` 和 `alt+tab fallback:` 用于区分消息到达、启动失败和主动回退；没有记录本身不能证明钩子未到达，日志也可能已满或不可写。
 
-运行 `AppHopper.exe --self-test` 或 `self-test.bat` 执行 21 项回归：布局、日志、自启动保护、输入回放与钩子路由、异常兜底、窗口资格，以及浮层显示/隐藏保持前台。自检先于单实例互斥量，可与运行实例并存；显示测试会短暂显示非激活窗口，不安装钩子、不写自启动注册表。退出码 0 表示通过。
+运行 `AppHopper.exe --self-test` 或 `self-test.bat` 执行 23 项回归：更新版本比较与发布附件验证、布局、日志、自启动保护、输入回放与钩子路由、异常兜底、窗口资格，以及浮层显示/隐藏保持前台。自检先于单实例互斥量，可与运行实例并存；显示测试会短暂显示非激活窗口，不安装钩子、不写自启动注册表。退出码 0 表示通过。
 
 `Start with Windows` 仅允许安装在 `Program Files` 或 `Program Files (x86)` 下的受保护路径；名称符合但 ACL 可被普通身份修改、存在重解析点的路径同样会被拒绝。HKCU Run 注册不绕过 UAC，Windows 可能阻止管理员程序在登录时启动，不能保证无人值守自启。
 

@@ -13,6 +13,14 @@ Two shortcuts, two distinct jobs — exactly like macOS:
 
 No more "walking through" five Explorer windows to reach the browser: `Alt+Tab` jumps straight to the next *app*, ``Alt+` `` cycles inside the current one.
 
+## 1.3 (not yet released)
+
+### bug fix
+- None.
+
+### features
+- Add `Get updates...` to the tray: download a stable GitHub release after confirmation, verify it, replace the executable in place and restart; attempt rollback on replacement or startup failure.
+
 ## 1.2
 
 - Adopt Window Hopper's foreground model: both overlay layers use `WS_EX_NOACTIVATE`. Showing, refreshing and cancelling do not claim foreground; low-level hooks post input to the message window.
@@ -107,14 +115,14 @@ This beta does not guarantee elimination of taskbar flashing. Regression tests c
 2. Or run the compiler manually:
     ```bat
     C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe -nologo -target:winexe -platform:anycpu -optimize+ -win32manifest:app.manifest ^
-      -r:System.dll -r:System.Core.dll -r:System.Drawing.dll -r:System.Windows.Forms.dll ^
+      -r:System.dll -r:System.Core.dll -r:System.Drawing.dll -r:System.Windows.Forms.dll -r:System.Web.Extensions.dll ^
       -out:AppHopper.exe AppHopper.cs
     ```
 Works on Windows 10 and 11.
 
 ## Usage
 
-Run `AppHopper.exe` — a tray icon appears (right-click: *Enabled*, *Start with Windows*, *Exit*). Then:
+Run `AppHopper.exe` — a tray icon appears (right-click: *Enabled*, *Start with Windows*, *Get updates...*, *Exit*). Then:
 
 | Input | Action |
 |---|---|
@@ -125,9 +133,17 @@ Run `AppHopper.exe` — a tray icon appears (right-click: *Enabled*, *Start with
 | click a card | switch to that app immediately |
 | mouse wheel | cycle |
 
+### Get updates
+
+Right-click the tray icon and choose `Get updates...`. Checking happens only on demand against GitHub's latest stable release. A newer version requires confirmation before download, replacement and restart. Repeated update requests are blocked during checking, confirmation and download. The switcher remains usable during download; no resident update service or separate server is required.
+
+Downloads must match the GitHub asset's size, SHA-256 digest and executable version. Missing integrity metadata, network errors and incomplete downloads do not exit the running app. A temporary helper runs in an administrator/SYSTEM-only `ProgramData` directory. For another installation drive, it first creates and locks a protected staging directory beside the executable so replacement stays on one volume. Once preparation succeeds, the old process exits and the helper atomically replaces the original path and starts the new version. If startup is not confirmed within 15 seconds, it attempts to restore and restart the old version. A failed recovery reports the backup path for manual recovery.
+
+The executable path and autostart registration remain unchanged; Enabled state and logging mode are preserved. Network paths and installation paths through reparse points are unsupported. Locked files or unsafe replacement report failure. The running temporary helper is scheduled for deletion at the next Windows reboot. Version 1.2 has no update menu: install an update-capable version manually once before using in-place updates.
+
 The app list is computed each time the switcher opens; there is nothing to configure. Launch with `--log` for an 8 MiB log that redacts window titles and executable names while retaining HWNDs, window classes and timing. Use `--log-verbose` for full enumeration details; inspect sensitive content before sharing it. `hotkey: alt+tab -> start`, `start aborted:`, and `alt+tab fallback:` identify message dispatch, startup failure and intentional fallback. Missing records alone do not prove a hook miss: the log may also be full or unwritable.
 
-`AppHopper.exe --self-test` or `self-test.bat` runs 21 regressions covering layout, logging, autostart protection, replay and hook routing, exception containment, eligibility and foreground preservation across overlay display/hiding. Tests run before the single-instance mutex and may coexist with the running switcher. Display checks briefly show non-activating windows; tests install no hooks and write no autostart registration. Exit code 0 means success.
+`AppHopper.exe --self-test` or `self-test.bat` runs 23 regressions covering update version comparison and release asset validation, layout, logging, autostart protection, replay and hook routing, exception containment, eligibility and foreground preservation across overlay display/hiding. Tests run before the single-instance mutex and may coexist with the running switcher. Display checks briefly show non-activating windows; tests install no hooks and write no autostart registration. Exit code 0 means success.
 
 `Start with Windows` requires a protected installation under `Program Files` or `Program Files (x86)`, without reparse points or file/ancestor ACLs permitting untrusted modification. HKCU Run registration does not bypass UAC; Windows may block elevated startup, so unattended launch is not guaranteed.
 

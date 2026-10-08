@@ -13,15 +13,18 @@
 // or virtual-desktop assignment are modified.
 
 using System;
+using System.ComponentModel;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.Drawing.Imaging;
 using System.IO;
+using System.Net;
 using System.Runtime.InteropServices;
 using System.Security.AccessControl;
 using System.Security.Principal;
+using System.Security.Cryptography;
 using System.Text;
 using System.Threading;
 using System.Windows.Forms;
@@ -30,9 +33,9 @@ using System.Windows.Forms;
 // "Properties -> Details") without any build.bat change. Bump once per
 // release - the tray tooltip and the startup log line read it back at
 // runtime via AppVersion, so this is the single place a version lives.
-[assembly: System.Reflection.AssemblyVersion("1.2.0.0")]
-[assembly: System.Reflection.AssemblyFileVersion("1.2.0.0")]
-[assembly: System.Reflection.AssemblyInformationalVersion("1.2")]
+[assembly: System.Reflection.AssemblyVersion("1.3.0.0")]
+[assembly: System.Reflection.AssemblyFileVersion("1.3.0.0")]
+[assembly: System.Reflection.AssemblyInformationalVersion("1.3")]
 
 namespace AppHopper
 {
@@ -239,6 +242,11 @@ namespace AppHopper
         public static extern bool IsChild(IntPtr parent, IntPtr child);
         [DllImport("kernel32.dll")]
         public static extern uint GetCurrentThreadId();
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        public static extern bool MoveFileEx(string existing, string replacement, uint flags);
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        public static extern Microsoft.Win32.SafeHandles.SafeFileHandle CreateFile(string path, uint access, uint sharing,
+            IntPtr security, uint creation, uint flags, IntPtr template);
         [DllImport("user32.dll")]
         public static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
         [DllImport("user32.dll")]
@@ -2443,6 +2451,435 @@ namespace AppHopper
             catch { return false; }
         }
 
+        // ================= on-demand GitHub updates =================
+        // A protected copy of this version replaces the exe after our exit.
+        // Downloaded code is never executed before checking GitHub's digest.
+        static class Updates
+        {
+            const string Api = "https://api.github.com/repos/informalgit/AppHopper/releases/latest";
+            const string DownloadRoot = "https://github.com/informalgit/AppHopper/releases/download/";
+            const long MaxAssetSize = 64 * 1024 * 1024;
+            static bool _busy; // UI-thread-owned: one check/confirmation/download at a time
+
+            internal sealed class Release
+            {
+                internal string Tag, Digest, Url;
+                internal Version Version;
+                internal long Size;
+            }
+
+            internal static Version ParseVersion(string value)
+            {
+                Version version;
+                if (value != null && value.StartsWith("v", StringComparison.Ordinal)) value = value.Substring(1);
+                if (!Version.TryParse(value, out version)) throw new InvalidDataException("Invalid release version.");
+                return new Version(version.Major, version.Minor, Math.Max(0, version.Build), Math.Max(0, version.Revision));
+            }
+
+            internal static Release ParseRelease(string json)
+            {
+                var serializer = new System.Web.Script.Serialization.JavaScriptSerializer { MaxJsonLength = 1024 * 1024 };
+                var data = serializer.DeserializeObject(json) as Dictionary<string, object>;
+                if (data == null || (bool)data["draft"] || (bool)data["prerelease"])
+                    throw new InvalidDataException("The release is not a public stable release.");
+                string tag = (string)data["tag_name"];
+                Version version = ParseVersion(tag);
+                string expectedUrl = DownloadRoot + Uri.EscapeDataString(tag) + "/AppHopper.exe";
+                Release found = null;
+                foreach (object item in (object[])data["assets"])
+                {
+                    var asset = item as Dictionary<string, object>;
+                    if (asset == null || !string.Equals(asset["name"] as string, "AppHopper.exe", StringComparison.Ordinal)) continue;
+                    if (found != null) throw new InvalidDataException("Duplicate AppHopper.exe assets.");
+                    string digest = asset.ContainsKey("digest") ? asset["digest"] as string : null;
+                    if (digest == null || !digest.StartsWith("sha256:", StringComparison.Ordinal) || !ValidHash(digest.Substring(7)))
+                        throw new InvalidDataException("The release asset has no valid SHA-256 digest.");
+                    string url = asset["browser_download_url"] as string;
+                    long size = Convert.ToInt64(asset["size"]);
+                    if (url != expectedUrl || size <= 0 || size > MaxAssetSize)
+                        throw new InvalidDataException("Invalid release download URL or size.");
+                    found = new Release { Tag = tag, Version = version, Digest = digest.Substring(7), Url = url, Size = size };
+                }
+                if (found == null) throw new InvalidDataException("This release has no AppHopper.exe asset.");
+                return found;
+            }
+
+            static bool ValidHash(string value)
+            {
+                if (value == null || value.Length != 64) return false;
+                foreach (char c in value)
+                    if (!(c >= '0' && c <= '9') && !(c >= 'a' && c <= 'f') && !(c >= 'A' && c <= 'F')) return false;
+                return true;
+            }
+
+            static HttpWebRequest Request(string url)
+            {
+                ServicePointManager.SecurityProtocol = (SecurityProtocolType)3072; // TLS 1.2 on .NET Framework 4
+                var request = (HttpWebRequest)WebRequest.Create(url);
+                request.UserAgent = "AppHopper/" + AppVersion;
+                request.Timeout = 30000;
+                request.ReadWriteTimeout = 30000;
+                return request;
+            }
+
+            internal static Release Latest()
+            {
+                var request = Request(Api);
+                request.Accept = "application/vnd.github+json";
+                using (var response = (HttpWebResponse)request.GetResponse())
+                using (var reader = new StreamReader(response.GetResponseStream(), Encoding.UTF8))
+                    return ParseRelease(reader.ReadToEnd());
+            }
+
+            internal static string HashFile(string path)
+            {
+                using (var stream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read))
+                using (var hash = SHA256.Create())
+                    return BitConverter.ToString(hash.ComputeHash(stream)).Replace("-", "").ToLowerInvariant();
+            }
+
+            internal static void Download(Release release, string path)
+            {
+                using (var response = (HttpWebResponse)Request(release.Url).GetResponse())
+                using (var input = response.GetResponseStream())
+                using (var output = new FileStream(path, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+                using (var hash = SHA256.Create())
+                {
+                    byte[] buffer = new byte[32768];
+                    long total = 0;
+                    int count;
+                    while ((count = input.Read(buffer, 0, buffer.Length)) != 0)
+                    {
+                        total += count;
+                        if (total > release.Size) throw new InvalidDataException("The download exceeds its published size.");
+                        output.Write(buffer, 0, count);
+                        hash.TransformBlock(buffer, 0, count, null, 0);
+                    }
+                    hash.TransformFinalBlock(buffer, 0, 0);
+                    string digest = BitConverter.ToString(hash.Hash).Replace("-", "").ToLowerInvariant();
+                    if (total != release.Size || !string.Equals(digest, release.Digest, StringComparison.OrdinalIgnoreCase))
+                        throw new InvalidDataException("Download verification failed. The existing application was not changed.");
+                }
+                if (ParseVersion(FileVersionInfo.GetVersionInfo(path).FileVersion) != release.Version)
+                    throw new InvalidDataException("The executable version does not match the release.");
+            }
+
+            static string StagePath(string id)
+            {
+                Guid guid;
+                if (!Guid.TryParseExact(id, "N", out guid)) throw new InvalidDataException("Invalid update transaction.");
+                return Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.CommonApplicationData), "AppHopper-update-" + id);
+            }
+
+            internal static string CreateStage(string id)
+            {
+                string path = StagePath(id);
+                if (Directory.Exists(path)) throw new IOException("The update directory already exists.");
+                var security = new DirectorySecurity();
+                security.SetOwner(new SecurityIdentifier("S-1-5-32-544"));
+                security.SetAccessRuleProtection(true, false);
+                foreach (string sid in new string[] { "S-1-5-18", "S-1-5-32-544" })
+                    security.AddAccessRule(new FileSystemAccessRule(new SecurityIdentifier(sid), FileSystemRights.FullControl,
+                        InheritanceFlags.ContainerInherit | InheritanceFlags.ObjectInherit, PropagationFlags.None, AccessControlType.Allow));
+                Directory.CreateDirectory(path, security);
+                ValidateStage(path);
+                return path;
+            }
+
+            static void ValidateStage(string path)
+            {
+                if ((File.GetAttributes(path) & FileAttributes.ReparsePoint) != 0 || !HasProtectedAcl(Directory.GetAccessControl(path)))
+                    throw new UnauthorizedAccessException("The update directory is not protected.");
+                string root = Path.GetDirectoryName(path);
+                if ((File.GetAttributes(root) & FileAttributes.ReparsePoint) != 0)
+                    throw new UnauthorizedAccessException("The update root is redirected.");
+                var security = Directory.GetAccessControl(root);
+                if (!TrustedOwner(security.GetOwner(typeof(SecurityIdentifier)).Value))
+                    throw new UnauthorizedAccessException("The update root has an untrusted owner.");
+                const FileSystemRights mutation = FileSystemRights.Delete | FileSystemRights.DeleteSubdirectoriesAndFiles
+                    | FileSystemRights.ChangePermissions | FileSystemRights.TakeOwnership | (FileSystemRights)0x10000000;
+                foreach (FileSystemAccessRule rule in security.GetAccessRules(true, true, typeof(SecurityIdentifier)))
+                    if (rule.AccessControlType == AccessControlType.Allow && (rule.FileSystemRights & mutation) != 0
+                        && (rule.PropagationFlags & PropagationFlags.InheritOnly) == 0 && !TrustedOwner(rule.IdentityReference.Value))
+                        throw new UnauthorizedAccessException("The update root permits untrusted deletion.");
+            }
+
+            static EventWaitHandle MakeEvent(string name)
+            {
+                var security = new EventWaitHandleSecurity();
+                foreach (string sid in new string[] { "S-1-5-18", "S-1-5-32-544" })
+                    security.AddAccessRule(new EventWaitHandleAccessRule(new SecurityIdentifier(sid), EventWaitHandleRights.FullControl, AccessControlType.Allow));
+                security.SetAccessRuleProtection(true, false);
+                bool created;
+                var handle = new EventWaitHandle(false, EventResetMode.ManualReset, name, out created, security);
+                if (!created) { handle.Dispose(); throw new IOException("The update signal already exists."); }
+                return handle;
+            }
+
+            static string LaunchArguments(int flags)
+            {
+                return ((flags & 4) != 0 ? " --log-verbose" : (flags & 2) != 0 ? " --log" : "")
+                    + ((flags & 1) != 0 ? " --disabled" : "");
+            }
+
+            static Process Start(string path, string arguments)
+            {
+                return Process.Start(new ProcessStartInfo(path, arguments) { UseShellExecute = false, WorkingDirectory = Path.GetDirectoryName(path) });
+            }
+
+            static void Cleanup(string stage, bool helperRunning)
+            {
+                foreach (string name in new string[] { "AppHopper.exe", "status.txt", "helper.exe" })
+                {
+                    string path = Path.Combine(stage, name);
+                    if (helperRunning && name == "helper.exe")
+                    {
+                        NativeMethods.MoveFileEx(path, null, 4); // mapped helper: delete at the next reboot
+                        continue;
+                    }
+                    if (File.Exists(path)) File.Delete(path);
+                }
+                if (helperRunning) NativeMethods.MoveFileEx(stage, null, 4);
+                else Directory.Delete(stage);
+            }
+
+            static void Prepare(Release release, string target, int flags)
+            {
+                string id = Guid.NewGuid().ToString("N");
+                string stage = CreateStage(id);
+                Process helper = null;
+                bool handedOff = false;
+                try
+                {
+                    Download(release, Path.Combine(stage, "AppHopper.exe"));
+                    File.Copy(target, Path.Combine(stage, "helper.exe"));
+                    using (var signal = MakeEvent("Local\\AppHopperUpdatePrepare-" + id))
+                    using (var parent = Process.GetCurrentProcess())
+                    {
+                        helper = Start(Path.Combine(stage, "helper.exe"), "--apply-update " + parent.Id + " " + parent.StartTime.Ticks
+                            + " \"" + target + "\" " + release.Digest + " " + release.Version + " " + id + " " + flags);
+                        if (!signal.WaitOne(20000)) throw new IOException("The update helper did not respond.");
+                        string status = File.ReadAllText(Path.Combine(stage, "status.txt"));
+                        if (status != "ready") throw new IOException(status);
+                        handedOff = true;
+                    }
+                }
+                finally
+                {
+                    if (helper != null)
+                    {
+                        if (!handedOff && !helper.HasExited) { helper.Kill(); helper.WaitForExit(); }
+                        helper.Dispose();
+                    }
+                    if (!handedOff) Cleanup(stage, false);
+                }
+            }
+
+            static void Idle(MenuItem item)
+            {
+                _busy = false;
+                item.Enabled = true;
+                item.Text = "Get updates...";
+            }
+
+            internal static void Click(MenuItem item, MenuItem exit)
+            {
+                if (_busy) return;
+                _busy = true;
+                item.Enabled = false;
+                item.Text = "Checking for updates...";
+                var check = new BackgroundWorker();
+                check.DoWork += delegate(object sender, DoWorkEventArgs e) { e.Result = Latest(); };
+                check.RunWorkerCompleted += delegate(object sender, RunWorkerCompletedEventArgs e)
+                {
+                    check.Dispose();
+                    if (_exitRequested) return;
+                    if (e.Error != null) { MessageBox.Show("Unable to check for updates.\n\n" + e.Error.Message, "AppHopper", MessageBoxButtons.OK, MessageBoxIcon.Warning); Idle(item); return; }
+                    var release = (Release)e.Result;
+                    if (release.Version <= ParseVersion(AppVersion))
+                    {
+                        MessageBox.Show("You are already running the latest version (" + AppVersion + ").", "AppHopper", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                        Idle(item);
+                        return;
+                    }
+                    if (MessageBox.Show("AppHopper " + release.Tag + " is available.\nDownload, replace this executable and restart now?",
+                        "AppHopper", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) { Idle(item); return; }
+                    item.Enabled = false;
+                    item.Text = "Downloading update...";
+                    exit.Enabled = false;
+                    string target = Application.ExecutablePath;
+                    int flags = (_enabled ? 0 : 1) | (_log != null ? 2 : 0) | (_logVerbose ? 4 : 0);
+                    var download = new BackgroundWorker();
+                    download.DoWork += delegate { Prepare(release, target, flags); };
+                    download.RunWorkerCompleted += delegate(object s, RunWorkerCompletedEventArgs result)
+                    {
+                        download.Dispose();
+                        if (result.Error == null) { _exitRequested = true; return; }
+                        exit.Enabled = true;
+                        MessageBox.Show("The update was not installed. AppHopper is still running.\n\n" + result.Error.Message,
+                            "AppHopper", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                        Idle(item);
+                    };
+                    download.RunWorkerAsync();
+                };
+                check.RunWorkerAsync();
+            }
+
+            internal static void SignalStarted(string id)
+            {
+                Guid parsed;
+                if (!Guid.TryParseExact(id, "N", out parsed)) throw new InvalidDataException("Invalid startup signal.");
+                using (var signal = EventWaitHandle.OpenExisting("Local\\AppHopperUpdateStart-" + id, EventWaitHandleRights.Modify))
+                    signal.Set();
+            }
+
+            static List<Microsoft.Win32.SafeHandles.SafeFileHandle> LockTargetDirectories(string target)
+            {
+                var handles = new List<Microsoft.Win32.SafeHandles.SafeFileHandle>();
+                try
+                {
+                    string root = Path.GetPathRoot(target);
+                    if (root.StartsWith("\\\\", StringComparison.Ordinal)) throw new IOException("Updates require a local executable.");
+                    for (string dir = Path.GetDirectoryName(target); dir != null && dir != root; dir = Path.GetDirectoryName(dir))
+                    {
+                        // Deny rename/reparse mutation while the elevated helper
+                        // uses this path, including portable user-writable installs.
+                        var handle = NativeMethods.CreateFile(dir, 0x80, 1, IntPtr.Zero, 3, 0x02200000, IntPtr.Zero);
+                        if (handle.IsInvalid) { handle.Dispose(); throw new Win32Exception(Marshal.GetLastWin32Error()); }
+                        handles.Add(handle);
+                        if ((File.GetAttributes(dir) & FileAttributes.ReparsePoint) != 0)
+                            throw new IOException("The installation directory is redirected.");
+                    }
+                    return handles;
+                }
+                catch
+                {
+                    foreach (var handle in handles) handle.Dispose();
+                    throw;
+                }
+            }
+
+            internal static void Apply(string[] args)
+            {
+                string stage = null, target = null, backup = null;
+                string replacementStage = null;
+                Microsoft.Win32.SafeHandles.SafeFileHandle replacementDirectory = null;
+                Process parent = null, child = null;
+                List<Microsoft.Win32.SafeHandles.SafeFileHandle> directories = null;
+                bool replaced = false, prepared = false, validated = false;
+                int flags = 0;
+                try
+                {
+                    if (args.Length != 8) throw new InvalidDataException("Invalid updater arguments.");
+                    stage = StagePath(args[6]);
+                    ValidateStage(stage);
+                    if (!string.Equals(Application.ExecutablePath, Path.Combine(stage, "helper.exe"), StringComparison.OrdinalIgnoreCase))
+                        throw new InvalidDataException("The updater is not running from its protected directory.");
+                    validated = true;
+                    target = Path.GetFullPath(args[3]);
+                    directories = LockTargetDirectories(target);
+                    if ((File.GetAttributes(target) & FileAttributes.ReparsePoint) != 0) throw new IOException("The target is redirected.");
+                    parent = Process.GetProcessById(int.Parse(args[1]));
+                    if (parent.StartTime.Ticks != long.Parse(args[2])
+                        || !string.Equals(parent.MainModule.FileName, target, StringComparison.OrdinalIgnoreCase)
+                        || HashFile(target) != HashFile(Application.ExecutablePath))
+                        throw new InvalidDataException("The updater does not match its running parent.");
+                    string candidate = Path.Combine(stage, "AppHopper.exe");
+                    Version version = ParseVersion(args[5]);
+                    if (!ValidHash(args[4]) || !string.Equals(HashFile(candidate), args[4], StringComparison.OrdinalIgnoreCase)
+                        || ParseVersion(FileVersionInfo.GetVersionInfo(candidate).FileVersion) != version
+                        || version <= ParseVersion(AppVersion))
+                        throw new InvalidDataException("The candidate is not a verified newer version.");
+                    flags = int.Parse(args[7]);
+                    if (flags < 0 || flags > 7) throw new InvalidDataException("Invalid restart flags.");
+                    backup = target + "." + args[6] + ".bak";
+                    if (!string.Equals(Path.GetPathRoot(candidate), Path.GetPathRoot(target), StringComparison.OrdinalIgnoreCase))
+                    {
+                        // ReplaceFile requires both executables on the same volume.
+                        // Keep the helper in ProgramData; lock a protected local stage
+                        // before copying into a potentially user-writable install path.
+                        string path = Path.Combine(Path.GetDirectoryName(target), ".AppHopper-update-" + args[6]);
+                        if (Directory.Exists(path)) throw new IOException("The replacement directory already exists.");
+                        Directory.CreateDirectory(path, Directory.GetAccessControl(stage));
+                        replacementDirectory = NativeMethods.CreateFile(path, 0x80, 1, IntPtr.Zero, 3, 0x02200000, IntPtr.Zero);
+                        if (replacementDirectory.IsInvalid) throw new Win32Exception(Marshal.GetLastWin32Error());
+                        if ((File.GetAttributes(path) & FileAttributes.ReparsePoint) != 0
+                            || !HasProtectedAcl(Directory.GetAccessControl(path)))
+                            throw new UnauthorizedAccessException("The replacement directory is not protected.");
+                        replacementStage = path;
+                        string localCandidate = Path.Combine(path, "AppHopper.exe");
+                        File.Copy(candidate, localCandidate, false);
+                        candidate = localCandidate;
+                    }
+                    File.WriteAllText(Path.Combine(stage, "status.txt"), "ready");
+                    using (var signal = EventWaitHandle.OpenExisting("Local\\AppHopperUpdatePrepare-" + args[6], EventWaitHandleRights.Modify))
+                        signal.Set();
+                    prepared = true;
+                    if (!parent.WaitForExit(30000)) throw new IOException("The original application did not exit; no file was replaced.");
+                    using (var started = MakeEvent("Local\\AppHopperUpdateStart-" + args[6]))
+                    {
+                        File.Replace(candidate, target, backup);
+                        replaced = true;
+                        child = Start(target, "--update-started " + args[6] + LaunchArguments(flags));
+                        if (!started.WaitOne(15000) || child.HasExited)
+                            throw new IOException("The new version did not complete startup.");
+                        File.Delete(backup);
+                    }
+                }
+                catch (Exception error)
+                {
+                    Environment.ExitCode = 1;
+                    string message = error.Message;
+                    try
+                    {
+                        if (replaced)
+                        {
+                            if (child != null && !child.HasExited) { child.Kill(); child.WaitForExit(5000); }
+                            File.Replace(backup, target, null);
+                        }
+                        if (prepared && parent != null && parent.HasExited && target != null) Start(target, LaunchArguments(flags)).Dispose();
+                    }
+                    catch (Exception rollback)
+                    {
+                        message += "\nRecovery failed: " + rollback.Message + "\nBackup: " + backup;
+                    }
+                    if (prepared) MessageBox.Show("Update failed.\n\n" + message, "AppHopper update", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                    else if (validated)
+                    {
+                        File.WriteAllText(Path.Combine(stage, "status.txt"), message);
+                        using (var signal = EventWaitHandle.OpenExisting("Local\\AppHopperUpdatePrepare-" + args[6], EventWaitHandleRights.Modify))
+                            signal.Set();
+                    }
+                }
+                finally
+                {
+                    if (child != null) child.Dispose();
+                    if (parent != null) parent.Dispose();
+                    if (replacementStage != null)
+                    {
+                        // Remove the candidate while its directory cannot be renamed.
+                        try { File.Delete(Path.Combine(replacementStage, "AppHopper.exe")); }
+                        catch (IOException) { }
+                        catch (UnauthorizedAccessException) { }
+                    }
+                    if (replacementDirectory != null) replacementDirectory.Dispose();
+                    if (replacementStage != null)
+                    {
+                        try { Directory.Delete(replacementStage); }
+                        catch (IOException) { }
+                        catch (UnauthorizedAccessException) { }
+                    }
+                    if (directories != null) foreach (var handle in directories) handle.Dispose();
+                    if (prepared)
+                    {
+                        try { Cleanup(stage, true); }
+                        catch (IOException) { }
+                        catch (UnauthorizedAccessException) { }
+                    }
+                }
+            }
+        }
+
         // ================= self-test =================
         // Run by `AppHopper.exe --self-test`. Everything lives in this binary:
         // there are no separate test executables to compile, ship or keep in
@@ -2534,6 +2971,34 @@ namespace AppHopper
         static bool RunSelfTests()
         {
             _testFailures = 0;
+            Test("update versions compare numerically and reject prerelease tags", delegate
+            {
+                Check(Updates.ParseVersion("v1.10") > Updates.ParseVersion("1.9.9"), "version comparison was lexical");
+                Check(Updates.ParseVersion("v1.3") == Updates.ParseVersion("1.3.0.0"), "equivalent versions differed");
+                bool rejected = false;
+                try { Updates.ParseVersion("v1.3-rc1"); }
+                catch (InvalidDataException) { rejected = true; }
+                Check(rejected, "prerelease version accepted");
+            });
+            Test("update metadata rejects untrusted assets and missing integrity", delegate
+            {
+                string url = "https://github.com/informalgit/AppHopper/releases/download/v2.0/AppHopper.exe";
+                string json = "{\"draft\":false,\"prerelease\":false,\"tag_name\":\"v2.0\",\"assets\":["
+                    + "{\"name\":\"AppHopper.exe\",\"size\":71680,\"digest\":\"sha256:" + new string('a', 64)
+                    + "\",\"browser_download_url\":\"" + url + "\"}]}";
+                foreach (string bad in new string[] {
+                    json.Replace(url, "https://example.com/AppHopper.exe"),
+                    json.Replace("\"draft\":false", "\"draft\":true"),
+                    json.Replace("\"prerelease\":false", "\"prerelease\":true"),
+                    json.Replace("sha256:" + new string('a', 64), "sha256:bad"),
+                    json.Replace("\"size\":71680", "\"size\":0") })
+                {
+                    bool rejected = false;
+                    try { Updates.ParseRelease(bad); }
+                    catch (InvalidDataException) { rejected = true; }
+                    Check(rejected, "unsafe release was accepted");
+                }
+            });
             Test("layout, cropping, paging and ordering", delegate
             {
                 NativeMethods.RECT work = new NativeMethods.RECT { Left = 0, Top = 0, Right = 1920, Bottom = 1080 };
@@ -2941,11 +3406,20 @@ namespace AppHopper
         static void Main(string[] args)
         {
             bool selfTest = false, logRequested = false;
-            foreach (string a in args)
+            if (args.Length > 0 && args[0] == "--apply-update")
             {
+                Updates.Apply(args);
+                return;
+            }
+            string updateSignal = null;
+            for (int i = 0; i < args.Length; i++)
+            {
+                string a = args[i];
                 if (a == "--self-test") selfTest = true;
                 if (a == "--log" || a == "--log-verbose") logRequested = true;
                 if (a == "--log-verbose") _logVerbose = true;
+                if (a == "--disabled") _enabled = false;
+                if (a == "--update-started" && i + 1 < args.Length) updateSignal = args[++i];
             }
 
             NativeMethods.SetProcessDPIAware();
@@ -3015,7 +3489,7 @@ namespace AppHopper
 
             var menu = new ContextMenu();
             var miToggle = new MenuItem("Enabled");
-            miToggle.Checked = true;
+            miToggle.Checked = _enabled;
             miToggle.Click += delegate { _enabled = !_enabled; miToggle.Checked = _enabled; };
             var miStartup = new MenuItem("Start with Windows");
             miStartup.Checked = StartupEnabled();
@@ -3029,8 +3503,12 @@ namespace AppHopper
             };
             var miExit = new MenuItem("Exit");
             miExit.Click += delegate { _exitRequested = true; };
+            var miUpdate = new MenuItem("Get updates...");
+            miUpdate.Click += delegate { Updates.Click(miUpdate, miExit); };
             menu.MenuItems.Add(miToggle);
             menu.MenuItems.Add(miStartup);
+            menu.MenuItems.Add(new MenuItem("-"));
+            menu.MenuItems.Add(miUpdate);
             menu.MenuItems.Add(new MenuItem("-"));
             menu.MenuItems.Add(miExit);
 
@@ -3082,6 +3560,7 @@ namespace AppHopper
                 Application.Exit();
             };
             exitTimer.Start();
+            if (updateSignal != null) Updates.SignalStarted(updateSignal);
 
             Application.Run();
 
