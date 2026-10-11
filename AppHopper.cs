@@ -33,9 +33,9 @@ using System.Windows.Forms;
 // "Properties -> Details") without any build.bat change. Bump once per
 // release - the tray tooltip and the startup log line read it back at
 // runtime via AppVersion, so this is the single place a version lives.
-[assembly: System.Reflection.AssemblyVersion("1.3.0.0")]
-[assembly: System.Reflection.AssemblyFileVersion("1.3.0.0")]
-[assembly: System.Reflection.AssemblyInformationalVersion("1.3")]
+[assembly: System.Reflection.AssemblyVersion("1.3.1.0")]
+[assembly: System.Reflection.AssemblyFileVersion("1.3.1.0")]
+[assembly: System.Reflection.AssemblyInformationalVersion("1.3.1")]
 
 namespace AppHopper
 {
@@ -539,10 +539,9 @@ namespace AppHopper
         // refresh matches entries on this, so a surviving entry keeps its
         // slot even when its representative window changed.
         public string Key;
-        // WS_EX_APPWINDOW: the window asked the shell for its own taskbar /
-        // switcher entry, so it is kept apart instead of being merged into the
-        // entry of its exe. It represents itself and nothing else, so it can
-        // only be pinned as "current" by handle, never by exe.
+        // Owned WS_EX_APPWINDOW dialogs may keep a separate entry. Unowned
+        // main windows always belong to their exe's application entry.
+        // Independent dialogs can only be pinned by handle, never by exe.
         public bool OwnEntry;
     }
 
@@ -1438,14 +1437,11 @@ namespace AppHopper
                 // here to obtain the value itself.
                 string exe = WindowExe(hwnd);
                 int ex = NativeMethods.GetWindowLong(hwnd, NativeMethods.GWL_EXSTYLE);
-                // WS_EX_APPWINDOW is how a window asks the shell for a taskbar
-                // / switcher entry of its own (Explorer folder Properties, Save
-                // As and Preferences dialogs, extra document windows, ...).
-                // Windows' own Alt+Tab lists those separately, and so do we:
-                // keying them per window keeps them reachable instead of being
-                // swallowed by the single entry of their exe - an Explorer
-                // Properties dialog could otherwise never be switched to.
-                bool ownEntry = (ex & NativeMethods.WS_EX_APPWINDOW) != 0;
+                // WS_EX_APPWINDOW alone does not mean a separate application:
+                // Electron main windows commonly set it. Only owned windows
+                // explicitly asking for a shell entry stay independent.
+                bool ownEntry = (ex & NativeMethods.WS_EX_APPWINDOW) != 0
+                    && NativeMethods.GetWindow(hwnd, NativeMethods.GW_OWNER) != IntPtr.Zero;
                 string key = ownEntry ? exe + "|" + hwnd.ToInt64().ToString("X") : exe;
                 AppEntry e;
                 if (!byExe.TryGetValue(key, out e))
@@ -2968,6 +2964,20 @@ namespace AppHopper
             catch { return false; }
         }
 
+        sealed class GroupingTestForm : Form
+        {
+            protected override bool ShowWithoutActivation { get { return true; } }
+            protected override CreateParams CreateParams
+            {
+                get
+                {
+                    var parameters = base.CreateParams;
+                    parameters.ExStyle |= NativeMethods.WS_EX_APPWINDOW;
+                    return parameters;
+                }
+            }
+        }
+
         static bool RunSelfTests()
         {
             _testFailures = 0;
@@ -2997,6 +3007,50 @@ namespace AppHopper
                     try { Updates.ParseRelease(bad); }
                     catch (InvalidDataException) { rejected = true; }
                     Check(rejected, "unsafe release was accepted");
+                }
+            });
+            Test("main windows share one application entry while owned dialogs remain reachable", delegate
+            {
+                using (var first = new GroupingTestForm())
+                using (var second = new GroupingTestForm())
+                using (var dialog = new GroupingTestForm())
+                {
+                    first.SetBounds(40, 40, 200, 100);
+                    second.SetBounds(60, 60, 200, 100);
+                    dialog.SetBounds(80, 80, 200, 100);
+                    first.Show();
+                    second.Show();
+                    Application.DoEvents();
+                    string exe = WindowExe(first.Handle);
+                    var entries = EnumerateEntries();
+                    AppEntry group = null;
+                    int count = 0;
+                    foreach (var entry in entries)
+                        if (entry.Exe == exe) { group = entry; count++; }
+                    Check(count == 1 && !group.OwnEntry, "same-app main windows were split");
+                    Check(group.ReprHwnd == second.Handle, "group did not retain the leading main window");
+                    dialog.Owner = first;
+                    dialog.Show();
+                    Application.DoEvents();
+                    entries = EnumerateEntries();
+                    count = 0;
+                    foreach (var entry in entries)
+                        if (entry.Exe == exe) count++;
+                    Check(count == 1, "visible owner's popup duplicated its application");
+                    first.Hide();
+                    dialog.Show();
+                    Application.DoEvents();
+                    entries = EnumerateEntries();
+                    bool foundDialog = false;
+                    count = 0;
+                    foreach (var entry in entries)
+                        if (entry.Exe == exe)
+                        {
+                            if (entry.OwnEntry)
+                                foundDialog |= entry.ReprHwnd == dialog.Handle;
+                            else count++;
+                        }
+                    Check(count == 1 && foundDialog, "owned dialog displaced or duplicated its application");
                 }
             });
             Test("layout, cropping, paging and ordering", delegate
