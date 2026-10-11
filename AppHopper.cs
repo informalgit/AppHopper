@@ -33,9 +33,9 @@ using System.Windows.Forms;
 // "Properties -> Details") without any build.bat change. Bump once per
 // release - the tray tooltip and the startup log line read it back at
 // runtime via AppVersion, so this is the single place a version lives.
-[assembly: System.Reflection.AssemblyVersion("1.3.1.0")]
-[assembly: System.Reflection.AssemblyFileVersion("1.3.1.0")]
-[assembly: System.Reflection.AssemblyInformationalVersion("1.3.1")]
+[assembly: System.Reflection.AssemblyVersion("1.3.2.0")]
+[assembly: System.Reflection.AssemblyFileVersion("1.3.2.0")]
+[assembly: System.Reflection.AssemblyInformationalVersion("1.3.2")]
 
 namespace AppHopper
 {
@@ -2359,11 +2359,6 @@ namespace AppHopper
         }
 
         // ================= infra =================
-        static bool IsUnderDirectory(string path, string root)
-        {
-            if (string.IsNullOrEmpty(path) || string.IsNullOrEmpty(root)) return false;
-            return Path.GetFullPath(path).StartsWith(Path.GetFullPath(root).TrimEnd('\\') + "\\", StringComparison.OrdinalIgnoreCase);
-        }
 
         static bool HasProtectedAcl(FileSystemSecurity security)
         {
@@ -2390,61 +2385,167 @@ namespace AppHopper
                 || sid == "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464";
         }
 
-        static bool IsProtectedStartupPath(string path)
+        // A per-user interactive logon task can launch our elevated manifest
+        // without a UAC prompt at every logon. It follows the installed exe,
+        // so an in-place update needs no task rewrite or second executable.
+        sealed class StartupTask : IDisposable
         {
-            try
+            readonly string _name, _exe, _sid;
+            object _service, _folder;
+
+            internal StartupTask(string name, string exe, string sid)
             {
-                string root = Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles);
-                if (!IsUnderDirectory(path, root))
+                _name = name; _exe = Path.GetFullPath(exe); _sid = sid;
+                try
                 {
-                    root = Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86);
-                    if (!IsUnderDirectory(path, root)) return false;
+                    _service = Activator.CreateInstance(Type.GetTypeFromProgID("Schedule.Service", true));
+                    ((dynamic)_service).Connect();
+                    _folder = ((dynamic)_service).GetFolder("\\");
                 }
-                path = Path.GetFullPath(path);
-                root = Path.GetFullPath(root).TrimEnd('\\');
-                if ((File.GetAttributes(path) & FileAttributes.ReparsePoint) != 0
-                    || !HasProtectedAcl(File.GetAccessControl(path))) return false;
-                string dir = Path.GetDirectoryName(path);
-                while (dir != null)
+                catch { Dispose(); throw; }
+            }
+
+            internal static StartupTask Open()
+            {
+                using (var identity = WindowsIdentity.GetCurrent())
                 {
-                    if ((File.GetAttributes(dir) & FileAttributes.ReparsePoint) != 0
-                        || !HasProtectedAcl(Directory.GetAccessControl(dir))) return false;
-                    if (string.Equals(dir, root, StringComparison.OrdinalIgnoreCase)) return true;
-                    dir = Path.GetDirectoryName(dir);
+                    string sid = identity.User.Value;
+                    return new StartupTask("AppHopper-" + sid, Application.ExecutablePath, sid);
                 }
             }
-            catch (IOException) { }
-            catch (UnauthorizedAccessException) { }
-            catch (ArgumentException) { }
-            catch (System.Security.SecurityException) { }
-            return false;
+
+            object Find()
+            {
+                try { return ((dynamic)_folder).GetTask(_name); }
+                catch (FileNotFoundException) { return null; }
+                catch (DirectoryNotFoundException) { return null; }
+            }
+
+            internal bool Enabled()
+            {
+                object task = Find();
+                if (task == null) return false;
+                try
+                {
+                    return ((dynamic)task).Enabled
+                        && Matches((string)((dynamic)task).Xml, _exe, _sid);
+                }
+                finally { Marshal.ReleaseComObject(task); }
+            }
+
+            internal void Set(bool add)
+            {
+                if (add)
+                {
+                    // Only SYSTEM/administrators may modify the task. The
+                    // chosen executable path is explicitly authorized here;
+                    // portable users must keep that executable trustworthy.
+                    object task = ((dynamic)_folder).RegisterTask(_name, Xml(_exe, _sid),
+                        6 /*CREATE_OR_UPDATE*/, _sid, null, 3 /*INTERACTIVE_TOKEN*/,
+                        "D:P(A;;FA;;;SY)(A;;FA;;;BA)");
+                    Marshal.ReleaseComObject(task);
+                }
+                else
+                {
+                    object task = Find();
+                    if (task != null)
+                    {
+                        Marshal.ReleaseComObject(task);
+                        ((dynamic)_folder).DeleteTask(_name, 0);
+                    }
+                }
+            }
+
+            internal static string Xml(string exe, string sid)
+            {
+                string command = System.Security.SecurityElement.Escape(Path.GetFullPath(exe));
+                string directory = System.Security.SecurityElement.Escape(Path.GetDirectoryName(Path.GetFullPath(exe)));
+                string user = System.Security.SecurityElement.Escape(sid);
+                return "<Task version=\"1.2\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">"
+                    + "<RegistrationInfo><Description>Start AppHopper when this user signs in.</Description></RegistrationInfo>"
+                    + "<Triggers><LogonTrigger><Enabled>true</Enabled><UserId>" + user + "</UserId></LogonTrigger></Triggers>"
+                    + "<Principals><Principal id=\"User\"><UserId>" + user + "</UserId>"
+                    + "<LogonType>InteractiveToken</LogonType><RunLevel>HighestAvailable</RunLevel></Principal></Principals>"
+                    + "<Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>"
+                    + "<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>"
+                    + "<StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>"
+                    + "<StartWhenAvailable>true</StartWhenAvailable><AllowStartOnDemand>true</AllowStartOnDemand>"
+                    + "<Enabled>true</Enabled><ExecutionTimeLimit>PT0S</ExecutionTimeLimit></Settings>"
+                    + "<Actions Context=\"User\"><Exec><Command>" + command + "</Command>"
+                    + "<WorkingDirectory>" + directory + "</WorkingDirectory></Exec></Actions></Task>";
+            }
+
+            internal static bool Matches(string xml, string exe, string sid)
+            {
+                var document = new System.Xml.XmlDocument();
+                document.XmlResolver = null;
+                document.LoadXml(xml);
+                var namespaces = new System.Xml.XmlNamespaceManager(document.NameTable);
+                namespaces.AddNamespace("t", "http://schemas.microsoft.com/windows/2004/02/mit/task");
+                var actions = document.SelectNodes("/t:Task/t:Actions/*", namespaces);
+                var principals = document.SelectNodes("/t:Task/t:Principals/t:Principal", namespaces);
+                var triggers = document.SelectNodes("/t:Task/t:Triggers/*", namespaces);
+                if (actions.Count != 1 || principals.Count != 1 || triggers.Count != 1) return false;
+                return Text(document, namespaces, "/t:Task/t:Actions/t:Exec/t:Command")
+                        .Equals(Path.GetFullPath(exe), StringComparison.OrdinalIgnoreCase)
+                    && SameUser(Text(document, namespaces, "/t:Task/t:Principals/t:Principal/t:UserId"), sid)
+                    && Text(document, namespaces, "/t:Task/t:Principals/t:Principal/t:LogonType") == "InteractiveToken"
+                    && Text(document, namespaces, "/t:Task/t:Principals/t:Principal/t:RunLevel") == "HighestAvailable"
+                    && SameUser(Text(document, namespaces, "/t:Task/t:Triggers/t:LogonTrigger/t:UserId"), sid)
+                    && Text(document, namespaces, "/t:Task/t:Triggers/t:LogonTrigger/t:Enabled") != "false"
+                    && Text(document, namespaces, "/t:Task/t:Settings/t:Enabled") != "false";
+            }
+
+            static bool SameUser(string account, string sid)
+            {
+                if (account == sid) return true;
+                if (string.IsNullOrEmpty(account) || account.StartsWith("S-1-", StringComparison.Ordinal)) return false;
+                // Task Scheduler may serialize a trigger's SID as DOMAIN\user.
+                try { return ((SecurityIdentifier)new NTAccount(account).Translate(typeof(SecurityIdentifier))).Value == sid; }
+                catch (IdentityNotMappedException) { return false; }
+                catch (ArgumentException) { return false; }
+            }
+
+            static string Text(System.Xml.XmlDocument document, System.Xml.XmlNamespaceManager namespaces, string xpath)
+            {
+                var node = document.SelectSingleNode(xpath, namespaces);
+                return node == null ? "" : node.InnerText;
+            }
+
+            public void Dispose()
+            {
+                if (_folder != null) { Marshal.ReleaseComObject(_folder); _folder = null; }
+                if (_service != null) { Marshal.ReleaseComObject(_service); _service = null; }
+            }
         }
 
-        static bool SetStartup(bool add)
+        static void SetStartup(bool add)
         {
-            if (add && !IsProtectedStartupPath(Application.ExecutablePath)) return false;
-            try
-            {
-                using (var key = Microsoft.Win32.Registry.CurrentUser.CreateSubKey(@"Software\Microsoft\Windows\CurrentVersion\Run"))
-                {
-                    if (add) key.SetValue("AppHopper", "\"" + Application.ExecutablePath + "\"");
-                    else key.DeleteValue("AppHopper", false);
-                }
-                return true;
-            }
-            catch (UnauthorizedAccessException) { return false; }
-            catch (IOException) { return false; }
-            catch (System.Security.SecurityException) { return false; }
+            using (var task = StartupTask.Open()) task.Set(add);
+            // Remove our obsolete Run entry only after the task operation
+            // succeeds; never modify other applications' startup entries.
+            using (var key = Microsoft.Win32.Registry.CurrentUser.OpenSubKey(
+                @"Software\Microsoft\Windows\CurrentVersion\Run", true))
+                if (key != null) key.DeleteValue("AppHopper", false);
         }
 
         static bool StartupEnabled()
         {
-            try
+            try { using (var task = StartupTask.Open()) return task.Enabled(); }
+            catch (COMException ex) { Log("autostart query failed: " + ex.Message); }
+            catch (UnauthorizedAccessException ex) { Log("autostart query failed: " + ex.Message); }
+            return false;
+        }
+
+        static void MigrateStartup()
+        {
+            using (var key = Microsoft.Win32.Registry.CurrentUser.OpenSubKey(
+                @"Software\Microsoft\Windows\CurrentVersion\Run"))
             {
-                using (var key = Microsoft.Win32.Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Run"))
-                    return key != null && key.GetValue("AppHopper") != null;
+                if (key == null || !string.Equals(key.GetValue("AppHopper") as string,
+                    "\"" + Application.ExecutablePath + "\"", StringComparison.OrdinalIgnoreCase)) return;
             }
-            catch { return false; }
+            SetStartup(true);
         }
 
         // ================= on-demand GitHub updates =================
@@ -3182,16 +3283,8 @@ namespace AppHopper
                 }
             });
 
-            Test("autostart rejects sibling prefixes, traversal and reparse escapes", delegate
-            {
-                string root = Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles);
-                Check(IsUnderDirectory(Path.Combine(root, "AppHopper", "app.exe"), root), "valid descendant rejected");
-                Check(!IsUnderDirectory(root + " Evil\\app.exe", root), "prefix bypass");
-                Check(!IsUnderDirectory(Path.Combine(root, "..", "Users", "app.exe"), root), "traversal bypass");
-                Check(!IsProtectedStartupPath(Application.ExecutablePath), "unprotected build accepted for autostart");
-            });
 
-            Test("autostart ACL permits only trusted mutation", delegate
+            Test("update staging ACL permits only trusted mutation", delegate
             {
                 Check(HasProtectedAcl(TestAcl("S-1-5-32-544", null)), "admin ACL rejected");
                 Check(!HasProtectedAcl(TestAcl("S-1-5-32-544", "S-1-5-32-545")), "Users write accepted");
@@ -3205,16 +3298,29 @@ namespace AppHopper
                 }
             });
 
-            Test("a rejected autostart leaves the Run key untouched", delegate
+            Test("autostart state rejects another executable, user or non-elevated task", delegate
             {
-                object before;
-                using (var key = Microsoft.Win32.Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Run"))
-                    before = key == null ? null : key.GetValue("AppHopper");
-                Check(!SetStartup(true), "unprotected build registered itself");
-                object after;
-                using (var key = Microsoft.Win32.Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Run"))
-                    after = key == null ? null : key.GetValue("AppHopper");
-                Check(object.Equals(before, after), "rejected autostart changed the registry");
+                string path = Path.Combine(Path.GetTempPath(), "App & Hopper", "AppHopper.exe");
+                const string sid = "S-1-5-21-1-2-3-1001";
+                string xml = StartupTask.Xml(path, sid);
+                Check(StartupTask.Matches(xml, path, sid), "portable task was not recognized");
+                Check(!StartupTask.Matches(xml, path + ".other", sid), "other executable was recognized");
+                Check(!StartupTask.Matches(xml, path, sid + "0"), "other user was recognized");
+                Check(!StartupTask.Matches(xml.Replace("HighestAvailable", "LeastPrivilege"), path, sid),
+                    "non-elevated task was recognized");
+                Check(!StartupTask.Matches(xml.Replace("<Enabled>true</Enabled>", "<Enabled>false</Enabled>"), path, sid),
+                    "disabled task was recognized");
+                Check(!StartupTask.Matches(xml.Replace("LogonTrigger", "BootTrigger"), path, sid),
+                    "non-logon trigger was recognized");
+                using (var identity = WindowsIdentity.GetCurrent())
+                {
+                    string currentSid = identity.User.Value;
+                    string normalized = StartupTask.Xml(path, currentSid).Replace(
+                        "<UserId>" + currentSid + "</UserId>",
+                        "<UserId>" + System.Security.SecurityElement.Escape(identity.Name) + "</UserId>");
+                    Check(StartupTask.Matches(normalized, path, currentSid),
+                        "scheduler's account-name normalization lost the enabled state");
+                }
             });
 
             Test("native replay preserves the physical modifiers", delegate
@@ -3545,16 +3651,26 @@ namespace AppHopper
             var miToggle = new MenuItem("Enabled");
             miToggle.Checked = _enabled;
             miToggle.Click += delegate { _enabled = !_enabled; miToggle.Checked = _enabled; };
+            try { MigrateStartup(); }
+            catch (Exception ex)
+            {
+                MessageBox.Show("Unable to migrate the previous autostart setting.\n\n" + ex.Message,
+                    "AppHopper", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            }
             var miStartup = new MenuItem("Start with Windows");
             miStartup.Checked = StartupEnabled();
             miStartup.Click += delegate
             {
-                bool add = !StartupEnabled();
-                if (!SetStartup(add))
-                    MessageBox.Show("Autostart requires a protected installation under Program Files and permission to update the Run key.",
+                try { SetStartup(!StartupEnabled()); }
+                catch (Exception ex)
+                {
+                    MessageBox.Show("Unable to change the logon task. AppHopper must be running as administrator"
+                        + " and the Task Scheduler service must be available.\n\n" + ex.Message,
                         "AppHopper", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                }
                 miStartup.Checked = StartupEnabled();
             };
+            menu.Popup += delegate { miStartup.Checked = StartupEnabled(); };
             var miExit = new MenuItem("Exit");
             miExit.Click += delegate { _exitRequested = true; };
             var miUpdate = new MenuItem("Get updates...");
