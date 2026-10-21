@@ -33,9 +33,9 @@ using System.Windows.Forms;
 // "Properties -> Details") without any build.bat change. Bump once per
 // release - the tray tooltip and the startup log line read it back at
 // runtime via AppVersion, so this is the single place a version lives.
-[assembly: System.Reflection.AssemblyVersion("1.3.2.0")]
-[assembly: System.Reflection.AssemblyFileVersion("1.3.2.0")]
-[assembly: System.Reflection.AssemblyInformationalVersion("1.3.2")]
+[assembly: System.Reflection.AssemblyVersion("1.3.3.0")]
+[assembly: System.Reflection.AssemblyFileVersion("1.3.3.0")]
+[assembly: System.Reflection.AssemblyInformationalVersion("1.3.3")]
 
 namespace AppHopper
 {
@@ -747,6 +747,16 @@ namespace AppHopper
                 _log = null;  // A partial write cannot be safely counted; stop logging.
             }
         }
+
+        // The system timestamp of the physical keystroke that opened a session.
+        // KBDLLHOOKSTRUCT.time and GetTickCount share a clock (measured delta
+        // 1-18 ms on this machine; GetMessageTime is 0 inside a hook callback
+        // and is therefore unusable here), so the difference between the two
+        // gives the one span nothing inside StartSession can see: how long the
+        // keypress waited before our own code got to it. An idle process being
+        // paged back in, or a low-level hook stalled by a slow callback, shows
+        // up here and nowhere else.
+        static uint _hookEventTime;
 
         static bool Post(int m) { return PostAt(m, 0); }
         static bool PostAt(int m, int i)
@@ -1478,6 +1488,10 @@ namespace AppHopper
 
         static void StartSession(bool reverse)
         {
+            // Times this process's own work from gesture-accepted to the moment
+            // the overlay is up. Lets a user-reported "slow" be attributed to a
+            // stage instead of guessed at.
+            var paintWatch = Stopwatch.StartNew();
             IntPtr fgRaw = NativeMethods.GetForegroundWindow();
             if (fgRaw == IntPtr.Zero) { Log("start aborted: no foreground window"); return; }
             string fgExe = WindowExe(fgRaw);
@@ -1503,7 +1517,8 @@ namespace AppHopper
             var order = EnumerateEntries();
             if (order.Count < 2)
             {
-                Log("start aborted: only " + order.Count + " app(s) in cycle");
+                Log("start aborted: only " + order.Count + " app(s) in cycle ("
+                    + paintWatch.ElapsedMilliseconds + "ms)");
                 EndSession();
                 return;
             }
@@ -1562,8 +1577,18 @@ namespace AppHopper
             if (_refreshTimer != null) _refreshTimer.Start();
 
             _session = true;
+            // firstPaintMs is entirely our own synchronous work (enumerate,
+            // layout, show, icons, thumbnails, chrome submit). Icons are the
+            // only part of it that reaches into another process without a
+            // timeout of its own, so the cached/pending split is recorded too.
             Log("session start, apps=" + _apps.Count + " scale=" + _scale.ToString("0.##")
-                + " panel=" + _layout.panelW + "x" + _layout.panelH + " tile=" + _layout.tileW + "x" + _layout.tileH);
+                + " panel=" + _layout.panelW + "x" + _layout.panelH + " tile=" + _layout.tileW + "x" + _layout.tileH
+                + " firstPaintMs=" + paintWatch.ElapsedMilliseconds
+                // waitMs: keypress -> the moment this session began doing any
+                // work. firstPaintMs: our work until the overlay is drawn.
+                // A large waitMs with a small firstPaintMs is not our code.
+                + " waitMs=" + (int)(unchecked((uint)Environment.TickCount - _hookEventTime))
+                + " iconCache=" + _iconCache.Count);
         }
 
         static void ShowPanel()
@@ -1724,13 +1749,23 @@ namespace AppHopper
                 string targetExe = app.Exe;
                 // Like Window Hopper, hide the non-activating overlay first.
                 HideOverlay();
+                var activateWatch = Stopwatch.StartNew();
                 bool ok = ForceForeground(target);
+                int activateMs = (int)activateWatch.ElapsedMilliseconds;
                 if (!ok) ok = ForegroundIs(target);   // FF's verdict can lag the real foreground; trust the latter
                 if (!ok) ok = WaitForForegroundLanding(target);   // see below: fg==0 is a transition, not a failure
                 EndSession();
                 IntPtr now = NativeMethods.GetForegroundWindow();
+                // activateMs covers the whole activation attempt after the
+                // overlay is already hidden: restore wait, queue attaches, the
+                // SetFocus of the selected window, retries and the bounded
+                // landing check. Focus/caret problems live in here.
                 Log("commit -> 0x" + target.ToInt64().ToString("X") + " " + LogText(Path.GetFileName(targetExe))
-                    + " sfw=" + (ok ? "ok" : "FAILED")
+                    + " sfw=" + (ok ? "ok" : "FAILED") + " activateMs=" + activateMs
+                    + " forcedFocus=0x" + _lastActivationFocus.ToInt64().ToString("X")
+                    + " resolved=" + (_lastActivationFocusResolved ? "child" : "frame")
+                    + " focusPath=" + _lastFocusPath
+                    + " postFocus=" + _lastPostFocus
                     + " fgNow=0x" + now.ToInt64().ToString("X") + " [" + ClassNameOf(now) + "]");
             }
             finally { _committing = false; }
@@ -1926,8 +1961,32 @@ namespace AppHopper
 
         // Window Hopper activation: attach to the current foreground thread
         // before raising the target; detach before pumping messages or logging.
+        static IntPtr _lastActivationFocus;
+        static bool _lastActivationFocusResolved;
+        // Where the target's own focus ended up after a successful hand-over:
+        // "child" (a real control - typing, and therefore any IME composition,
+        // continues), "frame" (only the top-level window), "none", "other",
+        // "unreadable". Recorded as evidence rather than inferred.
+        static string _lastPostFocus = "?";
+        // Set when the queue-restore SetFocus was deliberately skipped because
+        // only the top-level frame was known; drives the legacy fallback.
+        static bool _skippedFrameFocus;
+        // Which branch the focus decision took: "gti-child" (the target's own
+        // focused child was readable and focus was restored to it),
+        // "skip-frame" (nothing better than the frame was known, so focus was
+        // left alone), "retry-frame" / "target-attach-retry" (a fallback ran).
+        // Logged verbatim so the chosen path is never guessed at.
+        static string _lastFocusPath = "?";
+
         static bool ForceForeground(IntPtr hwnd)
         {
+            // Cleared up front so an early return cannot report the previous
+            // switch's activation focus as if it belonged to this one.
+            _lastActivationFocus = IntPtr.Zero;
+            _lastActivationFocusResolved = false;
+            _lastPostFocus = "?";
+            _skippedFrameFocus = false;
+            _lastFocusPath = "?";
             if (!NativeMethods.IsWindow(hwnd)) return false;
             if (ForegroundIs(hwnd)) return true;
             var sw = Stopwatch.StartNew();
@@ -1967,8 +2026,22 @@ namespace AppHopper
             if (NativeMethods.GetGUIThreadInfo(targetThread, ref gui)
                 && gui.hwndFocus != IntPtr.Zero
                 && (gui.hwndFocus == hwnd || NativeMethods.IsChild(hwnd, gui.hwndFocus)))
+            {
                 focus = gui.hwndFocus;
-            bool targetJoined = false;
+            }
+            // Diagnostic: which handle was forced, and whether the target's
+            // own focused child was readable from this thread at all. Carried
+            // out to the commit log line rather than logged here.
+            _lastActivationFocus = focus;
+            _lastActivationFocusResolved = focus != hwnd;
+            // The shell - which does not reproduce the swallowed first letter -
+            // never joins the TARGET's input queue. AttachThreadInput makes
+            // Windows generate focus transitions on attach and again on detach,
+            // and a Chromium app can turn that into a dropped first keystroke.
+            // So the target attach is now a FALLBACK: switch exactly as the
+            // shell would first, and join the target queue only if that is
+            // refused. Attaching to the foreground queue is still needed, since
+            // our process is not the foreground app.
             bool joined = fgThread != 0 && fgThread != myThread;
             if (joined && !NativeMethods.AttachThreadInput(myThread, fgThread, true))
             {
@@ -1977,27 +2050,61 @@ namespace AppHopper
             }
             try
             {
-                // Window Hopper cycles within an app. Our target can own a
-                // different input queue, so join it as well before activation.
-                if (targetThread != 0 && targetThread != myThread && targetThread != fgThread)
-                {
-                    targetJoined = NativeMethods.AttachThreadInput(myThread, targetThread, true);
-                    if (!targetJoined)
-                    {
-                        Log("  activation target attach failed err=" + Marshal.GetLastWin32Error());
-                    }
-                }
                 // Restore focus in the joined queue before requesting foreground.
                 // The reverse order was refused after long-held gestures from
                 // a console source with no GUI focus; short MRU taps hid it.
-                NativeMethods.SetFocus(focus);
+                //
+                // focus here is normally just the top-level frame: a foreign
+                // thread cannot read the target's real focused child (every
+                // switch in the logs reports resolved=frame). Forcing the frame
+                // is not harmless in that case - it strips focus from the very
+                // control the user was typing in, which terminates any live TSF
+                // composition in the target. That matches the reported symptom
+                // (the first letter after switching back is swallowed and the
+                // IME candidate window lands in the corner). So only force a
+                // genuinely resolved child; when nothing better than the frame
+                // is known, leave focus alone and let the target restore its
+                // own focus and composition on activation.
+                if (focus != hwnd)
+                {
+                    NativeMethods.SetFocus(focus);
+                    _lastFocusPath = "gti-child";
+                }
+                else
+                {
+                    _skippedFrameFocus = true;
+                    _lastFocusPath = "skip-frame";
+                }
                 NativeMethods.BringWindowToTop(hwnd);
                 NativeMethods.SetForegroundWindow(hwnd);
             }
             finally
             {
-                if (targetJoined) NativeMethods.AttachThreadInput(myThread, targetThread, false);
                 if (joined) NativeMethods.AttachThreadInput(myThread, fgThread, false);
+            }
+
+            // Fallback that used to run on every switch. Reached only when the
+            // shell-like attempt was not enough, and logged so a fallback can
+            // never be mistaken for the primary path working.
+            if (!ForegroundIs(hwnd) && targetThread != 0 && targetThread != myThread)
+            {
+                bool targetJoined = NativeMethods.AttachThreadInput(myThread, targetThread, true);
+                if (!targetJoined)
+                {
+                    Log("  activation target attach failed err=" + Marshal.GetLastWin32Error());
+                }
+                _lastFocusPath = "target-attach-retry";
+                Log("  switch refused without joining the target queue; retrying joined");
+                try
+                {
+                    if (focus != hwnd) NativeMethods.SetFocus(focus);
+                    NativeMethods.BringWindowToTop(hwnd);
+                    NativeMethods.SetForegroundWindow(hwnd);
+                }
+                finally
+                {
+                    if (targetJoined) NativeMethods.AttachThreadInput(myThread, targetThread, false);
+                }
             }
 
             if (!ForegroundIs(hwnd) && sw.ElapsedMilliseconds < 200)
@@ -2007,9 +2114,31 @@ namespace AppHopper
             }
             Application.DoEvents();
 
+            // The skip above is an optimisation for the common case, not a
+            // policy: if the hand-over did not take, retry once with the legacy
+            // behaviour so the switch still happens. Logged so a fallback can
+            // never be mistaken for the new path working.
+            if (!ForegroundIs(hwnd) && _skippedFrameFocus)
+            {
+                _skippedFrameFocus = false;
+                _lastFocusPath = "retry-frame";
+                Log("  force-fg retry with SetFocus(frame); first attempt left fg elsewhere");
+                NativeMethods.SetFocus(focus);
+                NativeMethods.BringWindowToTop(hwnd);
+                NativeMethods.SetForegroundWindow(hwnd);
+                if (!ForegroundIs(hwnd) && sw.ElapsedMilliseconds < 400)
+                {
+                    uint remaining = (uint)Math.Max(1L, 400L - sw.ElapsedMilliseconds);
+                    WaitForForegroundNotification(hwnd, remaining);
+                }
+                Application.DoEvents();
+            }
+
             if (ForegroundIs(hwnd))
             {
-                Log("  force-fg 0x" + hwnd.ToInt64().ToString("X") + " ok after " + sw.ElapsedMilliseconds + "ms");
+                _lastPostFocus = DescribeTargetFocus(targetThread, hwnd);
+                Log("  force-fg 0x" + hwnd.ToInt64().ToString("X") + " ok after " + sw.ElapsedMilliseconds + "ms"
+                    + " postFocus=" + _lastPostFocus);
                 return true;
             }
             IntPtr stuck = NativeMethods.GetForegroundWindow();
@@ -2017,6 +2146,21 @@ namespace AppHopper
                 + stuck.ToInt64().ToString("X") + " [" + ClassNameOf(stuck) + "] \""
                 + LogText(GetWindowTitle(stuck)) + "\" after " + sw.ElapsedMilliseconds + "ms");
             return false;
+        }
+
+        // Post-activation evidence. Answers the one question that matters for
+        // the IME symptom: after the hand-over, is the target's own focused
+        // window a real control (typing continues), or the top-level frame
+        // (focus was left on the frame, which is what ends a composition)?
+        static string DescribeTargetFocus(uint targetThread, IntPtr hwnd)
+        {
+            var g = new NativeMethods.GUITHREADINFO();
+            g.cbSize = (uint)Marshal.SizeOf(typeof(NativeMethods.GUITHREADINFO));
+            if (!NativeMethods.GetGUIThreadInfo(targetThread, ref g)) return "unreadable";
+            if (g.hwndFocus == IntPtr.Zero) return "none";
+            if (g.hwndFocus == hwnd) return "frame";
+            if (NativeMethods.IsChild(hwnd, g.hwndFocus)) return "child";
+            return "other";
         }
 
         static bool WaitForForegroundNotification(IntPtr hwnd, uint timeoutMs)
@@ -2270,7 +2414,12 @@ namespace AppHopper
                         bool reverse = (NativeMethods.GetAsyncKeyState(NativeMethods.VK_SHIFT) & 0x8000) != 0;
                         bool posted = !_session ? PostAt(NativeMethods.WM_APP_START, reverse ? 1 : 0)
                             : Post(reverse ? NativeMethods.WM_APP_PREV : NativeMethods.WM_APP_NEXT);
-                        if (posted) { _tabHookDown = true; return (IntPtr)1; }
+                        if (posted)
+                        {
+                            _hookEventTime = s.time;
+                            _tabHookDown = true;
+                            return (IntPtr)1;
+                        }
                     }
                     if (_session && s.vkCode == NativeMethods.VK_ESCAPE)
                     {
