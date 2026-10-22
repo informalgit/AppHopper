@@ -673,6 +673,33 @@ namespace AppHopper
         static Mutex _mutex;
         static StreamWriter _log;
         static bool _enabled = true;
+        // The Enabled switch is a user preference, so it outlives the process.
+        // Before this it lived only in memory: unticking it because of a game
+        // conflict silently reverted on the next launch.
+        const string SettingsKey = @"Software\AppHopper";
+
+        static bool LoadEnabled()
+        {
+            try
+            {
+                using (var key = Microsoft.Win32.Registry.CurrentUser.OpenSubKey(SettingsKey))
+                {
+                    object value = key == null ? null : key.GetValue("Enabled");
+                    return !(value is int) || (int)value != 0;
+                }
+            }
+            catch { return true; }
+        }
+
+        static void SaveEnabled(bool enabled)
+        {
+            try
+            {
+                using (var key = Microsoft.Win32.Registry.CurrentUser.CreateSubKey(SettingsKey))
+                    if (key != null) key.SetValue("Enabled", enabled ? 1 : 0, Microsoft.Win32.RegistryValueKind.DWord);
+            }
+            catch { }
+        }
         static bool _exitRequested;
         static bool _tabHookDown;
         static bool _tabPassedDown;
@@ -3734,6 +3761,42 @@ namespace AppHopper
                 Check(!ForceForeground(new IntPtr(0xFFFF0000)), "an invalid HWND was treated as claimable");
             });
 
+            Test("the enabled preference survives a restart", delegate
+            {
+                // The tray toggle used to live only in memory, so unticking it
+                // reverted on the next launch. Round-trip it and restore
+                // whatever the machine had before, so the suite never changes
+                // the user's real setting.
+                object previous = null;
+                bool hadPrevious = false;
+                using (var key = Microsoft.Win32.Registry.CurrentUser.OpenSubKey(SettingsKey))
+                {
+                    if (key != null)
+                    {
+                        previous = key.GetValue("Enabled");
+                        hadPrevious = previous != null;
+                    }
+                }
+                try
+                {
+                    SaveEnabled(false);
+                    Check(!LoadEnabled(), "a disabled preference was not persisted");
+                    SaveEnabled(true);
+                    Check(LoadEnabled(), "an enabled preference was not persisted");
+                }
+                finally
+                {
+                    using (var key = Microsoft.Win32.Registry.CurrentUser.OpenSubKey(SettingsKey, true))
+                    {
+                        if (key != null)
+                        {
+                            if (hadPrevious) key.SetValue("Enabled", previous, Microsoft.Win32.RegistryValueKind.DWord);
+                            else key.DeleteValue("Enabled", false);
+                        }
+                    }
+                }
+            });
+
             Test("eligibility memoization preserves the owner-chain verdict", delegate
             {
                 // The cache only skips recomputation; a window and its root
@@ -3762,15 +3825,20 @@ namespace AppHopper
                 return;
             }
             string updateSignal = null;
+            bool disabledFlag = false;
             for (int i = 0; i < args.Length; i++)
             {
                 string a = args[i];
                 if (a == "--self-test") selfTest = true;
                 if (a == "--log" || a == "--log-verbose") logRequested = true;
                 if (a == "--log-verbose") _logVerbose = true;
-                if (a == "--disabled") _enabled = false;
+                // The persisted preference is the default; the flag only
+                // overrides it for this launch (the update helper uses it to
+                // carry the state across the restart).
+                if (a == "--disabled") disabledFlag = true;
                 if (a == "--update-started" && i + 1 < args.Length) updateSignal = args[++i];
             }
+            _enabled = disabledFlag ? false : LoadEnabled();
 
             NativeMethods.SetProcessDPIAware();
             Application.EnableVisualStyles();
@@ -3840,7 +3908,12 @@ namespace AppHopper
             var menu = new ContextMenu();
             var miToggle = new MenuItem("Enabled");
             miToggle.Checked = _enabled;
-            miToggle.Click += delegate { _enabled = !_enabled; miToggle.Checked = _enabled; };
+            miToggle.Click += delegate
+            {
+                _enabled = !_enabled;
+                miToggle.Checked = _enabled;
+                SaveEnabled(_enabled);
+            };
             try { MigrateStartup(); }
             catch (Exception ex)
             {
@@ -3851,7 +3924,11 @@ namespace AppHopper
             miStartup.Checked = StartupEnabled();
             miStartup.Click += delegate
             {
-                try { SetStartup(!StartupEnabled()); }
+                // Act on what the menu SHOWS, then re-read the truth. Querying
+                // the task again here made the click a no-op whenever the task
+                // had been changed externally and the check mark was stale.
+                bool install = !miStartup.Checked;
+                try { SetStartup(install); }
                 catch (Exception ex)
                 {
                     MessageBox.Show("Unable to change the logon task. AppHopper must be running as administrator"
@@ -3860,7 +3937,10 @@ namespace AppHopper
                 }
                 miStartup.Checked = StartupEnabled();
             };
-            menu.Popup += delegate { miStartup.Checked = StartupEnabled(); };
+            // No Popup handler: reading the scheduled task is a cross-process
+            // COM call, and running it there stalled the menu from opening
+            // whenever the Task Scheduler service was slow. The click re-reads
+            // the state after every change, which is the only place it moves.
             var miExit = new MenuItem("Exit");
             miExit.Click += delegate { _exitRequested = true; };
             var miUpdate = new MenuItem("Get updates...");
