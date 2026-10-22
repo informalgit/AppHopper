@@ -1768,7 +1768,18 @@ namespace AppHopper
                     + " postFocus=" + _lastPostFocus
                     + " fgNow=0x" + now.ToInt64().ToString("X") + " [" + ClassNameOf(now) + "]");
             }
-            finally { _committing = false; }
+            finally
+            {
+                _committing = false;
+                // Replay a Tab the hook swallowed while this commit was in
+                // flight. Posted, not called, so the pump runs it only after
+                // this frame is fully unwound.
+                if (_pendingStart)
+                {
+                    _pendingStart = false;
+                    PostAt(NativeMethods.WM_APP_START, _pendingReverse ? 1 : 0);
+                }
+            }
         }
 
         // fg == 0 after a failed activation is NOT "nobody holds the focus" -
@@ -2389,6 +2400,13 @@ namespace AppHopper
                 || (NativeMethods.GetAsyncKeyState(NativeMethods.VK_RWIN) & 0x8000) != 0;
         }
 
+        // A Tab swallowed during a commit (see KbHookProc). Commit replays it
+        // as a fresh session once the hand-over finishes, so a fast double-tap
+        // advances two apps instead of losing the second gesture - and, just
+        // as important, instead of leaking it to the native Alt+Tab.
+        static bool _pendingStart;
+        static bool _pendingReverse;
+
         static IntPtr KbHookProc(int nCode, IntPtr wParam, IntPtr lParam)
         {
             if (nCode >= 0)
@@ -2405,6 +2423,25 @@ namespace AppHopper
                     _tabHookDown = false;
                     _tabPassedDown = false;
                     if (consume) return (IntPtr)1;
+                }
+                // A commit keeps the foreground hand-over in flight for up to
+                // a few hundred milliseconds (a busy target thread can stall
+                // SetForegroundWindow). A Tab pressed in that window used to
+                // fall through to the native switcher, so the user saw our
+                // overlay disappear and Windows' own Alt+Tab flash up behind
+                // it. Swallow the gesture here instead: the down is latched
+                // exactly like a normal session Tab, and the release block
+                // above consumes its matching up.
+                if (_enabled && _committing && s.vkCode == NativeMethods.VK_TAB && !up)
+                {
+                    // Remember the gesture rather than dropping it: Commit
+                    // replays it as a fresh session once the hand-over ends,
+                    // so a fast double-tap still advances two apps.
+                    _pendingStart = true;
+                    _pendingReverse = (NativeMethods.GetAsyncKeyState(NativeMethods.VK_SHIFT) & 0x8000) != 0;
+                    _tabHookDown = true;
+                    _tabPassedDown = false;
+                    return (IntPtr)1;
                 }
                 if (_enabled && !_committing)
                 {
@@ -3536,16 +3573,20 @@ namespace AppHopper
                     foreach (uint vk in new uint[] { NativeMethods.VK_MENU, NativeMethods.VK_LMENU, NativeMethods.VK_RMENU })
                         Check(!Swallowed(Hook(vk, NativeMethods.LLKHF_UP, IntPtr.Zero)), "an Alt release " + vk + " was swallowed");
 
-                    // Nothing is consumed mid-commit, or a second switch fires.
+                    // A Tab during a commit is swallowed and queued for replay,
+                    // never leaked to the native switcher.
                     _committing = true;
-                    Check(!Swallowed(Hook(NativeMethods.VK_TAB, 0x20, IntPtr.Zero)), "Alt+Tab was consumed during a commit");
-                    Check(!_tabHookDown, "Alt+Tab latched during a commit");
+                    Check(Swallowed(Hook(NativeMethods.VK_TAB, 0x20, IntPtr.Zero)), "Alt+Tab leaked to the system during a commit");
+                    Check(_tabHookDown, "the queued commit-time Tab was not latched");
+                    Check(_pendingStart, "the commit-time Tab was not queued for replay");
+                    _pendingStart = false; _tabHookDown = false; _tabPassedDown = false;
                     _enabled = true;
                 }
                 finally
                 {
                     _session = session; _enabled = enabled; _committing = committing;
                     _tabHookDown = false; _msg = previousMsg;
+                    _pendingStart = false; _pendingReverse = false;
                 }
             });
 
