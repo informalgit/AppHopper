@@ -54,6 +54,7 @@ namespace AppHopper
         public const int WH_MOUSE_LL = 14;
         public const uint LLKHF_UP = 0x80;
         public const int WM_LBUTTONDOWN = 0x0201;
+        public const int WM_LBUTTONUP = 0x0202;
         public const int WM_MOUSEWHEEL = 0x020A;
         public const int VK_TAB = 0x09;
         public const int VK_MENU = 0x12;
@@ -1969,10 +1970,16 @@ namespace AppHopper
             // icons belong to the cache (never disposed by a session), so
             // there is nothing to release here.
             _apps = merged;
-            int idx = 0;
+            int idx = -1;
             if (selKey != null)
                 for (int i = 0; i < _apps.Count; i++)
                     if (_apps[i].Key == selKey) { idx = i; break; }
+            // The selected entry died while the overlay was up. Slot 0 is the
+            // CURRENT app, so leaving the index there meant releasing Alt
+            // activated the window the user was already in - the overlay
+            // appeared to do nothing at all. Move to slot 1 (the most recent
+            // other app) whenever there is one.
+            if (idx < 0) idx = _apps.Count > 1 ? 1 : 0;
             _index = idx;
 
             Logic.ComputeLayout(_work, _apps.Count, _scale, ref _layout);
@@ -2540,13 +2547,24 @@ namespace AppHopper
                         int slot = SlotAtPhysical(s.pt.X, s.pt.Y);
                         if (slot >= 0)
                         {
+                            // Swallow the matching up as well: the commit
+                            // activates the target between down and up, so an
+                            // unswallowed up would land in a window that never
+                            // saw the press and could read it as a click.
+                            _swallowMouseUp = true;
                             PostAt(NativeMethods.WM_APP_COMMITAT, _pageStart + slot);
                             return (IntPtr)1;
                         }
                         return IntPtr.Zero;   // panel background: ignore
                     }
+                    _swallowMouseUp = true;   // outside click: commit is cancelled, up still belongs to us
                     Post(NativeMethods.WM_APP_CANCEL);
                     return (IntPtr)1;         // swallow outside clicks
+                }
+                if (msg == NativeMethods.WM_LBUTTONUP && _swallowMouseUp)
+                {
+                    _swallowMouseUp = false;
+                    return (IntPtr)1;
                 }
                 if (msg == NativeMethods.WM_MOUSEWHEEL)
                 {
@@ -2557,6 +2575,10 @@ namespace AppHopper
             }
             return NativeMethods.CallNextHookEx(_mouseHook, nCode, wParam, lParam);
         }
+
+        // Set when the overlay consumed a left button down; its matching up is
+        // consumed too so it cannot reach the window the commit just activated.
+        static bool _swallowMouseUp;
 
         // Hit-test rect of the overlay, in physical screen coordinates. The
         // mouse hook compares against it; it has to follow a relayout (a
@@ -2581,6 +2603,10 @@ namespace AppHopper
 
         static void UninstallMouseHook()
         {
+            // A session that ended between the down and its up leaves the
+            // latch set; clear it so the NEXT session does not swallow a
+            // press it never asked for.
+            _swallowMouseUp = false;
             if (_mouseHook != IntPtr.Zero) { NativeMethods.UnhookWindowsHookEx(_mouseHook); _mouseHook = IntPtr.Zero; }
         }
 
@@ -3884,7 +3910,15 @@ namespace AppHopper
 
             bool created;
             _mutex = new Mutex(true, "Local\\AppHopper", out created);
-            if (!created) return;
+            if (!created)
+            {
+                // The manifest forces an elevation prompt, so launching a
+                // second copy costs the user a UAC click. Exiting silently
+                // after it is indistinguishable from a failed start.
+                MessageBox.Show("AppHopper is already running.\n\nUse its tray icon to change settings or exit.",
+                    "AppHopper", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
 
             if (logRequested)
             {
