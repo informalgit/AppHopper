@@ -1596,8 +1596,13 @@ namespace AppHopper
                    .Append('@').Append(e.Rank).Append(e.Topmost ? "*" : "");
             Log(sb2.ToString());
 
-            ShowPanel();
+            // Load icons BEFORE the panel is shown. On a cold cache each one
+            // can cost two WM_GETICON round-trips into another process (100 ms
+            // timeout each), and the panel is an opaque surface: showing it
+            // first left an empty bar on screen for the whole icon phase
+            // (measured 202 ms on the first Alt+Tab after launch).
             foreach (var e in _apps) e.Icon = CachedIcon(e.Exe, e.ReprHwnd);
+            ShowPanel();
             RegisterThumbnails();
             RenderChrome();
             InstallMouseHook();
@@ -1778,9 +1783,12 @@ namespace AppHopper
                 HideOverlay();
                 var activateWatch = Stopwatch.StartNew();
                 bool ok = ForceForeground(target);
-                int activateMs = (int)activateWatch.ElapsedMilliseconds;
                 if (!ok) ok = ForegroundIs(target);   // FF's verdict can lag the real foreground; trust the latter
                 if (!ok) ok = WaitForForegroundLanding(target);   // see below: fg==0 is a transition, not a failure
+                // Measured AFTER the landing check, so the number in the log
+                // is the whole hand-over the user waited through, not just the
+                // part inside ForceForeground.
+                int activateMs = (int)activateWatch.ElapsedMilliseconds;
                 EndSession();
                 IntPtr now = NativeMethods.GetForegroundWindow();
                 // activateMs covers the whole activation attempt after the
@@ -2059,9 +2067,8 @@ namespace AppHopper
             // Joining queues changes their shared focus. Preserve the selected
             // window's existing child focus before attaching either queue.
             IntPtr focus = hwnd;
-            var gui = new NativeMethods.GUITHREADINFO();
-            gui.cbSize = (uint)Marshal.SizeOf(typeof(NativeMethods.GUITHREADINFO));
-            if (NativeMethods.GetGUIThreadInfo(targetThread, ref gui)
+            NativeMethods.GUITHREADINFO gui;
+            if (TryGUIThreadInfo(hwnd, targetThread, 50, out gui)
                 && gui.hwndFocus != IntPtr.Zero
                 && (gui.hwndFocus == hwnd || NativeMethods.IsChild(hwnd, gui.hwndFocus)))
             {
@@ -2192,13 +2199,31 @@ namespace AppHopper
         // (focus was left on the frame, which is what ends a composition)?
         static string DescribeTargetFocus(uint targetThread, IntPtr hwnd)
         {
-            var g = new NativeMethods.GUITHREADINFO();
-            g.cbSize = (uint)Marshal.SizeOf(typeof(NativeMethods.GUITHREADINFO));
-            if (!NativeMethods.GetGUIThreadInfo(targetThread, ref g)) return "unreadable";
+            NativeMethods.GUITHREADINFO g;
+            if (!TryGUIThreadInfo(hwnd, targetThread, 50, out g)) return "unreadable";
             if (g.hwndFocus == IntPtr.Zero) return "none";
             if (g.hwndFocus == hwnd) return "frame";
             if (NativeMethods.IsChild(hwnd, g.hwndFocus)) return "child";
             return "other";
+        }
+
+        // GetGUIThreadInfo has no timeout: against a busy target thread it
+        // blocks for as long as that thread takes to pump. On the commit path
+        // that showed up as 375 ms and 466 ms switches (both Chrome), with the
+        // overlay already hidden and the user staring at nothing. Probe the
+        // queue with a bounded WM_NULL first; a queue that cannot answer in
+        // time is treated as "focus not resolvable", which falls back to the
+        // existing skip-frame behaviour instead of stalling the switch.
+        static bool TryGUIThreadInfo(IntPtr hwnd, uint threadId, uint timeoutMs, out NativeMethods.GUITHREADINFO info)
+        {
+            info = new NativeMethods.GUITHREADINFO();
+            info.cbSize = (uint)Marshal.SizeOf(typeof(NativeMethods.GUITHREADINFO));
+            IntPtr unused;
+            if (hwnd == IntPtr.Zero || threadId == 0
+                || NativeMethods.SendMessageTimeoutW(hwnd, 0 /*WM_NULL*/, IntPtr.Zero, IntPtr.Zero,
+                    NativeMethods.SMTO_ABORTIFHUNG | NativeMethods.SMTO_ERRORONEXIT, timeoutMs, out unused) == IntPtr.Zero)
+                return false;
+            return NativeMethods.GetGUIThreadInfo(threadId, ref info);
         }
 
         static bool WaitForForegroundNotification(IntPtr hwnd, uint timeoutMs)
