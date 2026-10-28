@@ -215,6 +215,18 @@ namespace AppHopper
         public static extern IntPtr SetWindowsHookEx(int idHook, HookProc lpfn, IntPtr hMod, uint dwThreadId);
         [DllImport("user32.dll", SetLastError = true)]
         public static extern bool UnhookWindowsHookEx(IntPtr hhk);
+        [DllImport("user32.dll", SetLastError = true)]
+        public static extern IntPtr OpenInputDesktop(uint flags, bool inherit, uint access);
+        [DllImport("user32.dll")]
+        public static extern bool CloseDesktop(IntPtr desktop);
+        [StructLayout(LayoutKind.Sequential)]
+        public struct LASTINPUTINFO { public uint cbSize, dwTime; }
+        [DllImport("user32.dll")]
+        public static extern bool GetLastInputInfo(ref LASTINPUTINFO info);
+        [DllImport("wtsapi32.dll", SetLastError = true)]
+        public static extern bool WTSRegisterSessionNotification(IntPtr hwnd, uint flags);
+        [DllImport("wtsapi32.dll")]
+        public static extern bool WTSUnRegisterSessionNotification(IntPtr hwnd);
         [DllImport("user32.dll")]
         public static extern IntPtr CallNextHookEx(IntPtr hhk, int nCode, IntPtr wParam, IntPtr lParam);
         [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
@@ -709,6 +721,170 @@ namespace AppHopper
         static long _logBytes;
         static int _shellHookMessage;
         static readonly UIntPtr ReplayInputTag = new UIntPtr(0x41504852);
+        // A tagged F24 release tests the real input chain without typing text
+        // or pressing a shortcut. Our hook consumes it before application input.
+        // Self-tests may run beside the installed switcher. Each process must
+        // acknowledge only its own probe, never swallow another's heartbeat.
+        static readonly UIntPtr HookProbeTag = new UIntPtr(unchecked(0x41504850u ^ (uint)Process.GetCurrentProcess().Id));
+        static bool _hookProbeSeen;
+        static long _hookProbeSentAt = -1;
+        static readonly Stopwatch HookClock = Stopwatch.StartNew();
+        const int HookProbeTimeoutMs = 1500;
+        const int HookProbeIntervalMs = 2000;
+        static long _nextHookProbeAt;
+        static uint _lastCheckedInputTime, _lastProbeInputTime;
+        static string _hookRecoveryReason;
+        static bool _hookAwaitingVerification;
+        static bool _hookDesktopUnavailable;
+        static int _hookGeneration;
+        static int _hookGestureGeneration;
+        static System.Windows.Forms.Timer _hookHealthTimer;
+        static string _healthLogPath;
+        const long MaxHealthLogBytes = 256 * 1024;
+
+        // Sparse diagnostics remain available without --log. Retain previous
+        // runs in three bounded files; never record titles or raw keystrokes.
+        static void HealthLog(string message)
+        {
+            if (_healthLogPath == null) return;
+            try
+            {
+                Directory.CreateDirectory(Path.GetDirectoryName(_healthLogPath));
+                if (File.Exists(_healthLogPath) && new FileInfo(_healthLogPath).Length >= MaxHealthLogBytes)
+                {
+                    File.Delete(_healthLogPath + ".2");
+                    if (File.Exists(_healthLogPath + ".1")) File.Move(_healthLogPath + ".1", _healthLogPath + ".2");
+                    File.Move(_healthLogPath, _healthLogPath + ".1");
+                }
+                File.AppendAllText(_healthLogPath, DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss.fff ")
+                    + "pid=" + Process.GetCurrentProcess().Id + " " + message + Environment.NewLine, new UTF8Encoding(false));
+            }
+            catch (IOException) { }
+            catch (UnauthorizedAccessException) { }
+        }
+
+        static void RequestHookRecovery(string reason)
+        {
+            _hookRecoveryReason = reason;
+            _hookProbeSentAt = -1;
+            _nextHookProbeAt = 0;
+            HealthLog("recovery requested: " + reason);
+        }
+
+        static bool HookInputDesktopAvailable()
+        {
+            IntPtr desktop = NativeMethods.OpenInputDesktop(0, false, 0x0001 /*DESKTOP_READOBJECTS*/);
+            if (desktop == IntPtr.Zero) return false;
+            NativeMethods.CloseDesktop(desktop);
+            return true;
+        }
+
+        static bool HookKeysDown()
+        {
+            // Do not release a real F24 or re-install between a swallowed key
+            // down and its matching up, including remote modifier sequences.
+            for (int key = 1; key < 256; key++)
+                if ((NativeMethods.GetAsyncKeyState(key) & 0x8000) != 0) return true;
+            return false;
+        }
+
+        static bool InstallKeyboardHook(string reason)
+        {
+            IntPtr replacement = NativeMethods.SetWindowsHookEx(NativeMethods.WH_KEYBOARD_LL,
+                _hookProc, NativeMethods.GetModuleHandle(null), 0);
+            if (replacement == IntPtr.Zero)
+            {
+                HealthLog("hook install failed reason=" + reason + " error=" + Marshal.GetLastWin32Error());
+                return false; // Preserve the old hook if the replacement failed.
+            }
+            IntPtr previous = _hook;
+            _hook = replacement;
+            if (previous != IntPtr.Zero && previous != replacement) NativeMethods.UnhookWindowsHookEx(previous);
+            _hookGeneration++;
+            _hookAwaitingVerification = true;
+            _tabHookDown = _tabPassedDown = _pendingStart = _pendingReverse = false;
+            HealthLog("hook installed generation=" + _hookGeneration + " reason=" + reason + "; awaiting input callback");
+            return true;
+        }
+
+        static bool SendHookProbe(long now)
+        {
+            var lastInput = new NativeMethods.LASTINPUTINFO { cbSize = (uint)Marshal.SizeOf(typeof(NativeMethods.LASTINPUTINFO)) };
+            if (NativeMethods.GetLastInputInfo(ref lastInput)) _lastCheckedInputTime = lastInput.dwTime;
+            var input = KeyInput(0x87 /*VK_F24*/, true);
+            input.data.keyboard.dwExtraInfo = HookProbeTag;
+            _lastProbeInputTime = unchecked((uint)Environment.TickCount);
+            input.data.keyboard.time = _lastProbeInputTime;
+            _hookProbeSeen = false;
+            _hookProbeSentAt = now;
+            if (NativeMethods.SendInput(1, new NativeMethods.INPUT[] { input }, Marshal.SizeOf(typeof(NativeMethods.INPUT))) == 1)
+                return true;
+            _hookProbeSentAt = -1;
+            return false;
+        }
+
+        static void HookHealthTick(long now)
+        {
+            if (_exitRequested || !_enabled || _session || _committing) return;
+            if (!HookInputDesktopAvailable())
+            {
+                if (!_hookDesktopUnavailable) HealthLog("input desktop unavailable; health checks paused");
+                _hookDesktopUnavailable = true;
+                _hookProbeSentAt = -1;
+                return;
+            }
+            if (_hookDesktopUnavailable)
+            {
+                _hookDesktopUnavailable = false;
+                RequestHookRecovery("input desktop available again");
+            }
+            if (HookKeysDown()) return;
+            if (_hookProbeSentAt >= 0)
+            {
+                if (_hookProbeSeen)
+                {
+                    if (_hookAwaitingVerification)
+                        HealthLog("hook input verified generation=" + _hookGeneration);
+                    _hookAwaitingVerification = false;
+                    _hookProbeSentAt = -1;
+                    _nextHookProbeAt = now + HookProbeIntervalMs;
+                }
+                else if (now - _hookProbeSentAt >= HookProbeTimeoutMs)
+                {
+                    HealthLog("hook input probe timed out generation=" + _hookGeneration);
+                    _hookRecoveryReason = "input callback missing";
+                    _hookProbeSentAt = -1;
+                    _nextHookProbeAt = now;
+                }
+                else return;
+            }
+            if (now < _nextHookProbeAt) return;
+            if (_hook != IntPtr.Zero && _hookRecoveryReason == null && !_hookAwaitingVerification)
+            {
+                var lastInput = new NativeMethods.LASTINPUTINFO { cbSize = (uint)Marshal.SizeOf(typeof(NativeMethods.LASTINPUTINFO)) };
+                if (!NativeMethods.GetLastInputInfo(ref lastInput)
+                    || !HookInputNeedsProbe(lastInput.dwTime)) return;
+            }
+            if (_hook == IntPtr.Zero || _hookRecoveryReason != null)
+            {
+                if (!InstallKeyboardHook(_hookRecoveryReason ?? "missing hook"))
+                {
+                    _nextHookProbeAt = now + 5000;
+                    return;
+                }
+                _hookRecoveryReason = null;
+            }
+            _nextHookProbeAt = now + HookProbeIntervalMs;
+            if (!SendHookProbe(now))
+                HealthLog("hook input probe blocked error=" + Marshal.GetLastWin32Error() + "; will retry");
+        }
+
+        static bool HookInputNeedsProbe(uint lastInputTime)
+        {
+            // Never let our own probe schedule another probe. In particular,
+            // an idle machine must remain idle for screen lock/sleep purposes.
+            return lastInputTime != _lastCheckedInputTime && lastInputTime != _lastProbeInputTime;
+        }
 
         static PanelForm _panel;
         static ChromeForm _chrome;
@@ -872,6 +1048,13 @@ namespace AppHopper
             }
             protected override void WndProc(ref Message m)
             {
+                if (m.Msg == 0x02B1 /*WM_WTSSESSION_CHANGE*/)
+                    RequestHookRecovery("session change " + m.WParam.ToInt32());
+                else if (m.Msg == 0x007E /*WM_DISPLAYCHANGE*/)
+                    RequestHookRecovery("display change");
+                else if (m.Msg == 0x0218 /*WM_POWERBROADCAST*/
+                    && (m.WParam.ToInt32() == 7 || m.WParam.ToInt32() == 18))
+                    RequestHookRecovery("resume");
                 if (_shellHookMessage != 0 && m.Msg == _shellHookMessage && m.WParam == new IntPtr(0x8006))
                     Log("shell flash hwnd=0x" + m.LParam.ToInt64().ToString("X")
                         + " fg=0x" + NativeMethods.GetForegroundWindow().ToInt64().ToString("X"));
@@ -1339,15 +1522,86 @@ namespace AppHopper
         // dictionary lookup. Entries are owned by the cache, NEVER disposed
         // by a session.
         static Dictionary<string, Icon> _iconCache = new Dictionary<string, Icon>(StringComparer.OrdinalIgnoreCase);
+        static Func<IntPtr, string, Icon> _iconLoader = GetAppIcon;
+        struct IconRequest { public string Exe; public IntPtr Hwnd; }
+        static readonly Queue<IconRequest> _iconQueue = new Queue<IconRequest>();
+        static readonly HashSet<string> _iconsPending = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        static readonly AutoResetEvent _iconWake = new AutoResetEvent(false);
+        static Thread _iconWorker;
+        static int _iconQueuedCount;
+        static System.Windows.Forms.Timer _iconRefreshTimer;
+
+        static void QueueIcon(string exe, IntPtr hwnd)
+        {
+            if (!_iconsPending.Add(exe)) return;
+            if (_iconWorker == null)
+            {
+                _iconWorker = new Thread(IconWorkerLoop);
+                _iconWorker.IsBackground = true;
+                _iconWorker.SetApartmentState(ApartmentState.STA);
+                _iconWorker.Start();
+            }
+            lock (_iconQueue) _iconQueue.Enqueue(new IconRequest { Exe = exe, Hwnd = hwnd });
+            _iconQueuedCount++;
+            _iconWake.Set();
+        }
+
+        static void IconWorkerLoop()
+        {
+            while (true)
+            {
+                IconRequest request;
+                lock (_iconQueue)
+                {
+                    if (_iconQueue.Count == 0) { request = new IconRequest(); }
+                    else request = _iconQueue.Dequeue();
+                }
+                if (request.Exe == null) { _iconWake.WaitOne(); continue; }
+                Icon loaded = null;
+                try { loaded = _iconLoader(request.Hwnd, request.Exe); }
+                catch { }
+                if (loaded == null) loaded = (Icon)SystemIcons.Application.Clone();
+                Icon completed = loaded;
+                try
+                {
+                    if (_msg == null || _msg.IsDisposed || !_msg.IsHandleCreated) { completed.Dispose(); continue; }
+                    _msg.BeginInvoke((Action)delegate
+                    {
+                        _iconsPending.Remove(request.Exe);
+                        _iconCache[request.Exe] = completed;
+                        bool changed = false;
+                        foreach (var entry in _apps)
+                        {
+                            if (string.Equals(entry.Exe, request.Exe, StringComparison.OrdinalIgnoreCase))
+                            { entry.Icon = completed; changed = true; }
+                        }
+                        if (changed && _session && !_committing)
+                        {
+                            if (_iconRefreshTimer == null)
+                            {
+                                _iconRefreshTimer = new System.Windows.Forms.Timer { Interval = 50 };
+                                _iconRefreshTimer.Tick += delegate
+                                {
+                                    _iconRefreshTimer.Stop();
+                                    if (_session && !_committing) RenderChrome();
+                                };
+                            }
+                            _iconRefreshTimer.Stop();
+                            _iconRefreshTimer.Start();
+                        }
+                    });
+                }
+                catch (InvalidOperationException) { completed.Dispose(); }
+            }
+        }
 
         static Icon CachedIcon(string exe, IntPtr hwnd)
         {
             if (string.IsNullOrEmpty(exe)) exe = "?";
             Icon ic;
             if (_iconCache.TryGetValue(exe, out ic) && ic != null) return ic;
-            ic = GetAppIcon(hwnd, exe);
-            _iconCache[exe] = ic;
-            return ic;
+            QueueIcon(exe, hwnd);
+            return SystemIcons.Application;
         }
 
         // ================= state machine =================
@@ -1543,6 +1797,7 @@ namespace AppHopper
                 + " exe=" + LogText(Path.GetFileName(fgExe)));
 
             var order = EnumerateEntries();
+            long perfEnumerate = paintWatch.ElapsedMilliseconds;
             if (order.Count < 2)
             {
                 Log("start aborted: only " + order.Count + " app(s) in cycle ("
@@ -1602,14 +1857,28 @@ namespace AppHopper
             // timeout each), and the panel is an opaque surface: showing it
             // first left an empty bar on screen for the whole icon phase
             // (measured 202 ms on the first Alt+Tab after launch).
+            int perfIconCacheBefore = _iconQueuedCount;
             foreach (var e in _apps) e.Icon = CachedIcon(e.Exe, e.ReprHwnd);
+            long perfIcons = paintWatch.ElapsedMilliseconds;
             ShowPanel();
+            long perfPanel = paintWatch.ElapsedMilliseconds;
             RegisterThumbnails();
+            long perfThumbs = paintWatch.ElapsedMilliseconds;
             RenderChrome();
+            long perfChrome = paintWatch.ElapsedMilliseconds;
             InstallMouseHook();
             if (_refreshTimer != null) _refreshTimer.Start();
 
             _session = true;
+            if (_hookGestureGeneration != _hookGeneration)
+            {
+                _hookGestureGeneration = _hookGeneration;
+                HealthLog("switcher session started generation=" + _hookGeneration);
+            }
+            HealthLog("perf start enum=" + perfEnumerate + " icons=" + (perfIcons - perfEnumerate)
+                + " panel=" + (perfPanel - perfIcons) + " thumbs=" + (perfThumbs - perfPanel)
+                + " chrome=" + (perfChrome - perfThumbs) + " total=" + paintWatch.ElapsedMilliseconds
+                + " newIcons=" + (_iconQueuedCount - perfIconCacheBefore) + " apps=" + _apps.Count);
             // firstPaintMs is entirely our own synchronous work (enumerate,
             // layout, show, icons, thumbnails, chrome submit). Icons are the
             // only part of it that reaches into another process without a
@@ -1886,6 +2155,7 @@ namespace AppHopper
             // Commit/Cancel while we tear down.
             _session = false;
             if (_refreshTimer != null) _refreshTimer.Stop();
+            if (_iconRefreshTimer != null) _iconRefreshTimer.Stop();
             UninstallMouseHook();
             HideOverlay();
             foreach (var e in _apps)
@@ -1937,7 +2207,9 @@ namespace AppHopper
         static void RefreshEntries()
         {
             if (_committing) return;
+            var perfWatch = Stopwatch.StartNew();
             var fresh = EnumerateEntries();
+            long perfEnumerate = perfWatch.ElapsedMilliseconds;
             if (fresh.Count == 0) { AbortSession(); return; }
 
             string selKey = _index >= 0 && _index < _apps.Count ? _apps[_index].Key : null;
@@ -1981,13 +2253,20 @@ namespace AppHopper
             // other app) whenever there is one.
             if (idx < 0) idx = _apps.Count > 1 ? 1 : 0;
             _index = idx;
+            long perfMerge = perfWatch.ElapsedMilliseconds;
 
             Logic.ComputeLayout(_work, _apps.Count, _scale, ref _layout);
             _pageStart = Logic.PageStartFor(_index, _apps.Count, _layout.pageSize);
             ShowPanel();
             UpdatePanelRect();
+            long perfPanel = perfWatch.ElapsedMilliseconds;
             RegisterThumbnails();
+            long perfThumbs = perfWatch.ElapsedMilliseconds;
             RenderChrome();
+            HealthLog("perf refresh enum=" + perfEnumerate + " mergeIcons=" + (perfMerge - perfEnumerate)
+                + " panel=" + (perfPanel - perfMerge) + " thumbs=" + (perfThumbs - perfPanel)
+                + " chrome=" + (perfWatch.ElapsedMilliseconds - perfThumbs)
+                + " total=" + perfWatch.ElapsedMilliseconds + " apps=" + _apps.Count);
             Log("refresh: " + _apps.Count + " entries, index=" + _index
                 + ", panel=" + _layout.panelW + "x" + _layout.panelH
                 + " rows=" + _layout.rows + " cols=" + _layout.cols);
@@ -2471,6 +2750,12 @@ namespace AppHopper
             if (nCode >= 0)
             {
                 var s = (NativeMethods.KBDLLHOOKSTRUCT)Marshal.PtrToStructure(lParam, typeof(NativeMethods.KBDLLHOOKSTRUCT));
+                if (s.dwExtraInfo == (IntPtr)HookProbeTag.ToUInt64())
+                {
+                    _hookProbeSeen = true;
+                    _lastProbeInputTime = s.time;
+                    return (IntPtr)1;
+                }
                 if (s.dwExtraInfo == (IntPtr)ReplayInputTag.ToUInt64())
                     return NativeMethods.CallNextHookEx(_hook, nCode, wParam, lParam);
                 bool up = (s.flags & NativeMethods.LLKHF_UP) != 0;
@@ -3343,6 +3628,231 @@ namespace AppHopper
             }
         }
 
+        static void WaitForHookProbe()
+        {
+            var wait = Stopwatch.StartNew();
+            while (!_hookProbeSeen && wait.ElapsedMilliseconds < 1000)
+            {
+                Application.DoEvents();
+                Thread.Sleep(5);
+            }
+        }
+
+        static void WaitForHookTestIdle()
+        {
+            var wait = Stopwatch.StartNew();
+            while (HookKeysDown() && wait.ElapsedMilliseconds < 10000)
+            {
+                Application.DoEvents();
+                Thread.Sleep(20);
+            }
+            Check(!HookKeysDown(), "keyboard or mouse remained held during test");
+        }
+
+        static bool RunHookRecoveryTests()
+        {
+            _testFailures = 0;
+            _hookProc = KbHookProc;
+            Test("real removed keyboard hook is detected and recovers input callbacks", delegate
+            {
+                try
+                {
+                    Check(InstallKeyboardHook("test setup"), "initial hook installation failed");
+                    Check(SendHookProbe(0), "initial input probe was blocked by the desktop");
+                    WaitForHookProbe();
+                    Check(_hookProbeSeen, "initial hook never received Windows input");
+                    IntPtr stale = _hook;
+                    Check(NativeMethods.UnhookWindowsHookEx(stale), "could not remove the real hook");
+                    // Deliberately keep the stale handle, just as after silent
+                    // removal by Windows: a nonzero field proves nothing.
+                    Check(SendHookProbe(2000), "missing-hook input probe was blocked");
+                    WaitForHookProbe();
+                    Check(!_hookProbeSeen, "removed hook still received input");
+                    WaitForHookTestIdle();
+                    HookHealthTick(2000 + HookProbeTimeoutMs + 1);
+                    WaitForHookProbe();
+                    Check(_hookProbeSeen, "lost hook was not restored: Windows input callback still missing; keys=" + HookKeysDown() + " desktop=" + HookInputDesktopAvailable() + " enabled=" + _enabled);
+                    Check(_hook != IntPtr.Zero, "recovery left no hook");
+                    for (int cycle = 1; cycle <= 3; cycle++)
+                    {
+                        HookHealthTick(4000 * cycle);
+                        Check(NativeMethods.UnhookWindowsHookEx(_hook), "repeat removal failed");
+                        Check(SendHookProbe(4000 * cycle + 2000), "repeat probe blocked");
+                        WaitForHookProbe();
+                        Check(!_hookProbeSeen, "repeat removal did not lose callbacks");
+                        WaitForHookTestIdle();
+                        HookHealthTick(4000 * cycle + 2000 + HookProbeTimeoutMs + 1);
+                        WaitForHookProbe();
+                        Check(_hookProbeSeen, "repeat loss failed to recover; keys=" + HookKeysDown() + " desktop=" + HookInputDesktopAvailable() + " enabled=" + _enabled + " now=" + (4000 * cycle + 2000 + HookProbeTimeoutMs + 1) + " next=" + _nextHookProbeAt);
+                    }
+                }
+                finally
+                {
+                    if (_hook != IntPtr.Zero) NativeMethods.UnhookWindowsHookEx(_hook);
+                    _hook = IntPtr.Zero;
+                    _hookProbeSentAt = -1;
+                }
+            });
+            Test("idle and probe input never cause a self-sustaining input loop", delegate
+            {
+                _lastCheckedInputTime = 123;
+                _lastProbeInputTime = 456;
+                Check(!HookInputNeedsProbe(123), "unchanged input started a probe");
+                Check(!HookInputNeedsProbe(456), "probe input started another probe");
+                Check(HookInputNeedsProbe(789), "new user input was ignored");
+                _lastCheckedInputTime = uint.MaxValue;
+                _lastProbeInputTime = 0;
+                Check(HookInputNeedsProbe(1), "input clock wrap disabled health checks");
+            });
+            Test("the real watchdog timer restores a removed hook unattended", delegate
+            {
+                using (var timer = new System.Windows.Forms.Timer { Interval = 100 })
+                {
+                    try
+                    {
+                        Check(InstallKeyboardHook("timer test setup"), "initial install failed");
+                        Check(SendHookProbe(HookClock.ElapsedMilliseconds), "initial timer probe blocked");
+                        WaitForHookProbe();
+                        Check(_hookProbeSeen, "initial timer hook did not work");
+                        Check(NativeMethods.UnhookWindowsHookEx(_hook), "timer-test removal failed");
+                        Check(SendHookProbe(HookClock.ElapsedMilliseconds), "timer loss probe blocked");
+                        int generation = _hookGeneration;
+                        _nextHookProbeAt = 0;
+                        timer.Tick += delegate { HookHealthTick(HookClock.ElapsedMilliseconds); };
+                        timer.Start();
+                        var wait = Stopwatch.StartNew();
+                        while ((!_hookProbeSeen || _hookAwaitingVerification) && wait.ElapsedMilliseconds < 5000)
+                        {
+                            Application.DoEvents();
+                            Thread.Sleep(5);
+                        }
+                        Check(_hookGeneration > generation && _hookProbeSeen && !_hookAwaitingVerification,
+                            "timer did not restore and verify input without a manual health tick");
+                    }
+                    finally
+                    {
+                        timer.Stop();
+                        if (_hook != IntPtr.Zero) NativeMethods.UnhookWindowsHookEx(_hook);
+                        _hook = IntPtr.Zero;
+                        _hookProbeSentAt = -1;
+                    }
+                }
+            });
+            Test("session recovery waits for an idle enabled switcher", delegate
+            {
+                try
+                {
+                    Check(InstallKeyboardHook("session test setup"), "initial install failed");
+                    int generation = _hookGeneration;
+                    IntPtr ignored;
+                    NativeMethods.SendMessageTimeoutW(_msg.Handle, 0x02B1, new IntPtr(3), IntPtr.Zero, 2, 500, out ignored);
+                    Check(_hookRecoveryReason == "session change 3", "session notification did not queue recovery");
+                    _enabled = false;
+                    HookHealthTick(100000);
+                    Check(_hookGeneration == generation, "disabled switcher reinstalled a hook");
+                    _enabled = true;
+                    _session = true;
+                    HookHealthTick(100000);
+                    Check(_hookGeneration == generation, "active overlay was interrupted");
+                    _session = false;
+                    _committing = true;
+                    HookHealthTick(100000);
+                    Check(_hookGeneration == generation, "active commit was interrupted");
+                    _committing = false;
+                    HookHealthTick(100000);
+                    WaitForHookProbe();
+                    Check(_hookGeneration == generation + 1 && _hookProbeSeen, "idle session recovery was not verified by Windows input");
+                    HookHealthTick(100250);
+                    Check(!_hookAwaitingVerification, "verification was not completed");
+                    // A failed replacement must not remove a working hook.
+                    IntPtr working = _hook;
+                    NativeMethods.HookProc workingCallback = _hookProc;
+                    try
+                    {
+                        _hookProc = null;
+                        Check(!InstallKeyboardHook("intentional invalid callback"), "invalid callback was accepted");
+                    }
+                    finally { _hookProc = workingCallback; }
+                    Check(_hook == working, "failed replacement discarded the working hook");
+                    Check(SendHookProbe(101000), "retained-hook probe blocked");
+                    WaitForHookProbe();
+                    Check(_hookProbeSeen, "failed replacement broke the old hook");
+                }
+                finally
+                {
+                    _hookProc = KbHookProc;
+                    if (_hook != IntPtr.Zero) NativeMethods.UnhookWindowsHookEx(_hook);
+                    _hook = IntPtr.Zero;
+                    _hookProbeSentAt = -1;
+                    _hookRecoveryReason = null;
+                    _enabled = true;
+                    _session = _committing = false;
+                }
+            });
+            Test("health logs preserve prior runs and rotate at their bound", delegate
+            {
+                string previous = _healthLogPath;
+                string directory = Path.Combine(Path.GetTempPath(), "AppHopper-health-" + Guid.NewGuid().ToString("N"));
+                try
+                {
+                    _healthLogPath = Path.Combine(directory, "health.log");
+                    HealthLog("previous run");
+                    HealthLog("next run");
+                    string both = File.ReadAllText(_healthLogPath);
+                    Check(both.Contains("previous run") && both.Contains("next run"), "previous run was overwritten");
+                    File.WriteAllText(_healthLogPath, new string('x', (int)MaxHealthLogBytes));
+                    HealthLog("after rotation");
+                    Check(new FileInfo(_healthLogPath + ".1").Length == MaxHealthLogBytes, "previous file not rotated");
+                    Check(File.ReadAllText(_healthLogPath).Contains("after rotation"), "new event was lost");
+                    File.WriteAllText(_healthLogPath, new string('y', (int)MaxHealthLogBytes));
+                    HealthLog("second rotation");
+                    Check(File.Exists(_healthLogPath + ".2") && new FileInfo(_healthLogPath).Length < MaxHealthLogBytes,
+                        "rotation did not retain bounded history");
+                }
+                finally
+                {
+                    _healthLogPath = previous;
+                    if (Directory.Exists(directory)) Directory.Delete(directory, true);
+                }
+            });
+            Console.WriteLine("failures=" + _testFailures);
+            return _testFailures == 0;
+        }
+
+        static bool RunIconLatencyTest()
+        {
+            _testFailures = 0;
+            Test("slow new-window icon does not block the switcher", delegate
+            {
+                string key = "synthetic-slow-icon.exe";
+                var finished = new ManualResetEvent(false);
+                _iconLoader = delegate(IntPtr hwnd, string exe)
+                {
+                    Thread.Sleep(250);
+                    finished.Set();
+                    return (Icon)SystemIcons.Question.Clone();
+                };
+                try
+                {
+                    var watch = Stopwatch.StartNew();
+                    Icon result = CachedIcon(key, IntPtr.Zero);
+                    watch.Stop();
+                    Console.WriteLine("icon lookup latency=" + watch.ElapsedMilliseconds + "ms");
+                    Check(result != null && watch.ElapsedMilliseconds < 100, "new icon blocked the caller for " + watch.ElapsedMilliseconds + "ms");
+                    var wait = Stopwatch.StartNew();
+                    while (!_iconCache.ContainsKey(key) && wait.ElapsedMilliseconds < 3000)
+                    {
+                        Application.DoEvents();
+                        Thread.Sleep(5);
+                    }
+                    Check(finished.WaitOne(0) && _iconCache.ContainsKey(key), "background icon never reached the cache");
+                }
+                finally { _iconLoader = GetAppIcon; }
+            });
+            Console.WriteLine("failures=" + _testFailures);
+            return _testFailures == 0;
+        }
+
         static bool RunSelfTests()
         {
             _testFailures = 0;
@@ -3869,7 +4379,7 @@ namespace AppHopper
         [STAThread]
         static void Main(string[] args)
         {
-            bool selfTest = false, logRequested = false;
+            bool selfTest = false, hookHealthTest = false, iconLatencyTest = false, logRequested = false;
             if (args.Length > 0 && args[0] == "--apply-update")
             {
                 Updates.Apply(args);
@@ -3881,6 +4391,8 @@ namespace AppHopper
             {
                 string a = args[i];
                 if (a == "--self-test") selfTest = true;
+                if (a == "--hook-health-test") hookHealthTest = true;
+                if (a == "--icon-latency-test") iconLatencyTest = true;
                 if (a == "--log" || a == "--log-verbose") logRequested = true;
                 if (a == "--log-verbose") _logVerbose = true;
                 // The persisted preference is the default; the flag only
@@ -3895,15 +4407,14 @@ namespace AppHopper
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
 
-            // The suite drives the low-level hook directly and needs a real
-            // message window for the activation barrier, but no tray, no
-            // hooks and no second instance: it runs ahead of the mutex so it
-            // stays available while the switcher itself is running.
-            if (selfTest)
+            // Tests run before the singleton mutex, with no tray. The normal
+            // suite routes callbacks directly; --hook-health-test additionally
+            // installs/removes real hooks and verifies Windows input delivery.
+            if (selfTest || hookHealthTest || iconLatencyTest)
             {
                 _msg = new MsgForm();
                 IntPtr probe = _msg.Handle;   // force handle creation before the suite runs
-                try { Environment.ExitCode = RunSelfTests() ? 0 : 1; }
+                try { Environment.ExitCode = (iconLatencyTest ? RunIconLatencyTest() : hookHealthTest ? RunHookRecoveryTests() : RunSelfTests()) ? 0 : 1; }
                 finally { _msg.Dispose(); GC.KeepAlive(probe); }
                 return;
             }
@@ -3920,6 +4431,9 @@ namespace AppHopper
                 return;
             }
 
+            _healthLogPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                "AppHopper", "apphopper-health.log");
+            HealthLog("AppHopper v" + AppVersion + " starting enabled=" + _enabled + " hook-recovery=1");
             if (logRequested)
             {
                 try
@@ -3934,6 +4448,8 @@ namespace AppHopper
 
             _msg = new MsgForm();
             IntPtr hMsg = _msg.Handle;
+            bool sessionNotifications = NativeMethods.WTSRegisterSessionNotification(hMsg, 0 /*this session*/);
+            HealthLog("session notifications=" + sessionNotifications);
             if (_log != null)
             {
                 uint shellMessage = NativeMethods.RegisterWindowMessage("SHELLHOOK");
@@ -3955,9 +4471,7 @@ namespace AppHopper
 
             _hookProc = KbHookProc;
             _mouseHookProc = MouseHookProc;
-            using (var cur = Process.GetCurrentProcess())
-            using (var mod = cur.MainModule)
-                _hook = NativeMethods.SetWindowsHookEx(NativeMethods.WH_KEYBOARD_LL, _hookProc, NativeMethods.GetModuleHandle(mod.ModuleName), 0);
+            InstallKeyboardHook("startup");
             // A silently missing hook leaves the app looking alive but doing
             // nothing, and the failure is invisible from the outside - the
             // user just sees the OS switcher instead. Record it either way.
@@ -3972,6 +4486,8 @@ namespace AppHopper
                 _enabled = !_enabled;
                 miToggle.Checked = _enabled;
                 SaveEnabled(_enabled);
+                HealthLog("enabled=" + _enabled);
+                if (_enabled) RequestHookRecovery("enabled by user");
             };
             try { MigrateStartup(); }
             catch (Exception ex)
@@ -4043,6 +4559,13 @@ namespace AppHopper
             };
             sessionWatchdog.Start();
 
+            // A nonzero handle does not prove Windows still calls the hook.
+            // Parsec need not generate a WTS session notification: probe the
+            // input chain and recover at an idle boundary independently.
+            _hookHealthTimer = new System.Windows.Forms.Timer { Interval = 250 };
+            _hookHealthTimer.Tick += delegate { HookHealthTick(HookClock.ElapsedMilliseconds); };
+            _hookHealthTimer.Start();
+
             // Live refresh: catches windows closed while the overlay is up.
             _refreshTimer = new System.Windows.Forms.Timer { Interval = 120 };
             _refreshTimer.Tick += delegate { RefreshTick(); };
@@ -4054,6 +4577,7 @@ namespace AppHopper
                 if (_committing) return;   // a commit is mid-flight; retry next tick
                 EndSession();
                 exitTimer.Stop();
+                _hookHealthTimer.Stop();
                 icon.Visible = false;
                 if (_hook != IntPtr.Zero) NativeMethods.UnhookWindowsHookEx(_hook);
                 Application.Exit();
@@ -4063,6 +4587,11 @@ namespace AppHopper
 
             Application.Run();
 
+            _hookHealthTimer.Dispose();
+            sessionWatchdog.Dispose();
+            if (_iconRefreshTimer != null) _iconRefreshTimer.Dispose();
+            if (sessionNotifications) NativeMethods.WTSUnRegisterSessionNotification(hMsg);
+            HealthLog("stopped");
             EndSession();
             if (_shellHookMessage != 0)
             {

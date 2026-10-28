@@ -11,6 +11,12 @@ rem run next to the always-elevated installed instance without a UAC prompt.
 if errorlevel 1 goto cleanup
 "%BUILD%" --self-test
 set "RESULT=%errorlevel%"
+if not "%RESULT%"=="0" goto cleanup
+rem Opt in: this suite installs/removes real hooks and sends tagged F24 ups.
+rem It needs an unlocked interactive desktop; no elevation is required.
+if /i not "%~1"=="--hook-health" goto cleanup
+"%BUILD%" --hook-health-test
+set "RESULT=%errorlevel%"
 
 :cleanup
 del /q "%BUILD%" >nul 2>&1
