@@ -2049,6 +2049,10 @@ namespace AppHopper
                 var app = _apps[_index];
                 IntPtr target = app.ReprHwnd;
                 string targetExe = app.Exe;
+                HealthLog("activation-trace commit target=0x" + target.ToInt64().ToString("X")
+                    + " source=0x" + NativeMethods.GetForegroundWindow().ToInt64().ToString("X")
+                    + " index=" + _index + " count=" + _apps.Count);
+                ClaimForegroundForHandoff();
                 // Like Window Hopper, hide the non-activating overlay first.
                 HideOverlay();
                 var activateWatch = Stopwatch.StartNew();
@@ -2061,6 +2065,9 @@ namespace AppHopper
                 int activateMs = (int)activateWatch.ElapsedMilliseconds;
                 EndSession();
                 IntPtr now = NativeMethods.GetForegroundWindow();
+                HealthLog("activation-trace result target=0x" + target.ToInt64().ToString("X")
+                    + " foreground=0x" + now.ToInt64().ToString("X") + " ok=" + ok
+                    + " path=" + _lastFocusPath + " elapsed=" + activateMs);
                 // activateMs covers the whole activation attempt after the
                 // overlay is already hidden: restore wait, queue attaches, the
                 // SetFocus of the selected window, retries and the bounded
@@ -2310,6 +2317,34 @@ namespace AppHopper
         // Logged verbatim so the chosen path is never guessed at.
         static string _lastFocusPath = "?";
 
+        // The current foreground application may deny a direct switch even
+        // when its input queue is attached. Claim foreground for our visible
+        // switcher first, then hand foreground to the selected window.
+        static bool ClaimForegroundForHandoff()
+        {
+            if (_panel == null || !_panel.IsHandleCreated) return false;
+            IntPtr panel = _panel.Handle;
+            bool requested = NativeMethods.SetForegroundWindow(panel);
+            bool claimed = NativeMethods.GetForegroundWindow() == panel;
+            if (!claimed)
+            {
+                uint current = NativeMethods.GetCurrentThreadId();
+                uint source = NativeMethods.GetWindowThreadProcessId(NativeMethods.GetForegroundWindow(), IntPtr.Zero);
+                bool attached = source != 0 && source != current && NativeMethods.AttachThreadInput(current, source, true);
+                try
+                {
+                    if (attached)
+                    {
+                        requested = NativeMethods.SetForegroundWindow(panel);
+                        claimed = NativeMethods.GetForegroundWindow() == panel;
+                    }
+                }
+                finally { if (attached) NativeMethods.AttachThreadInput(current, source, false); }
+            }
+            HealthLog("activation-trace panel claim requested=" + requested + " claimed=" + claimed);
+            return claimed;
+        }
+
         static bool ForceForeground(IntPtr hwnd)
         {
             // Cleared up front so an early return cannot report the previous
@@ -2377,6 +2412,7 @@ namespace AppHopper
             if (joined && !NativeMethods.AttachThreadInput(myThread, fgThread, true))
             {
                 joined = false;
+                HealthLog("activation-trace source attach failed error=" + Marshal.GetLastWin32Error());
                 Log("  activation attach failed err=" + Marshal.GetLastWin32Error());
             }
             try
@@ -2407,7 +2443,8 @@ namespace AppHopper
                     _lastFocusPath = "skip-frame";
                 }
                 NativeMethods.BringWindowToTop(hwnd);
-                NativeMethods.SetForegroundWindow(hwnd);
+                bool requested = NativeMethods.SetForegroundWindow(hwnd);
+                HealthLog("activation-trace first request=" + requested + " sourceJoined=" + joined);
             }
             finally
             {
@@ -2422,6 +2459,7 @@ namespace AppHopper
                 bool targetJoined = NativeMethods.AttachThreadInput(myThread, targetThread, true);
                 if (!targetJoined)
                 {
+                    HealthLog("activation-trace target attach failed error=" + Marshal.GetLastWin32Error());
                     Log("  activation target attach failed err=" + Marshal.GetLastWin32Error());
                 }
                 _lastFocusPath = "target-attach-retry";
