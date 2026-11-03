@@ -523,6 +523,17 @@ namespace AppHopper
             return (idx / pageSize) * pageSize;
         }
 
+        // Slot the session opens on. A one-app cycle has nowhere to go, so its
+        // only entry is preselected: releasing Alt then stays on the window the
+        // user is already in instead of advancing past the end of the list.
+        // With two or more apps the pinned current app owns slot 0 and the
+        // cycle starts on 1, which is the "next app" the user asked for.
+        public static int InitialIndex(int count, bool reverse, bool fgPinned)
+        {
+            if (count <= 1) return 0;
+            return reverse ? count - 1 : (fgPinned ? 1 : 0);
+        }
+
 
         // The pinned entry (the current one) sorts first; non-topmost apps keep
         // their Z-order rank; topmost apps are offset past every non-topmost
@@ -1798,9 +1809,13 @@ namespace AppHopper
 
             var order = EnumerateEntries();
             long perfEnumerate = paintWatch.ElapsedMilliseconds;
-            if (order.Count < 2)
+            // A cycle with a single app is still ours to show: the native
+            // switcher does not group by application, so handing the gesture
+            // back there let Alt+Tab cycle that one app's own windows. Only an
+            // empty cycle has nothing to draw.
+            if (order.Count == 0)
             {
-                Log("start aborted: only " + order.Count + " app(s) in cycle ("
+                Log("start aborted: no apps in cycle ("
                     + paintWatch.ElapsedMilliseconds + "ms)");
                 EndSession();
                 return;
@@ -1842,7 +1857,7 @@ namespace AppHopper
             // recently used other app, and starting at 1 would skip it - which
             // is exactly the "Alt+Tab goes one app too far back" symptom.
             bool fgPinned = pin != IntPtr.Zero;
-            _index = reverse ? order.Count - 1 : (fgPinned ? 1 : 0);
+            _index = Logic.InitialIndex(order.Count, reverse, fgPinned);
             _pageStart = Logic.PageStartFor(_index, _apps.Count, _layout.pageSize);
             Log("fgPinned=" + fgPinned + " index=" + _index);
 
@@ -2049,6 +2064,21 @@ namespace AppHopper
                 var app = _apps[_index];
                 IntPtr target = app.ReprHwnd;
                 string targetExe = app.Exe;
+                if (_apps.Count == 1)
+                {
+                    // Nothing to switch to: the only card is the app the user is
+                    // already in. Close the overlay and leave the foreground
+                    // untouched, so Alt+Tab cannot move between that app's own
+                    // windows the way the native switcher did.
+                    HideOverlay();
+                    EndSession();
+                    HealthLog("activation-trace result target=0x" + target.ToInt64().ToString("X")
+                        + " foreground=0x" + NativeMethods.GetForegroundWindow().ToInt64().ToString("X")
+                        + " skipped=single-app");
+                    Log("commit -> no target: single app in cycle, staying on 0x"
+                        + target.ToInt64().ToString("X"));
+                    return;
+                }
                 HealthLog("activation-trace commit target=0x" + target.ToInt64().ToString("X")
                     + " source=0x" + NativeMethods.GetForegroundWindow().ToInt64().ToString("X")
                     + " index=" + _index + " count=" + _apps.Count);
@@ -4010,6 +4040,19 @@ namespace AppHopper
                 Logic.ComputeLayout(new NativeMethods.RECT { Left = 0, Top = 0, Right = 1920, Bottom = 1080 }, 1, 1.0, ref layout);
                 Check(layout.cols == 1 && layout.rows == 1, "one app reserved more than one slot");
                 Check(layout.panelW == 2 * layout.pad + layout.tileW, "panel wider than its only tile");
+            });
+
+            Test("a one-app cycle preselects its only entry", delegate
+            {
+                // The single entry is the app the user is already in; releasing
+                // Alt must not advance past it. The old start index was 1 for a
+                // pinned cycle, which is out of range once only one app is left.
+                Check(Logic.InitialIndex(1, false, true) == 0, "one-app cycle selected an app it does not have");
+                Check(Logic.InitialIndex(1, false, false) == 0, "unpinned one-app cycle started elsewhere");
+                Check(Logic.InitialIndex(1, true, true) == 0, "reverse one-app cycle started elsewhere");
+                Check(Logic.InitialIndex(2, false, true) == 1, "two-app cycle no longer starts on the next app");
+                Check(Logic.InitialIndex(2, false, false) == 0, "unpinned two-app cycle skipped slot 0");
+                Check(Logic.InitialIndex(3, true, true) == 2, "reverse cycle no longer starts at the last app");
             });
 
             Test("sensitive fields are redacted unless verbose", delegate
