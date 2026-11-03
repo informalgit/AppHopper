@@ -2,6 +2,10 @@
 
 # AppHopper
 
+<p align="center">
+  <img src="assets/apphopper-demo.gif" alt="AppHopper demo" width="960">
+</p>
+
 **Windows 上的应用级 `Alt+Tab`，外观 UI 来自 PowerToys Window Hopper**
 
 两个快捷键, 职责完全分开:

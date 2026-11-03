@@ -2,6 +2,10 @@ English | [简体中文](README.md)
 
 # AppHopper
 
+<p align="center">
+  <img src="assets/apphopper-demo.gif" alt="AppHopper demo" width="960">
+</p>
+
 **App-level `Alt+Tab` for Windows, styled after PowerToys Window Hopper.**
 
 Two shortcuts, two distinct jobs — exactly like macOS:
