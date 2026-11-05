@@ -33,9 +33,9 @@ using System.Windows.Forms;
 // "Properties -> Details") without any build.bat change. Bump once per
 // release - the tray tooltip and the startup log line read it back at
 // runtime via AppVersion, so this is the single place a version lives.
-[assembly: System.Reflection.AssemblyVersion("1.3.3.0")]
-[assembly: System.Reflection.AssemblyFileVersion("1.3.3.0")]
-[assembly: System.Reflection.AssemblyInformationalVersion("1.3.3")]
+[assembly: System.Reflection.AssemblyVersion("1.4.0.0")]
+[assembly: System.Reflection.AssemblyFileVersion("1.4.0.0")]
+[assembly: System.Reflection.AssemblyInformationalVersion("1.4.0")]
 
 namespace AppHopper
 {
