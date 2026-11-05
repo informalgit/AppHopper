@@ -84,6 +84,7 @@ namespace AppHopper
         public const uint SHGFI_LARGEICON = 0x0;
         public const uint SHGFI_USEFILEATTRIBUTES = 0x10;
         public const int ULW_ALPHA = 2;
+        public const int LWA_COLORKEY = 0x1, LWA_ALPHA = 0x2;
         public const byte AC_SRC_OVER = 0, AC_SRC_ALPHA = 1;
         public const int ICON_SMALL2 = 2, ICON_BIG = 1;
         public const uint WM_GETICON = 0x7F;
@@ -187,6 +188,8 @@ namespace AppHopper
             public uint dwAttributes;
             [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 260)]
             public string szDisplayName;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 80)]
+            public string szTypeName;
         }
 
         [StructLayout(LayoutKind.Sequential)]
@@ -335,7 +338,7 @@ namespace AppHopper
         public static extern IntPtr GetDC(IntPtr hWnd);
         [DllImport("user32.dll")]
         public static extern int ReleaseDC(IntPtr hWnd, IntPtr hDC);
-        [DllImport("user32.dll")]
+        [DllImport("user32.dll", SetLastError = true)]
         public static extern bool UpdateLayeredWindow(IntPtr hwnd, IntPtr hdcDst, ref POINT pptDst, ref SIZE psize, IntPtr hdcSrc, ref POINT pprSrc, int crKey, ref BLENDFUNCTION pblend, int dwFlags);
         [DllImport("gdi32.dll")]
         public static extern IntPtr CreateCompatibleDC(IntPtr hdc);
@@ -1363,7 +1366,9 @@ namespace AppHopper
             if ((ex & NativeMethods.WS_EX_LAYERED) == 0) return false;
             int crKey; byte alpha; int flags;
             if (!NativeMethods.GetLayeredWindowAttributes(hwnd, out crKey, out alpha, out flags)) return false;
-            return alpha == 0;
+            // A LWA_COLORKEY-only window leaves bAlpha unspecified; a zero
+            // alpha only means "nothing to show" when LWA_ALPHA is set.
+            return (flags & NativeMethods.LWA_ALPHA) != 0 && alpha == 0;
         }
 
         // The classic native Alt-Tab predicate (Raymond Chen / PowerToys
