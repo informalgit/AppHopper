@@ -240,6 +240,10 @@ namespace AppHopper
         [DllImport("user32.dll")]
         public static extern bool IsWindowVisible(IntPtr hWnd);
         [DllImport("user32.dll")]
+        public static extern bool IsWindowEnabled(IntPtr hWnd);
+        [DllImport("user32.dll")]
+        public static extern bool EnableWindow(IntPtr hWnd, bool enable);
+        [DllImport("user32.dll")]
         public static extern bool IsIconic(IntPtr hWnd);
         [DllImport("user32.dll")]
         public static extern bool SetForegroundWindow(IntPtr hWnd);
@@ -407,6 +411,14 @@ namespace AppHopper
 
         public static int Scaled(double scale, int v) { return (int)(v * scale + 0.5); }
 
+        static bool SingleTileFits(double scale, int workW, int workH)
+        {
+            int pad = Scaled(scale, 32);
+            int width = 2 * pad + Scaled(scale, 270);
+            int height = 2 * pad + Scaled(scale, 48) + 2 * Scaled(scale, 6) + Scaled(scale, 142);
+            return width <= workW && height <= workH;
+        }
+
         public static NativeMethods.RECT TileRect(ref OverlayLayout L, int index)
         {
             int row, col;
@@ -462,6 +474,21 @@ namespace AppHopper
 
         public static void ComputeLayout(NativeMethods.RECT work, int windowCount, double scale, ref OverlayLayout L)
         {
+            int workW = work.Right - work.Left, workH = work.Bottom - work.Top;
+            // The normal DPI layout is unchanged whenever one tile fits. On a
+            // smaller work area, find the largest scale that fits a complete
+            // tile, evaluating the same integer rounding used by the layout.
+            if (workW > 0 && workH > 0 && scale > 0 && !SingleTileFits(scale, workW, workH))
+            {
+                double low = 0, high = scale;
+                for (int i = 0; i < 48; i++)
+                {
+                    double candidate = (low + high) / 2;
+                    if (SingleTileFits(candidate, workW, workH)) low = candidate;
+                    else high = candidate;
+                }
+                scale = low;
+            }
             L.scale = scale;
             L.pad = Scaled(scale, 32);
             L.gap = Scaled(scale, 26);
@@ -473,7 +500,6 @@ namespace AppHopper
             L.iconSize = Scaled(scale, 16);
             L.tileH = L.headerH + L.inner + L.previewH + L.inner;
 
-            int workW = work.Right - work.Left, workH = work.Bottom - work.Top;
             int count = windowCount < 0 ? 0 : windowCount;
             int colsFromWork = (workW - 2 * L.pad + L.gap) / (L.tileW + L.gap);
             if (colsFromWork < 1) colsFromWork = 1;
@@ -772,6 +798,10 @@ namespace AppHopper
             }
             catch (IOException) { }
             catch (UnauthorizedAccessException) { }
+            // Logging is best effort and runs from the activation path, where a
+            // throw between AttachThreadInput and its finally would leave the
+            // queues joined. Never let a log failure escape.
+            catch (Exception) { }
         }
 
         static void RequestHookRecovery(string reason)
@@ -1406,8 +1436,11 @@ namespace AppHopper
             IntPtr root = OwnerChainRoot(hwnd);
             if (root == hwnd) return null;
             string rootWhy;
-            if (memo.TryGetValue(root, out rootWhy)) rootWhy = AltTabIneligibleIgnoreChain(root);
-            else { rootWhy = AltTabIneligibleIgnoreChain(root); memo[root] = rootWhy; }
+            if (!memo.TryGetValue(root, out rootWhy))
+            {
+                rootWhy = AltTabIneligibleIgnoreChain(root);
+                memo[root] = rootWhy;
+            }
             return rootWhy == null ? "owned-popup" : null;
         }
 
@@ -1800,6 +1833,17 @@ namespace AppHopper
             // its owned popup. Matching on the raw handle alone fails in both.
             IntPtr fg = RepresentativeOf(fgRaw);
             if (fg == IntPtr.Zero || !NativeMethods.IsWindowVisible(fg)) fg = fgRaw;
+            // A fresh gesture supersedes any activation still waiting on a
+            // previously unresponsive target. Without this the old request
+            // keeps its ticket, and when this session's own activation fails
+            // and the foreground falls back to the old source, every guard the
+            // deferred worker checks - pending, identity, unchanged input,
+            // source still foreground - still holds, so it would later claim
+            // the foreground the user has already moved past. This also covers
+            // the Tab buffered during a previous commit, which reaches here
+            // through a posted WM_APP_START and so never passes the single-app
+            // branch that already cancels.
+            CancelDeferredActivation();
             // Capture the source monitor before enumerating windows.
             NativeMethods.RECT work;
             double scale = MonitorScale(fg, out work);
@@ -1824,6 +1868,7 @@ namespace AppHopper
             _scale = scale;
             _work = work;
             Logic.ComputeLayout(work, order.Count, _scale, ref _layout);
+            _scale = _layout.scale; // Keep drawing and hit-testing in the fitted layout's scale.
 
             // Exactly one entry is pinned as "current": first the one that *is*
             // the foreground window, else - GetForegroundWindow() does not
@@ -2057,12 +2102,20 @@ namespace AppHopper
             // first act of Commit. _committing stays as belt-and-braces.
             _session = false;
             _committing = true;
+            _handoffLastReleaseTime = 0;
+            _handoffInterveningInput = false;
             try
             {
                 // Capture the target before any DoEvents can run: a nested
                 // WM_APP_NEXT/COMMITAT may still rewrite _index mid-teardown.
                 var app = _apps[_index];
-                IntPtr target = app.ReprHwnd;
+                // A modal dialog disables its owner. The owner remains the
+                // grouped entry, but activation must go to its active dialog.
+                IntPtr sourceForDeferred = NativeMethods.GetForegroundWindow();
+                var inputBeforeHandoff = new NativeMethods.LASTINPUTINFO { cbSize = (uint)Marshal.SizeOf(typeof(NativeMethods.LASTINPUTINFO)) };
+                bool inputBeforeHandoffKnown = NativeMethods.GetLastInputInfo(ref inputBeforeHandoff);
+                IntPtr entryTarget = app.ReprHwnd;
+                IntPtr target = ResolveActivationTarget(entryTarget);
                 string targetExe = app.Exe;
                 if (_apps.Count == 1)
                 {
@@ -2070,6 +2123,11 @@ namespace AppHopper
                     // already in. Close the overlay and leave the foreground
                     // untouched, so Alt+Tab cannot move between that app's own
                     // windows the way the native switcher did.
+                    // Starting a new cycle supersedes an activation still
+                    // waiting on a previously unresponsive target; otherwise
+                    // EndSession() would drop the mouse observer that cancels
+                    // that stale request and it could steal focus later.
+                    CancelDeferredActivation();
                     HideOverlay();
                     EndSession();
                     HealthLog("activation-trace result target=0x" + target.ToInt64().ToString("X")
@@ -2087,13 +2145,41 @@ namespace AppHopper
                 HideOverlay();
                 var activateWatch = Stopwatch.StartNew();
                 bool ok = ForceForeground(target);
-                if (!ok) ok = ForegroundIs(target);   // FF's verdict can lag the real foreground; trust the latter
-                if (!ok) ok = WaitForForegroundLanding(target);   // see below: fg==0 is a transition, not a failure
+                bool deferred = _lastActivationDeferred;
+                // A dialog can close or be replaced while the handoff is in
+                // progress. Resolve the original entry once more before
+                // giving up, so a stale popup does not lose the switch.
+                if (!ok && !deferred && NativeMethods.IsWindow(entryTarget))
+                {
+                    IntPtr retryTarget = ResolveActivationTarget(entryTarget);
+                    if (retryTarget != target && NativeMethods.IsWindow(retryTarget))
+                    {
+                        HealthLog("activation-trace target changed from=0x" + target.ToInt64().ToString("X")
+                            + " to=0x" + retryTarget.ToInt64().ToString("X"));
+                        target = retryTarget;
+                        ok = ForceForeground(target);
+                        deferred = _lastActivationDeferred;
+                    }
+                }
+                if (!ok && !deferred) ok = ForegroundIs(target);   // FF's verdict can lag the real foreground; trust the latter
+                if (!ok && !deferred) ok = WaitForForegroundLanding(target);   // see below: fg==0 is a transition, not a failure
                 // Measured AFTER the landing check, so the number in the log
                 // is the whole hand-over the user waited through, not just the
                 // part inside ForceForeground.
                 int activateMs = (int)activateWatch.ElapsedMilliseconds;
-                EndSession();
+                // Keep the existing mouse observer continuously installed until
+                // QueueDeferredActivation has adopted or rejected the handoff.
+                bool keepHandoffMouseHook = deferred && inputBeforeHandoffKnown && _mouseHook != IntPtr.Zero;
+                EndSession(keepHandoffMouseHook);
+                if (deferred)
+                {
+                    if (keepHandoffMouseHook)
+                        QueueDeferredActivation(target, sourceForDeferred, inputBeforeHandoff.dwTime);
+                    else HealthLog(inputBeforeHandoffKnown
+                        ? "activation-deferred rejected=mouse-hook-unavailable"
+                        : "activation-deferred rejected=input-unavailable");
+                    activateMs = (int)activateWatch.ElapsedMilliseconds;
+                }
                 IntPtr now = NativeMethods.GetForegroundWindow();
                 HealthLog("activation-trace result target=0x" + target.ToInt64().ToString("X")
                     + " foreground=0x" + now.ToInt64().ToString("X") + " ok=" + ok
@@ -2112,6 +2198,7 @@ namespace AppHopper
             }
             finally
             {
+                if (!_session && !_deferredPending) UninstallMouseHook();
                 _committing = false;
                 // Replay a Tab the hook swallowed while this commit was in
                 // flight. Posted, not called, so the pump runs it only after
@@ -2186,14 +2273,15 @@ namespace AppHopper
         }
 
 
-        static void EndSession()
+        static void EndSession(bool keepMouseHook = false)
         {
             // Reentrancy guard first: the watchdog timer must not re-enter
             // Commit/Cancel while we tear down.
             _session = false;
             if (_refreshTimer != null) _refreshTimer.Stop();
             if (_iconRefreshTimer != null) _iconRefreshTimer.Stop();
-            UninstallMouseHook();
+            if (keepMouseHook) _swallowMouseUp = false;
+            else UninstallMouseHook();
             HideOverlay();
             foreach (var e in _apps)
             {
@@ -2313,8 +2401,34 @@ namespace AppHopper
         {
             IntPtr now = NativeMethods.GetForegroundWindow();
             if (now == IntPtr.Zero) return false;
-            if (now == hwnd) return true;
+            if (now == hwnd) return NativeMethods.IsWindowEnabled(hwnd);
+            // When activating an owned modal popup, its disabled root is not
+            // an equivalent foreground target: it cannot receive input.
+            IntPtr root = OwnerChainRoot(hwnd);
+            if (root != hwnd && !NativeMethods.IsWindowEnabled(root)) return false;
             return RepresentativeOf(now) == hwnd || RepresentativeOf(hwnd) == now;
+        }
+
+        static IntPtr ResolveActivationTarget(IntPtr hwnd)
+        {
+            if (!NativeMethods.IsWindow(hwnd) || NativeMethods.IsWindowEnabled(hwnd)) return hwnd;
+            IntPtr root = OwnerChainRoot(hwnd);
+            // A disabled entry can be an owned popup whose real owner is hidden.
+            // The modal dialog belongs to that owner, not to the popup, so
+            // starting the walk at the popup makes GetLastActivePopup return the
+            // popup itself and the loop stops before the modal is reached.
+            // Starting at the chain root fixes that case; when hwnd already is
+            // the root (ordinary disabled main window) it is unchanged.
+            IntPtr current = root != IntPtr.Zero ? root : hwnd;
+            for (int hops = 0; hops < 32; hops++)
+            {
+                IntPtr popup = NativeMethods.GetLastActivePopup(current);
+                if (popup == IntPtr.Zero || popup == current || !NativeMethods.IsWindow(popup)
+                    || OwnerChainRoot(popup) != root) break;
+                if (NativeMethods.IsWindowVisible(popup) && NativeMethods.IsWindowEnabled(popup)) return popup;
+                current = popup;
+            }
+            return hwnd;
         }
 
         // True when hwnd belongs to this process (panel / chrome / msg window).
@@ -2375,10 +2489,244 @@ namespace AppHopper
             return claimed;
         }
 
+        // Wait off the message-pump thread for a hung target.
+        // A later user action supersedes this deferred activation.
+        static bool _lastActivationDeferred;
+        static bool _deferredPending;
+        static int _deferredGeneration;
+        static uint _deferredLastReleaseTime;
+        static uint _handoffLastReleaseTime;
+        static bool _handoffInterveningInput;
+
+        static void CancelDeferredActivation(bool keepMouseHook = false)
+        {
+            if (!_deferredPending) return;
+            _deferredPending = false;
+            Interlocked.Increment(ref _deferredGeneration);
+            if (!_session && !keepMouseHook) UninstallMouseHook();
+        }
+
+        static bool DeferredIdentity(IntPtr hwnd, out uint pid, out uint tid, out long started)
+        {
+            pid = 0; tid = 0; started = 0;
+            if (hwnd == IntPtr.Zero || !NativeMethods.IsWindow(hwnd)) return false;
+            tid = NativeMethods.GetWindowThreadProcessId(hwnd, out pid);
+            if (pid == 0 || tid == 0) return false;
+            try
+            {
+                using (Process p = Process.GetProcessById((int)pid))
+                    started = p.StartTime.ToUniversalTime().Ticks;
+                return true;
+            }
+            catch { return false; }
+        }
+
+        static bool DeferredIdentityMatches(IntPtr hwnd, uint pid, uint tid, long started)
+        {
+            uint actualPid, actualTid; long actualStart;
+            return DeferredIdentity(hwnd, out actualPid, out actualTid, out actualStart)
+                && actualPid == pid && actualTid == tid && actualStart == started;
+        }
+
+        static bool DeferredInputUnchanged(uint initial)
+        {
+            var input = new NativeMethods.LASTINPUTINFO { cbSize = (uint)Marshal.SizeOf(typeof(NativeMethods.LASTINPUTINFO)) };
+            if (!NativeMethods.GetLastInputInfo(ref input)) return false;
+            if (input.dwTime == initial || (_deferredLastReleaseTime != 0 && input.dwTime == _deferredLastReleaseTime)) return true;
+            // The watchdog's tagged F24-up is our own input. Its pre-probe
+            // marker must still equal the baseline to exclude intervening input.
+            return input.dwTime == _lastProbeInputTime
+                && (_lastCheckedInputTime == initial
+                    || (_deferredLastReleaseTime != 0 && _lastCheckedInputTime == _deferredLastReleaseTime));
+        }
+
+        static void QueueDeferredActivation(IntPtr target, IntPtr source, uint baseline)
+        {
+            CancelDeferredActivation(true);
+            var input = new NativeMethods.LASTINPUTINFO { cbSize = (uint)Marshal.SizeOf(typeof(NativeMethods.LASTINPUTINFO)) };
+            if (!NativeMethods.GetLastInputInfo(ref input) || _handoffInterveningInput
+                || (input.dwTime != baseline && (_handoffLastReleaseTime == 0 || input.dwTime != _handoffLastReleaseTime))
+                || _msg == null || _msg.IsDisposed)
+            {
+                UninstallMouseHook();
+                HealthLog("activation-deferred rejected=input-before-observer");
+                return;
+            }
+            baseline = input.dwTime;
+            int ticket = Interlocked.Increment(ref _deferredGeneration);
+            _deferredLastReleaseTime = 0;
+            _deferredPending = true;
+            InstallMouseHook();
+            if (_mouseHook == IntPtr.Zero)
+            {
+                CancelDeferredActivation();
+                HealthLog("activation-deferred rejected=mouse-hook");
+                return;
+            }
+            // Close the gap between reading the input marker and installing
+            // the observer. Never defer over an already observed new action.
+            if (_handoffInterveningInput || !DeferredInputUnchanged(baseline))
+            {
+                CancelDeferredActivation();
+                HealthLog("activation-deferred rejected=input-before-observer");
+                return;
+            }
+            uint targetPid, targetTid, sourcePid, sourceTid;
+            long targetStart, sourceStart;
+            if (!DeferredIdentity(target, out targetPid, out targetTid, out targetStart)
+                || !DeferredIdentity(source, out sourcePid, out sourceTid, out sourceStart))
+            {
+                CancelDeferredActivation();
+                HealthLog("activation-deferred rejected=identity");
+                return;
+            }
+            MsgForm sink = _msg;
+            HealthLog("activation-deferred queued ticket=" + ticket);
+            try
+            {
+              bool queued = ThreadPool.QueueUserWorkItem(delegate
+              {
+                bool ready = false;
+                try
+                {
+                    var wait = Stopwatch.StartNew();
+                    while (wait.ElapsedMilliseconds < 10000
+                        && Interlocked.CompareExchange(ref _deferredGeneration, 0, 0) == ticket)
+                    {
+                        uint pid;
+                        if (!NativeMethods.IsWindow(target)
+                            || NativeMethods.GetWindowThreadProcessId(target, out pid) != targetTid || pid != targetPid)
+                            break;
+                        if (WaitForForegroundNotification(target, 50)) { ready = true; break; }
+                        Thread.Sleep(100);
+                    }
+                }
+                catch (Exception) { }
+                try
+                {
+                    sink.BeginInvoke((MethodInvoker)delegate
+                    {
+                        if (!_deferredPending || Interlocked.CompareExchange(ref _deferredGeneration, 0, 0) != ticket)
+                        {
+                            try { HealthLog("activation-deferred cancelled reason=generation-or-pending ticket=" + ticket); } catch (Exception) { }
+                            return;
+                        }
+                        if (!ready || _session || _committing || !_enabled || _exitRequested
+                            || NativeMethods.GetForegroundWindow() != source || !DeferredInputUnchanged(baseline)
+                            || !DeferredIdentityMatches(source, sourcePid, sourceTid, sourceStart)
+                            || !DeferredIdentityMatches(target, targetPid, targetTid, targetStart))
+                        {
+                            CancelDeferredActivation();
+                            try { HealthLog("activation-deferred cancelled reason=not-ready-or-state ticket=" + ticket); } catch (Exception) { }
+                            return;
+                        }
+                        CancelDeferredActivation();
+                        var activate = Stopwatch.StartNew();
+                        _committing = true;
+                        try
+                        {
+                            bool ok = ForceForeground(target);
+                            HealthLog("activation-deferred completed ok=" + ok
+                                + " foreground=0x" + NativeMethods.GetForegroundWindow().ToInt64().ToString("X")
+                                + " elapsed=" + activate.ElapsedMilliseconds + " ticket=" + ticket);
+                        }
+                        catch (Exception ex) { HealthLog("activation-deferred failed=" + ex.GetType().Name + " ticket=" + ticket); }
+                        finally
+                        {
+                            _committing = false;
+                            if (_pendingStart)
+                            {
+                                _pendingStart = false;
+                                PostAt(NativeMethods.WM_APP_START, _pendingReverse ? 1 : 0);
+                            }
+                        }
+                    });
+                }
+                catch (InvalidOperationException) { }
+              });
+              if (!queued)
+              {
+                  CancelDeferredActivation();
+                  HealthLog("activation-deferred rejected=worker ticket=" + ticket);
+              }
+            }
+            catch (Exception ex)
+            {
+                CancelDeferredActivation();
+                HealthLog("activation-deferred rejected=" + ex.GetType().Name + " ticket=" + ticket);
+            }
+        }
+
+        // A system surface (Action Centre, Start, Search) lives in a protected
+        // process: its input queue rejects AttachThreadInput with error 5, and
+        // the panel stays on top, so the switch can never land while it is up.
+        // A synthetic Escape is what actually dismisses it (PostMessage to the
+        // surface is ignored). After it closes, the desktop window underneath
+        // becomes the source, and joining that queue lets the normal path run.
+        // Only called from the source-attach failure branch.
+        static bool DismissProtectedSource(ref IntPtr source, ref uint fgThread)
+        {
+            if (!IsProtectedShellSurface(source)) return false;
+            var inputs = new NativeMethods.INPUT[]
+            {
+                KeyInput(NativeMethods.VK_ESCAPE, false),
+                KeyInput(NativeMethods.VK_ESCAPE, true),
+            };
+            uint sent = NativeMethods.SendInput((uint)inputs.Length, inputs,
+                Marshal.SizeOf(typeof(NativeMethods.INPUT)));
+            if (sent != inputs.Length)
+            {
+                // Only part of the sequence landed. The first entry is the
+                // Escape-down, so a sent count of one leaves the shell holding
+                // a logically pressed Escape: release it on its own.
+                if (sent == 1)
+                {
+                    var release = new NativeMethods.INPUT[] { KeyInput(NativeMethods.VK_ESCAPE, true) };
+                    NativeMethods.SendInput(1, release, Marshal.SizeOf(typeof(NativeMethods.INPUT)));
+                }
+                HealthLog("activation-trace shell dismiss input failed sent=" + sent);
+                return false;
+            }
+            for (int waited = 0; waited < 600; waited += 10)
+            {
+                System.Threading.Thread.Sleep(10);
+                // This runs on the UI thread. A bare Sleep would stall the
+                // low-level keyboard/mouse hooks for the whole wait budget, so
+                // keep the message pump serviced between polls.
+                Application.DoEvents();
+                IntPtr now = NativeMethods.GetForegroundWindow();
+                if (now != source && !IsProtectedShellSurface(now)) break;
+            }
+            source = NativeMethods.GetForegroundWindow();
+            fgThread = NativeMethods.GetWindowThreadProcessId(source, IntPtr.Zero);
+            return source != IntPtr.Zero && !IsProtectedShellSurface(source);
+        }
+
+        static bool IsProtectedShellSurface(IntPtr hwnd)
+        {
+            if (hwnd == IntPtr.Zero) return false;
+            if (ClassNameOf(hwnd) != ClassCoreWindow) return false;
+            uint pid;
+            NativeMethods.GetWindowThreadProcessId(hwnd, out pid);
+            if (pid == 0) return false;
+            try
+            {
+                using (Process p = Process.GetProcessById((int)pid))
+                {
+                    string name = p.ProcessName;
+                    return string.Equals(name, "ShellExperienceHost", StringComparison.OrdinalIgnoreCase)
+                        || string.Equals(name, "StartMenuExperienceHost", StringComparison.OrdinalIgnoreCase)
+                        || string.Equals(name, "SearchHost", StringComparison.OrdinalIgnoreCase);
+                }
+            }
+            catch { return false; }
+        }
+
         static bool ForceForeground(IntPtr hwnd)
         {
             // Cleared up front so an early return cannot report the previous
             // switch's activation focus as if it belonged to this one.
+            _lastActivationDeferred = false;
             _lastActivationFocus = IntPtr.Zero;
             _lastActivationFocusResolved = false;
             _lastPostFocus = "?";
@@ -2415,15 +2763,22 @@ namespace AppHopper
             uint fgThread = NativeMethods.GetWindowThreadProcessId(NativeMethods.GetForegroundWindow(), IntPtr.Zero);
             uint myThread = NativeMethods.GetCurrentThreadId();
             uint targetThread = NativeMethods.GetWindowThreadProcessId(hwnd, IntPtr.Zero);
-            // Joining queues changes their shared focus. Preserve the selected
-            // window's existing child focus before attaching either queue.
+            // Joining queues changes their shared focus, so the selected
+            // window's own child focus used to be read with GetGUIThreadInfo
+            // and restored after the attach. That call has no timeout and runs
+            // on the UI thread: against a busy target it stalled the message
+            // pump - and with it the low-level hooks - for 375-466 ms (both
+            // Chrome). A bounded WM_NULL probe is now the only question asked
+            // of the target: one that cannot answer is deferred, and a
+            // responsive one keeps whatever focus it already has. Forcing the
+            // frame was the harmful case anyway - it stripped the control the
+            // user was typing in and ended live TSF composition.
             IntPtr focus = hwnd;
-            NativeMethods.GUITHREADINFO gui;
-            if (TryGUIThreadInfo(hwnd, targetThread, 50, out gui)
-                && gui.hwndFocus != IntPtr.Zero
-                && (gui.hwndFocus == hwnd || NativeMethods.IsChild(hwnd, gui.hwndFocus)))
+            if (!WaitForForegroundNotification(hwnd, 50) && targetThread != 0 && NativeMethods.IsWindow(hwnd))
             {
-                focus = gui.hwndFocus;
+                _lastActivationDeferred = true;
+                _lastFocusPath = "deferred-unresponsive";
+                return false;
             }
             // Diagnostic: which handle was forced, and whether the target's
             // own focused child was readable from this thread at all. Carried
@@ -2442,36 +2797,31 @@ namespace AppHopper
             if (joined && !NativeMethods.AttachThreadInput(myThread, fgThread, true))
             {
                 joined = false;
-                HealthLog("activation-trace source attach failed error=" + Marshal.GetLastWin32Error());
-                Log("  activation attach failed err=" + Marshal.GetLastWin32Error());
+                int attachError = Marshal.GetLastWin32Error();
+                HealthLog("activation-trace source attach failed error=" + attachError);
+                Log("  activation attach failed err=" + attachError);
+                if (attachError == 5 && DismissProtectedSource(ref source, ref fgThread))
+                {
+                    joined = fgThread != 0 && fgThread != myThread
+                        && NativeMethods.AttachThreadInput(myThread, fgThread, true);
+                    HealthLog("activation-trace shell source dismissed"
+                        + " source=0x" + source.ToInt64().ToString("X")
+                        + " joined=" + joined);
+                }
             }
             try
             {
-                // Restore focus in the joined queue before requesting foreground.
-                // The reverse order was refused after long-held gestures from
-                // a console source with no GUI focus; short MRU taps hid it.
-                //
-                // focus here is normally just the top-level frame: a foreign
-                // thread cannot read the target's real focused child (every
-                // switch in the logs reports resolved=frame). Forcing the frame
-                // is not harmless in that case - it strips focus from the very
-                // control the user was typing in, which terminates any live TSF
-                // composition in the target. That matches the reported symptom
-                // (the first letter after switching back is swallowed and the
-                // IME candidate window lands in the corner). So only force a
-                // genuinely resolved child; when nothing better than the frame
-                // is known, leave focus alone and let the target restore its
+                // Focus is never forced here any more. The child focus used to
+                // be read with GetGUIThreadInfo; with that call gone the only
+                // known handle is the top-level frame, and forcing the frame
+                // strips focus from the very control the user was typing in,
+                // which terminates any live TSF composition in the target.
+                // That matches the reported symptom (the first letter after
+                // switching back is swallowed and the IME candidate window
+                // lands in the corner), so the target is left to restore its
                 // own focus and composition on activation.
-                if (focus != hwnd)
-                {
-                    NativeMethods.SetFocus(focus);
-                    _lastFocusPath = "gti-child";
-                }
-                else
-                {
-                    _skippedFrameFocus = true;
-                    _lastFocusPath = "skip-frame";
-                }
+                _skippedFrameFocus = true;
+                _lastFocusPath = "skip-frame";
                 NativeMethods.BringWindowToTop(hwnd);
                 bool requested = NativeMethods.SetForegroundWindow(hwnd);
                 HealthLog("activation-trace first request=" + requested + " sourceJoined=" + joined);
@@ -2535,7 +2885,7 @@ namespace AppHopper
 
             if (ForegroundIs(hwnd))
             {
-                _lastPostFocus = DescribeTargetFocus(targetThread, hwnd);
+                _lastPostFocus = "not-read";
                 Log("  force-fg 0x" + hwnd.ToInt64().ToString("X") + " ok after " + sw.ElapsedMilliseconds + "ms"
                     + " postFocus=" + _lastPostFocus);
                 return true;
@@ -2551,35 +2901,12 @@ namespace AppHopper
         // the IME symptom: after the hand-over, is the target's own focused
         // window a real control (typing continues), or the top-level frame
         // (focus was left on the frame, which is what ends a composition)?
-        static string DescribeTargetFocus(uint targetThread, IntPtr hwnd)
-        {
-            NativeMethods.GUITHREADINFO g;
-            if (!TryGUIThreadInfo(hwnd, targetThread, 50, out g)) return "unreadable";
-            if (g.hwndFocus == IntPtr.Zero) return "none";
-            if (g.hwndFocus == hwnd) return "frame";
-            if (NativeMethods.IsChild(hwnd, g.hwndFocus)) return "child";
-            return "other";
-        }
-
         // GetGUIThreadInfo has no timeout: against a busy target thread it
-        // blocks for as long as that thread takes to pump. On the commit path
-        // that showed up as 375 ms and 466 ms switches (both Chrome), with the
-        // overlay already hidden and the user staring at nothing. Probe the
-        // queue with a bounded WM_NULL first; a queue that cannot answer in
-        // time is treated as "focus not resolvable", which falls back to the
-        // existing skip-frame behaviour instead of stalling the switch.
-        static bool TryGUIThreadInfo(IntPtr hwnd, uint threadId, uint timeoutMs, out NativeMethods.GUITHREADINFO info)
-        {
-            info = new NativeMethods.GUITHREADINFO();
-            info.cbSize = (uint)Marshal.SizeOf(typeof(NativeMethods.GUITHREADINFO));
-            IntPtr unused;
-            if (hwnd == IntPtr.Zero || threadId == 0
-                || NativeMethods.SendMessageTimeoutW(hwnd, 0 /*WM_NULL*/, IntPtr.Zero, IntPtr.Zero,
-                    NativeMethods.SMTO_ABORTIFHUNG | NativeMethods.SMTO_ERRORONEXIT, timeoutMs, out unused) == IntPtr.Zero)
-                return false;
-            return NativeMethods.GetGUIThreadInfo(threadId, ref info);
-        }
-
+        // blocks for as long as that thread takes to pump, and both of its old
+        // call sites sat on the UI thread, where that also stalls the low-level
+        // hooks. It is gone: the bounded WM_NULL probe in
+        // WaitForForegroundNotification is the only target question left, and
+        // the focus verdict it used to feed is reported as "not-read".
         static bool WaitForForegroundNotification(IntPtr hwnd, uint timeoutMs)
         {
             IntPtr unused;
@@ -2598,7 +2925,7 @@ namespace AppHopper
             // RenderChrome runs on every Tab keypress; constructing (and
             // disposing) a Font per tile was pure overhead on the hot path.
             // Fields rather than locals so the drawing helpers can reach them.
-            _headerFont = new Font("Segoe UI", Logic.Scaled(_scale, 14), GraphicsUnit.Pixel);
+            _headerFont = new Font("Segoe UI", Math.Max(1, Logic.Scaled(_scale, 14)), GraphicsUnit.Pixel);
             _headerBrush = new SolidBrush(HeaderTextC(light));
 
             IntPtr screenDc = NativeMethods.GetDC(IntPtr.Zero);
@@ -2827,6 +3154,16 @@ namespace AppHopper
                 if (s.dwExtraInfo == (IntPtr)ReplayInputTag.ToUInt64())
                     return NativeMethods.CallNextHookEx(_hook, nCode, wParam, lParam);
                 bool up = (s.flags & NativeMethods.LLKHF_UP) != 0;
+                if (_committing && !_session && !_deferredPending)
+                {
+                    if (up) _handoffLastReleaseTime = s.time;
+                    else _handoffInterveningInput = true;
+                }
+                if (_deferredPending)
+                {
+                    if (up) _deferredLastReleaseTime = s.time;
+                    else CancelDeferredActivation();
+                }
                 if (s.vkCode == NativeMethods.VK_TAB && up)
                 {
                     // If any repeat was forwarded (disable, commit or failed
@@ -2887,6 +3224,27 @@ namespace AppHopper
         // ================= mouse hook =================
         static IntPtr MouseHookProc(int nCode, IntPtr wParam, IntPtr lParam)
         {
+            if (nCode >= 0 && _committing && !_session && !_deferredPending)
+            {
+                int type = wParam.ToInt32();
+                if (type == NativeMethods.WM_LBUTTONUP || type == 0x0205 || type == 0x0208 || type == 0x020C)
+                {
+                    var mouse = (NativeMethods.MSLLHOOKSTRUCT)Marshal.PtrToStructure(lParam, typeof(NativeMethods.MSLLHOOKSTRUCT));
+                    _handoffLastReleaseTime = mouse.time;
+                }
+                else _handoffInterveningInput = true;
+            }
+            if (nCode >= 0 && _deferredPending && !_session)
+            {
+                int eventType = wParam.ToInt32();
+                if (eventType == NativeMethods.WM_LBUTTONUP || eventType == 0x0205 /*RBUTTONUP*/
+                    || eventType == 0x0208 /*MBUTTONUP*/ || eventType == 0x020C /*XBUTTONUP*/)
+                {
+                    var mouse = (NativeMethods.MSLLHOOKSTRUCT)Marshal.PtrToStructure(lParam, typeof(NativeMethods.MSLLHOOKSTRUCT));
+                    _deferredLastReleaseTime = mouse.time;
+                }
+                else CancelDeferredActivation();
+            }
             if (nCode >= 0 && _session && _enabled)
             {
                 int msg = wParam.ToInt32();
@@ -3975,6 +4333,8 @@ namespace AppHopper
                     dialog.Owner = first;
                     dialog.Show();
                     Application.DoEvents();
+                    Check(ResolveActivationTarget(first.Handle) == first.Handle,
+                        "enabled owner was unexpectedly redirected to a modeless popup");
                     entries = EnumerateEntries();
                     count = 0;
                     foreach (var entry in entries)
@@ -3994,6 +4354,29 @@ namespace AppHopper
                             else count++;
                         }
                     Check(count == 1 && foundDialog, "owned dialog displaced or duplicated its application");
+                }
+            });
+            Test("owned popup eligibility uses the cached root verdict", delegate
+            {
+                using (var root = new GroupingTestForm())
+                using (var popup = new GroupingTestForm())
+                {
+                    root.SetBounds(40, 40, 200, 100);
+                    popup.SetBounds(80, 80, 200, 100);
+                    root.Show();
+                    popup.Owner = root;
+                    popup.Show();
+                    Application.DoEvents();
+                    var memo = new Dictionary<IntPtr, string>();
+                    // Simulate a previously observed, non-presentable owner:
+                    // the current enumeration must reuse that cached verdict.
+                    memo[root.Handle] = "invisible";
+                    Check(EligibilityMemoized(popup.Handle, memo) == null,
+                        "cached non-presentable owner verdict was ignored");
+                    memo.Clear();
+                    memo[root.Handle] = null;
+                    Check(EligibilityMemoized(popup.Handle, memo) == "owned-popup",
+                        "cached presentable owner verdict was ignored");
                 }
             });
             Test("layout, cropping, paging and ordering", delegate
@@ -4032,6 +4415,27 @@ namespace AppHopper
                 Check(layout.panelX >= secondary.Left && layout.panelX + layout.panelW <= secondary.Right, "panel left the source monitor");
                 Check(layout.panelY >= secondary.Top && layout.panelY + layout.panelH <= secondary.Bottom, "panel left the source monitor");
                 Check(layout.panelX > 0 && layout.panelY > 0, "panel fell back to the primary monitor");
+            });
+
+            Test("panel fits narrow and short work areas", delegate
+            {
+                var areas = new NativeMethods.RECT[] {
+                    new NativeMethods.RECT { Left = 100, Top = -200, Right = 740, Bottom = 700 },
+                    new NativeMethods.RECT { Left = 0, Top = 0, Right = 320, Bottom = 900 },
+                    new NativeMethods.RECT { Left = 1920, Top = -200, Right = 3840, Bottom = 40 }
+                };
+                double[] scales = { 2.0, 1.0, 1.0 };
+                for (int i = 0; i < areas.Length; i++)
+                foreach (int count in new int[] { 1, 2, 7, 20 })
+                {
+                    Logic.OverlayLayout layout = new Logic.OverlayLayout();
+                    Logic.ComputeLayout(areas[i], count, scales[i], ref layout);
+                    Check(layout.panelX >= areas[i].Left && layout.panelY >= areas[i].Top
+                        && layout.panelX + layout.panelW <= areas[i].Right
+                        && layout.panelY + layout.panelH <= areas[i].Bottom, "panel left work area");
+                    Check(layout.tileW > 0 && layout.tileH > 0 && layout.scale > 0
+                        && layout.scale <= scales[i], "invalid fitted tile or scale");
+                }
             });
 
             Test("a single entry never draws a second tile of background", delegate
@@ -4401,6 +4805,70 @@ namespace AppHopper
             {
                 Check(!ForceForeground(IntPtr.Zero), "a zero HWND was treated as claimable");
                 Check(!ForceForeground(new IntPtr(0xFFFF0000)), "an invalid HWND was treated as claimable");
+                Check(ResolveActivationTarget(IntPtr.Zero) == IntPtr.Zero,
+                    "invalid activation target was unexpectedly changed");
+            });
+
+            Test("a disabled owned popup resolves to the root's modal dialog", delegate
+            {
+                // A disabled entry is not always the window that holds the
+                // dialog: the entry can be a popup owned by the root, while the
+                // dialog that needs the input belongs to that root. Starting
+                // the walk at the popup makes GetLastActivePopup return the
+                // popup itself, so the walk stops one hop early and activation
+                // lands on a window that cannot take input.
+                IntPtr restore = NativeMethods.GetForegroundWindow();
+                var rootForm = new Form();
+                var popupForm = new Form();
+                var modalForm = new Form();
+                try
+                {
+                    rootForm.Text = "AppHopper self-test root";
+                    popupForm.Text = "AppHopper self-test popup";
+                    modalForm.Text = "AppHopper self-test modal";
+                    rootForm.SetBounds(40, 40, 220, 120);
+                    popupForm.SetBounds(60, 60, 220, 120);
+                    modalForm.SetBounds(80, 80, 220, 120);
+                    popupForm.Owner = rootForm;
+                    modalForm.Owner = rootForm;
+                    rootForm.Show();
+                    popupForm.Show();
+                    modalForm.Show();
+                    modalForm.Activate();
+                    Application.DoEvents();
+                    Check(OwnerChainRoot(popupForm.Handle) == rootForm.Handle,
+                        "the popup is not owned by the root");
+                    Check(OwnerChainRoot(modalForm.Handle) == rootForm.Handle,
+                        "the modal is not owned by the root");
+                    // A dialog disables its owner; the popup stands in for a
+                    // disabled entry next to it.
+                    NativeMethods.EnableWindow(rootForm.Handle, false);
+                    NativeMethods.EnableWindow(popupForm.Handle, false);
+                    try
+                    {
+                        Check(!NativeMethods.IsWindowEnabled(popupForm.Handle),
+                            "the entry window did not become disabled");
+                        Check(ResolveActivationTarget(popupForm.Handle) == modalForm.Handle,
+                            "a disabled owned popup resolved to itself instead of the root modal");
+                    }
+                    finally
+                    {
+                        NativeMethods.EnableWindow(popupForm.Handle, true);
+                        NativeMethods.EnableWindow(rootForm.Handle, true);
+                    }
+                }
+                finally
+                {
+                    modalForm.Hide();
+                    popupForm.Hide();
+                    rootForm.Hide();
+                    Application.DoEvents();
+                    modalForm.Dispose();
+                    popupForm.Dispose();
+                    rootForm.Dispose();
+                    if (restore != IntPtr.Zero && NativeMethods.IsWindow(restore))
+                        NativeMethods.SetForegroundWindow(restore);
+                }
             });
 
             Test("the enabled preference survives a restart", delegate

@@ -20,7 +20,7 @@ No more "walking through" five Explorer windows to reach the browser: `Alt+Tab` 
 
 ## Build
 
-1. **The easiest route: double-click `build.bat` in the repository** — it terminates any running instance and embeds `app.manifest` so the resulting exe requests administrator privileges on launch. If an elevated instance is already running, quit it from the tray first; the locked output file would break the build.
+1. **The easiest route: double-click `build.bat` in the repository.** It compiles a candidate first and only stops the running instance and swaps the target once that succeeds, so a failed compile leaves the running program and the installed binary untouched. The embedded `app.manifest` makes the resulting exe request administrator privileges on launch. An elevated instance started by its scheduled task is stopped as well; one launched by hand with no matching task still has to be quit from the tray first.
 2. Or run the compiler manually:
     ```bat
     C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe -nologo -target:winexe -platform:anycpu -optimize+ -win32manifest:app.manifest ^

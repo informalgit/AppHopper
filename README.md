@@ -19,7 +19,7 @@
 
 ## 构建
 
-1. **最简单的做法：双击仓库里的 `build.bat`**，它会先结束正在运行的实例，并嵌入 `app.manifest`，使生成的 exe 启动时自动申请管理员权限；若已有实例正以管理员权限运行，**请先从托盘退出**，否则输出文件被占用会导致编译失败。
+1. **最简单的做法：双击仓库里的 `build.bat`**：它先编译出候选 exe，成功后才结束正在运行的实例并替换目标，所以编译失败不会影响正在运行的程序和现有的 exe。嵌入的 `app.manifest` 让生成的 exe 启动时自动申请管理员权限。由计划任务启动的提权实例也能被停掉；手动启动、又没有对应计划任务的提权实例，请先从托盘退出。
 2. 手动执行等价命令:
     ```bat
     C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe -nologo -target:winexe -platform:anycpu -optimize+ -win32manifest:app.manifest ^

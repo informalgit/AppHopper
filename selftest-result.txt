@@ -1,0 +1,29 @@
+PASS update versions compare numerically and reject prerelease tags
+PASS update metadata rejects untrusted assets and missing integrity
+PASS main windows share one application entry while owned dialogs remain reachable
+PASS owned popup eligibility uses the cached root verdict
+PASS layout, cropping, paging and ordering
+PASS panel is centred on the monitor the source window is on
+PASS panel fits narrow and short work areas
+PASS a single entry never draws a second tile of background
+PASS a one-app cycle preselects its only entry
+PASS sensitive fields are redacted unless verbose
+PASS plain runs log no per-window enumeration detail
+PASS the 8 MiB log cap holds at its exact boundary
+PASS multibyte records respect the byte cap
+PASS a failed log stream stops writing without duplicating records
+PASS update staging ACL permits only trusted mutation
+PASS autostart state rejects another executable, user or non-elevated task
+PASS native replay preserves the physical modifiers
+PASS hook routing: failures, repeats, modifiers and replay tags
+PASS activation notification survives a blocked and a dead target
+PASS app icons are copies, so disposing one never harms another
+PASS an out-of-range commit index is ignored, not fatal
+PASS a failing app message never escapes into the message pump
+PASS an untitled window with real size stays switchable
+PASS overlay display and cancellation preserve foreground
+PASS activation refuses handles it cannot claim
+PASS a disabled owned popup resolves to the root's modal dialog
+PASS the enabled preference survives a restart
+PASS eligibility memoization preserves the owner-chain verdict
+failures=0

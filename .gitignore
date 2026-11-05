@@ -17,3 +17,9 @@ tools/
 # local agent rules and handoff
 /AGENTS.md
 /HANDOFF_PROMPT.md
+
+# test-run byproducts
+__pycache__/
+*.pyc
+*.bmp
+sumatrapdfcache/
