@@ -32,7 +32,8 @@ using System.Windows.Forms;
 // Version resource: csc turns these into the PE's VS_VERSIONINFO (Explorer
 // "Properties -> Details") without any build.bat change. Bump once per
 // release - the tray tooltip and the startup log line read it back at
-// runtime via AppVersion, so this is the single place a version lives.
+// runtime via AppVersion. Keep app.manifest's assemblyIdentity version in
+// sync: it is a separate Win32 SxS label, not part of VS_VERSIONINFO.
 [assembly: System.Reflection.AssemblyVersion("1.4.0.0")]
 [assembly: System.Reflection.AssemblyFileVersion("1.4.0.0")]
 [assembly: System.Reflection.AssemblyInformationalVersion("1.4.0")]
@@ -1917,11 +1918,12 @@ namespace AppHopper
                    .Append('@').Append(e.Rank).Append(e.Topmost ? "*" : "");
             Log(sb2.ToString());
 
-            // Load icons BEFORE the panel is shown. On a cold cache each one
-            // can cost two WM_GETICON round-trips into another process (100 ms
-            // timeout each), and the panel is an opaque surface: showing it
-            // first left an empty bar on screen for the whole icon phase
-            // (measured 202 ms on the first Alt+Tab after launch).
+            // CachedIcon is only a dictionary lookup on this thread: a cold
+            // entry just queues a background load (IconWorkerLoop) and returns
+            // a placeholder, so the two WM_GETICON round-trips no longer block
+            // the first frame. The 202 ms cold-start stall this comment used to
+            // describe was removed by the asynchronous loader; perfIcons below
+            // now measures the synchronous lookup phase only.
             int perfIconCacheBefore = _iconQueuedCount;
             foreach (var e in _apps) e.Icon = CachedIcon(e.Exe, e.ReprHwnd);
             long perfIcons = paintWatch.ElapsedMilliseconds;

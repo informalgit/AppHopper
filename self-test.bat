@@ -1,7 +1,7 @@
 @echo off
-rem Runs the regression suite that lives inside AppHopper.exe. There is no
+rem Runs the regression suites that live inside AppHopper.exe. There is no
 rem separate test project: every check is compiled in and reachable through
-rem the --self-test switch, so this script only builds and calls it.
+rem --self-test plus two opt-in suites; this script just builds and calls them.
 cd /d "%~dp0"
 setlocal
 set "BUILD=%TEMP%\AppHopper-selftest-%RANDOM%-%RANDOM%.exe"
@@ -15,12 +15,26 @@ if errorlevel 1 (
 "%BUILD%" --self-test
 set "RESULT=%errorlevel%"
 if not "%RESULT%"=="0" goto cleanup
-rem Opt in: this suite installs/removes real hooks and sends tagged F24 ups.
-rem It needs an unlocked interactive desktop; no elevation is required.
-if /i not "%~1"=="--hook-health" goto cleanup
-"%BUILD%" --hook-health-test
-set "RESULT=%errorlevel%"
+rem Optional suites; pass --hook-health and/or --icon-latency (any order).
+rem --hook-health installs/removes real hooks and sends tagged F24 ups, so it
+rem needs an unlocked interactive desktop. Neither suite needs elevation.
+if "%~1"=="" goto cleanup
+for %%A in (%*) do call :run_optional "%%~A"
+goto cleanup
 
 :cleanup
 del /q "%BUILD%" >nul 2>&1
 exit /b %RESULT%
+
+:run_optional
+if /i "%~1"=="--hook-health" goto run_hook
+if /i "%~1"=="--icon-latency" goto run_icon
+exit /b 0
+:run_hook
+"%BUILD%" --hook-health-test
+if errorlevel 1 set "RESULT=1"
+exit /b 0
+:run_icon
+"%BUILD%" --icon-latency-test
+if errorlevel 1 set "RESULT=1"
+exit /b 0
