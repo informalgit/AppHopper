@@ -109,14 +109,6 @@ namespace AppHopper
             public IntPtr dwExtraInfo;
         }
 
-        [StructLayout(LayoutKind.Sequential)]
-        public struct GUITHREADINFO
-        {
-            public uint cbSize, flags;
-            public IntPtr hwndActive, hwndFocus, hwndCapture, hwndMenuOwner, hwndMoveSize, hwndCaret;
-            public RECT rcCaret;
-        }
-
         // The mouse member fixes INPUT's union size/alignment on both x86/x64.
         [StructLayout(LayoutKind.Sequential)]
         public struct MOUSEINPUT
@@ -257,10 +249,6 @@ namespace AppHopper
         public static extern bool BringWindowToTop(IntPtr hWnd);
         [DllImport("user32.dll")]
         public static extern IntPtr SetFocus(IntPtr hWnd);
-        [DllImport("user32.dll")]
-        public static extern bool GetGUIThreadInfo(uint idThread, ref GUITHREADINFO info);
-        [DllImport("user32.dll")]
-        public static extern bool IsChild(IntPtr parent, IntPtr child);
         [DllImport("kernel32.dll")]
         public static extern uint GetCurrentThreadId();
         [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
@@ -1378,48 +1366,17 @@ namespace AppHopper
         // cycle (null = it participates). The merged form serves both the
         // filter and the log so they can never diverge.
         //
-        // This entry point is the owner-chain rule; every other check lives in
-        // AltTabIneligibleIgnoreChain below, which the root-presentable probe
-        // also calls.
+        // Uncached entry point for single-window probes and the self-tests.
+        // The owner-chain rule itself lives in EligibilityMemoized below, so
+        // this and the production filter share one implementation and can
+        // never drift apart.
         static string AltTabIneligibilityReason(IntPtr hwnd)
         {
-            string why = AltTabIneligibleIgnoreChain(hwnd);
-            if (why != null) return why;
-
-            // Owner chains appear exactly once, represented by their ROOT
-            // window. An owned popup sits above its owner and is raised with
-            // it, and while a MODAL popup is up the root cannot take focus
-            // anyway - a separate popup entry would only trap the user. (A
-            // file dialog used to show up next to its own main window exactly
-            // like that: the main window carries WS_EX_APPWINDOW, so the dialog
-            // fell out of the exe grouping into an entry of its own.)
-            //
-            // Note the old form of this rule could never fire for a VISIBLE
-            // popup: OwnerChainRepresentative walks to GetLastActivePopup,
-            // which - by construction - returns that very popup, so the popup
-            // compared equal to its representative and passed.
-            //
-            // A popup may stand in for the chain only when the root itself is
-            // not presentable (hidden, cloaked, alpha-0, toolwindow, other
-            // desktop), which keeps "main window hidden while an owned dialog
-            // is visible" groups alive.
-            IntPtr root = OwnerChainRoot(hwnd);
-            if (root != hwnd)
-            {
-                if (AltTabIneligibleIgnoreChain(root) == null) return "owned-popup";
-                // Root cannot represent the chain: a visible popup is then the
-                // only presentable member left, so it stands in. No further
-                // check here - the walk in OwnerChainRepresentative always
-                // stops BEFORE a visible popup (it returns the root or an
-                // invisible one), so a "not-owner-rep" test on this path could
-                // never let a visible dialog through and would instead hide
-                // apps like "tray utility with a floating panel" entirely.
-            }
-            return null;
+            return EligibilityMemoized(hwnd, new Dictionary<IntPtr, string>());
         }
 
-        // AltTabIneligibilityReason with a per-enumeration cache of the
-        // chain-only check.
+        // The canonical eligibility predicate, with a per-enumeration cache of
+        // the chain-only check. AltTabIneligibilityReason wraps this uncached.
         //
         // The owner-chain rule calls AltTabIneligibleIgnoreChain on the ROOT as
         // well as on the window itself, and that root is re-evaluated for every
@@ -1434,20 +1391,35 @@ namespace AppHopper
             string cached;
             if (memo.TryGetValue(hwnd, out cached)) return cached;
             string why = AltTabIneligibleIgnoreChain(hwnd);
-            memo[hwnd] = why;
-            if (why != null) return why;
+            if (why != null) { memo[hwnd] = why; return why; }
 
-            // Same owner-chain rule as AltTabIneligibilityReason, with the root
-            // probe served from the same cache.
+            // Owner chains appear exactly once, represented by their ROOT
+            // window. An owned popup sits above its owner and is raised with
+            // it, and while a MODAL popup is up the root cannot take focus
+            // anyway - a separate popup entry would only trap the user. (A
+            // file dialog used to show up next to its own main window exactly
+            // like that: the main window carries WS_EX_APPWINDOW, so the dialog
+            // fell out of the exe grouping into an entry of its own.)
+            //
+            // A popup may stand in for the chain only when the root itself is
+            // not presentable (hidden, cloaked, alpha-0, toolwindow, other
+            // desktop), which keeps "main window hidden while an owned dialog
+            // is visible" groups alive. The root probe is served from the same
+            // cache, so a root shared by many popups is classified only once.
             IntPtr root = OwnerChainRoot(hwnd);
-            if (root == hwnd) return null;
-            string rootWhy;
-            if (!memo.TryGetValue(root, out rootWhy))
+            string verdict = null;
+            if (root != hwnd)
             {
-                rootWhy = AltTabIneligibleIgnoreChain(root);
-                memo[root] = rootWhy;
+                string rootWhy;
+                if (!memo.TryGetValue(root, out rootWhy))
+                {
+                    rootWhy = AltTabIneligibleIgnoreChain(root);
+                    memo[root] = rootWhy;   // a root's full verdict equals its chain verdict
+                }
+                verdict = rootWhy == null ? "owned-popup" : null;
             }
-            return rootWhy == null ? "owned-popup" : null;
+            memo[hwnd] = verdict;   // cache the full verdict so a repeat query of a popup agrees
+            return verdict;
         }
 
         // Every eligibility check except the owner-chain rule. Shared by the
@@ -1826,7 +1798,8 @@ namespace AppHopper
             var paintWatch = Stopwatch.StartNew();
             IntPtr fgRaw = NativeMethods.GetForegroundWindow();
             if (fgRaw == IntPtr.Zero) { Log("start aborted: no foreground window"); return; }
-            string fgExe = WindowExe(fgRaw);
+            // Query fresh: the exe memo still holds the prior session's values until EnumerateEntries clears it below.
+            string fgExe = WindowExeCore(fgRaw);
             if (fgExe == null)
             {
                 Log("start aborted: no exe for fg 0x" + fgRaw.ToInt64().ToString("X")
@@ -2198,7 +2171,6 @@ namespace AppHopper
                 Log("commit -> 0x" + target.ToInt64().ToString("X") + " " + LogText(Path.GetFileName(targetExe))
                     + " sfw=" + (ok ? "ok" : "FAILED") + " activateMs=" + activateMs
                     + " forcedFocus=0x" + _lastActivationFocus.ToInt64().ToString("X")
-                    + " resolved=" + (_lastActivationFocusResolved ? "child" : "frame")
                     + " focusPath=" + _lastFocusPath
                     + " postFocus=" + _lastPostFocus
                     + " fgNow=0x" + now.ToInt64().ToString("X") + " [" + ClassNameOf(now) + "]");
@@ -2452,7 +2424,6 @@ namespace AppHopper
         // Window Hopper activation: attach to the current foreground thread
         // before raising the target; detach before pumping messages or logging.
         static IntPtr _lastActivationFocus;
-        static bool _lastActivationFocusResolved;
         // Where the target's own focus ended up after a successful hand-over:
         // "child" (a real control - typing, and therefore any IME composition,
         // continues), "frame" (only the top-level window), "none", "other",
@@ -2735,7 +2706,6 @@ namespace AppHopper
             // switch's activation focus as if it belonged to this one.
             _lastActivationDeferred = false;
             _lastActivationFocus = IntPtr.Zero;
-            _lastActivationFocusResolved = false;
             _lastPostFocus = "?";
             _skippedFrameFocus = false;
             _lastFocusPath = "?";
@@ -2787,11 +2757,9 @@ namespace AppHopper
                 _lastFocusPath = "deferred-unresponsive";
                 return false;
             }
-            // Diagnostic: which handle was forced, and whether the target's
-            // own focused child was readable from this thread at all. Carried
-            // out to the commit log line rather than logged here.
+            // Diagnostic: which handle was forced. Carried out to the commit
+            // log line rather than logged here.
             _lastActivationFocus = focus;
-            _lastActivationFocusResolved = focus != hwnd;
             // The shell - which does not reproduce the swallowed first letter -
             // never joins the TARGET's input queue. AttachThreadInput makes
             // Windows generate focus transitions on attach and again on detach,
@@ -2853,7 +2821,6 @@ namespace AppHopper
                 Log("  switch refused without joining the target queue; retrying joined");
                 try
                 {
-                    if (focus != hwnd) NativeMethods.SetFocus(focus);
                     NativeMethods.BringWindowToTop(hwnd);
                     NativeMethods.SetForegroundWindow(hwnd);
                 }
@@ -4916,15 +4883,28 @@ namespace AppHopper
 
             Test("eligibility memoization preserves the owner-chain verdict", delegate
             {
-                // The cache only skips recomputation; a window and its root
-                // must still classify exactly as the uncached predicate does.
-                var memo = new Dictionary<IntPtr, string>();
-                IntPtr w = NativeMethods.GetDesktopWindow();
-                string cached = EligibilityMemoized(w, memo);
-                string direct = AltTabIneligibilityReason(w);
-                Check(cached == direct, "memoized verdict \"" + cached + "\" != direct \"" + direct + "\"");
-                // Second call must come from the cache and agree.
-                Check(EligibilityMemoized(w, memo) == cached, "cached verdict changed between calls");
+                // Exercise the owner-chain rule itself, not just the shared
+                // chain checks: the desktop window short-circuits to "desktop"
+                // before the owner rule, so a visible popup under a presentable
+                // root is used instead. Direct and cached must agree, and the
+                // popup must collapse into its root.
+                using (var root = new GroupingTestForm())
+                using (var popup = new GroupingTestForm())
+                {
+                    root.SetBounds(40, 40, 200, 100);
+                    popup.SetBounds(80, 80, 200, 100);
+                    root.Show();
+                    popup.Owner = root;
+                    popup.Show();
+                    Application.DoEvents();
+                    var memo = new Dictionary<IntPtr, string>();
+                    string direct = AltTabIneligibilityReason(popup.Handle);
+                    string cached = EligibilityMemoized(popup.Handle, memo);
+                    Check(direct == "owned-popup", "a presentable root did not collapse its owned popup");
+                    Check(cached == direct, "memoized verdict \"" + cached + "\" != direct \"" + direct + "\"");
+                    // Second call must come from the cache and agree.
+                    Check(EligibilityMemoized(popup.Handle, memo) == cached, "cached verdict changed between calls");
+                }
             });
 
 
@@ -5097,10 +5077,16 @@ namespace AppHopper
             {
                 var cat = e.Category;
                 if (cat != Microsoft.Win32.UserPreferenceCategory.Color && cat != Microsoft.Win32.UserPreferenceCategory.General) return;
-                Icon old = _trayIcon;
-                _trayIcon = MakeTrayIcon();
-                icon.Icon = _trayIcon;
-                if (old != null) old.Dispose();
+                // SystemEvents raises this on its own thread; rebuild the icon
+                // on the UI thread like every other tray/icon mutation.
+                if (_msg == null || _msg.IsDisposed || !_msg.IsHandleCreated) return;
+                _msg.BeginInvoke((Action)delegate
+                {
+                    Icon old = _trayIcon;
+                    _trayIcon = MakeTrayIcon();
+                    icon.Icon = _trayIcon;
+                    if (old != null) old.Dispose();
+                });
             };
 
             // Watchdog: if the Alt release never arrives through the hook
@@ -5139,7 +5125,13 @@ namespace AppHopper
                 Application.Exit();
             };
             exitTimer.Start();
-            if (updateSignal != null) Updates.SignalStarted(updateSignal);
+            if (updateSignal != null)
+            {
+                // The event is created by the update helper, not here; a stale
+                // or malformed --update-started must not brick startup.
+                try { Updates.SignalStarted(updateSignal); }
+                catch (Exception ex) { HealthLog("update-started signal failed: " + ex.Message); }
+            }
 
             Application.Run();
 
