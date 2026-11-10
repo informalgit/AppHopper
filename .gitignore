@@ -10,6 +10,8 @@ Thumbs.db
 
 # WorkBuddy session data
 .workbuddy/
+.claude/
+.kilo/
 
 # local dev tools (never push)
 tools/
@@ -23,3 +25,8 @@ __pycache__/
 *.pyc
 *.bmp
 sumatrapdfcache/
+
+# Local desktop-test records
+/AppHopper系统测试/
+/远程重连后AltTab恢复系统切换条/
+/演示视频制作/
