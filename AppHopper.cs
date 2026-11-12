@@ -34,9 +34,9 @@ using System.Windows.Forms;
 // release - the tray tooltip and the startup log line read it back at
 // runtime via AppVersion. Keep app.manifest's assemblyIdentity version in
 // sync: it is a separate Win32 SxS label, not part of VS_VERSIONINFO.
-[assembly: System.Reflection.AssemblyVersion("1.4.0.0")]
-[assembly: System.Reflection.AssemblyFileVersion("1.4.0.0")]
-[assembly: System.Reflection.AssemblyInformationalVersion("1.4.0")]
+[assembly: System.Reflection.AssemblyVersion("1.4.1.0")]
+[assembly: System.Reflection.AssemblyFileVersion("1.4.1.0")]
+[assembly: System.Reflection.AssemblyInformationalVersion("1.4.1")]
 
 namespace AppHopper
 {
