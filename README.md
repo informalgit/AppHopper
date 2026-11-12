@@ -6,16 +6,16 @@
   <img src="assets/apphopper-demo-zh.gif" alt="AppHopper demo" width="960">
 </p>
 
-**Windows 上的应用级 `Alt+Tab`，外观 UI 来自 PowerToys Window Hopper**
+**Windows 上的跨应用 `Alt+Tab` 窗口切换器，外观 UI 来自 PowerToys Window Hopper**
 
 两个快捷键, 职责完全分开:
 
 | 快捷键 | 在什么之间切换 | 行为 |
 |---|---|---|
-| `Alt+Tab` | **应用** | 每个应用只占一个条目，按最近使用排序；前台应用的兄弟窗口不出现，所以 `Alt+Tab` 永远落在*另一个*应用上 |
+| `Alt+Tab` | **其他应用的窗口** | 当前应用只保留前台窗口，其兄弟窗口不出现；其他应用的每个可切换窗口各占一个条目，按最近使用顺序排列 |
 | ``Alt+` `` | **前台应用的窗口** | 交给 [PowerToys Window Hopper](https://learn.microsoft.com/zh-cn/windows/powertoys/window-hopper)(或任何应用内切换器)处理 |
 
-再也不用在五个资源管理器窗口之间"路过"才能到达浏览器：`Alt+Tab` 直接跳到下一个*应用*，``Alt+` `` 在当前应用内部循环
+从其他应用切到资源管理器时，每个可切换的资源管理器窗口都会分别出现，不再只显示一个代表；当前应用内部的兄弟窗口仍不出现，``Alt+` `` 继续负责当前应用内部循环。
 
 ## 构建
 

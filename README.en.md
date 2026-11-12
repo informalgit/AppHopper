@@ -6,16 +6,16 @@ English | [简体中文](README.md)
   <img src="assets/apphopper-demo.gif" alt="AppHopper demo" width="960">
 </p>
 
-**App-level `Alt+Tab` for Windows, styled after PowerToys Window Hopper.**
+**A cross-application `Alt+Tab` switcher for Windows, styled after PowerToys Window Hopper.**
 
-Two shortcuts, two distinct jobs — exactly like macOS:
+Two shortcuts, two distinct jobs:
 
 | Shortcut | Switches between | Behavior |
 |---|---|---|
-| `Alt+Tab` | **applications** | one entry per app, MRU order; sibling windows of the focused app never appear, so `Alt+Tab` always lands on a *different* app |
+| `Alt+Tab` | **windows of other apps** | the focused app keeps only its foreground window; its sibling windows are omitted, while every eligible window of every other app gets its own entry in MRU order |
 | ``Alt+` `` | **windows of the focused app** | handled by [PowerToys Window Hopper](https://learn.microsoft.com/en-us/windows/powertoys/window-hopper) (or any per-app cycler) |
 
-No more "walking through" five Explorer windows to reach the browser: `Alt+Tab` jumps straight to the next *app*, ``Alt+` `` cycles inside the current one.
+When switching from another app, every eligible Explorer window appears as its own entry instead of one app-level placeholder; sibling windows of the focused app stay out of the cycle and remain the job of ``Alt+` ``.
 
 
 ## Build
