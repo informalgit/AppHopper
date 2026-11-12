@@ -564,8 +564,8 @@ namespace AppHopper
         }
     }
 
-    // ================= cycled-application model =================
-    // One entry per cycled application: representative window plus the
+    // ================= cycled-window model =================
+    // One entry per eligible top-level window: representative window plus the
     // grouping/paint state the overlay needs.
     class AppEntry
     {
@@ -576,14 +576,13 @@ namespace AppHopper
         public IntPtr Thumb = IntPtr.Zero;
         public int Rank;       // Z-order rank of the representative window
         public bool Topmost;   // representative window is WS_EX_TOPMOST
-        // Stable identity across re-enumerations: the exe path, or
-        // "exe|hwnd" for a window that owns its own entry. The in-session
-        // refresh matches entries on this, so a surviving entry keeps its
-        // slot even when its representative window changed.
+        // Stable identity across re-enumerations: "exe|hwnd" distinguishes
+        // multiple windows of the same application. The in-session refresh
+        // matches entries on this, so a surviving window keeps its slot.
         public string Key;
-        // Owned WS_EX_APPWINDOW dialogs may keep a separate entry. Unowned
-        // main windows always belong to their exe's application entry.
-        // Independent dialogs can only be pinned by handle, never by exe.
+        // An owned WS_EX_APPWINDOW window can represent its owner chain when
+        // the root is not presentable. It follows the same per-window identity
+        // and current-application filtering as every other entry.
         public bool OwnEntry;
     }
 
@@ -926,6 +925,11 @@ namespace AppHopper
         static List<AppEntry> _apps = new List<AppEntry>();
         static List<IntPtr> _thumbs = new List<IntPtr>();
         static bool _session;
+        // Freeze the current application for the whole overlay session. Live
+        // refresh must not read a transient foreground change and re-admit the
+        // current application's sibling windows.
+        static IntPtr _sessionForeground;
+        static string _sessionForegroundExe;
         // Commit/Cancel teardown in progress: a second trigger pumped in via
         // Application.DoEvents (watchdog tick / queued WM_APP_COMMIT) must
         // no-op instead of running a nested Commit to completion - the nested
@@ -1694,18 +1698,20 @@ namespace AppHopper
             return 1.0;
         }
 
-        // One entry per application, in raw Z-order: grouped by exe, plus a
-        // dedicated entry for every WS_EX_APPWINDOW window. Shared by
-        // StartSession and the in-session refresh, so a refresh produces
-        // exactly the same entries and can diff them against the running list.
-        static List<AppEntry> EnumerateEntries()
+        // One entry per eligible top-level window, in raw Z-order. The current
+        // application contributes only its normalized foreground representative;
+        // all its sibling windows (including owned WS_EX_APPWINDOW entries) are
+        // excluded. Other applications contribute every eligible window.
+        // StartSession and in-session refresh pass the same frozen context, so
+        // a refresh produces the same entries and can diff them by window key.
+        static List<AppEntry> EnumerateEntries(IntPtr currentHwnd, string currentExe)
         {
             // The per-hwnd exe cache is process-wide, so it must be reset per
             // enumeration or a window that has since been recreated keeps the
             // previous mapping.
             _exeMemo.Clear();
             var order = new List<AppEntry>();
-            var byExe = new Dictionary<string, AppEntry>();
+            var byKey = new Dictionary<string, AppEntry>(StringComparer.Ordinal);
             // Memoized per enumeration. The owner-chain rule evaluates a
             // window's root as well, so without this the common case (many
             // visible popups under one root) re-runs the full predicate on the
@@ -1724,11 +1730,10 @@ namespace AppHopper
                 // EnumWindows callback escapes across the unmanaged frame and
                 // kills the process, so every failure is contained here and the
                 // window is simply skipped.
-                // Every top-level window consumes one Z-order slot. Incrementing
-                // only on the skip branches gives two adjacent apps the same
-                // rank, which makes the sort order them randomly - the cycle
-                // then alternates between two different "next" apps from the
-                // same foreground window (the "wrong app gets mixed in" bug).
+                // Every top-level window consumes one Z-order slot, including
+                // filtered siblings. Incrementing only on the skip branches
+                // gives adjacent windows the same rank and makes their sort
+                // order unstable between gestures.
                 int myRank = rank++;
                 // Single predicate serves filter AND log: no double evaluation,
                 // no second copy to drift out of sync. Memoized because the
@@ -1750,15 +1755,21 @@ namespace AppHopper
                 // The predicate already vetted that an exe resolves; re-resolve
                 // here to obtain the value itself.
                 string exe = WindowExe(hwnd);
+                // Do not manufacture an entry for an ineligible current window,
+                // and do not let a sibling take its place. Applying this before
+                // the owned-popup branch gives both kinds of entry one rule.
+                if (currentHwnd != IntPtr.Zero
+                    && string.Equals(exe, currentExe, StringComparison.OrdinalIgnoreCase)
+                    && hwnd != currentHwnd) return true;
                 int ex = NativeMethods.GetWindowLong(hwnd, NativeMethods.GWL_EXSTYLE);
-                // WS_EX_APPWINDOW alone does not mean a separate application:
-                // Electron main windows commonly set it. Only owned windows
-                // explicitly asking for a shell entry stay independent.
+                // WS_EX_APPWINDOW alone does not change per-window grouping:
+                // Electron main windows commonly set it. The flag remains useful
+                // for diagnostics and for windows representing a hidden owner.
                 bool ownEntry = (ex & NativeMethods.WS_EX_APPWINDOW) != 0
                     && NativeMethods.GetWindow(hwnd, NativeMethods.GW_OWNER) != IntPtr.Zero;
-                string key = ownEntry ? exe + "|" + hwnd.ToInt64().ToString("X") : exe;
+                string key = exe + "|" + hwnd.ToInt64().ToString("X");
                 AppEntry e;
-                if (!byExe.TryGetValue(key, out e))
+                if (!byKey.TryGetValue(key, out e))
                 {
                     e = new AppEntry
                     {
@@ -1777,7 +1788,7 @@ namespace AppHopper
                     var t = new StringBuilder(256);
                     NativeMethods.GetWindowTextW(hwnd, t, 256);
                     e.Title = t.ToString();
-                    byExe[key] = e;
+                    byKey[key] = e;
                     order.Add(e);
                     if (ownEntry && _log != null)
                         Log("  own entry (WS_EX_APPWINDOW) 0x" + hwnd.ToInt64().ToString("X")
@@ -1830,12 +1841,12 @@ namespace AppHopper
                 + LogText(GetWindowTitle(fgRaw)) + "\" -> repr 0x" + fg.ToInt64().ToString("X")
                 + " exe=" + LogText(Path.GetFileName(fgExe)));
 
-            var order = EnumerateEntries();
+            var order = EnumerateEntries(fg, fgExe);
             long perfEnumerate = paintWatch.ElapsedMilliseconds;
-            // A cycle with a single app is still ours to show: the native
-            // switcher does not group by application, so handing the gesture
-            // back there let Alt+Tab cycle that one app's own windows. Only an
-            // empty cycle has nothing to draw.
+            // A cycle with a single window is still ours to show: handing the
+            // gesture back would let native Alt+Tab advance to a sibling this
+            // overlay deliberately excluded. Only an empty cycle has nothing
+            // to draw.
             if (order.Count == 0)
             {
                 Log("start aborted: no apps in cycle ("
@@ -1849,24 +1860,15 @@ namespace AppHopper
             Logic.ComputeLayout(work, order.Count, _scale, ref _layout);
             _scale = _layout.scale; // Keep drawing and hit-testing in the fitted layout's scale.
 
-            // Exactly one entry is pinned as "current": first the one that *is*
-            // the foreground window, else - GetForegroundWindow() does not
-            // necessarily return a group's representative (a UWP app reports its
-            // CoreWindow, a minimized group reports an owned popup) - the group
-            // the foreground window belongs to. Split entries stand for their
-            // own window only, so they are never pinned by exe: with an
-            // Explorer dialog in front, both it and the Explorer group would
-            // otherwise claim slot 0 and Alt+Tab would preselect the dialog
-            // itself.
+            // Exactly one entry is pinned as "current", and only by normalized
+            // window handle. If that window failed eligibility, enumeration did
+            // not add it or any same-exe sibling: pin stays zero and the normal
+            // unpinned MRU fallback selects the most recent other window.
             IntPtr pin = IntPtr.Zero;
             foreach (var e in order)
                 if (e.ReprHwnd == fg) { pin = fg; break; }
-            if (pin == IntPtr.Zero)
-                foreach (var e in order)
-                    if (!e.OwnEntry && string.Equals(e.Exe, fgExe, StringComparison.OrdinalIgnoreCase))
-                    { pin = e.ReprHwnd; break; }
 
-            // pinned app first, then MRU-ish Z-order with topmost apps last
+            // pinned window first, then MRU-ish Z-order with topmost windows last
             // (their raw Z-order position is meaningless: topmost windows are
             // always painted above everything else regardless of activation)
             _apps = order;
@@ -1909,6 +1911,8 @@ namespace AppHopper
             InstallMouseHook();
             if (_refreshTimer != null) _refreshTimer.Start();
 
+            _sessionForeground = fg;
+            _sessionForegroundExe = fgExe;
             _session = true;
             if (_hookGestureGeneration != _hookGeneration)
             {
@@ -2270,6 +2274,8 @@ namespace AppHopper
                 e.Icon = null;
             }
             _apps.Clear();
+            _sessionForeground = IntPtr.Zero;
+            _sessionForegroundExe = null;
         }
 
         // Give up on the cycle without switching anywhere: used when the
@@ -2312,7 +2318,7 @@ namespace AppHopper
         {
             if (_committing) return;
             var perfWatch = Stopwatch.StartNew();
-            var fresh = EnumerateEntries();
+            var fresh = EnumerateEntries(_sessionForeground, _sessionForegroundExe);
             long perfEnumerate = perfWatch.ElapsedMilliseconds;
             if (fresh.Count == 0) { AbortSession(); return; }
 
@@ -4284,7 +4290,7 @@ namespace AppHopper
                     Check(rejected, "unsafe release was accepted");
                 }
             });
-            Test("main windows share one application entry while owned dialogs remain reachable", delegate
+            Test("other applications split windows while the current application keeps only its representative", delegate
             {
                 using (var first = new GroupingTestForm())
                 using (var second = new GroupingTestForm())
@@ -4297,37 +4303,99 @@ namespace AppHopper
                     second.Show();
                     Application.DoEvents();
                     string exe = WindowExe(first.Handle);
-                    var entries = EnumerateEntries();
-                    AppEntry group = null;
-                    int count = 0;
+                    var entries = EnumerateEntries(IntPtr.Zero, null);
+                    AppEntry firstEntry = null, secondEntry = null;
+                    int firstCount = 0, secondCount = 0;
                     foreach (var entry in entries)
-                        if (entry.Exe == exe) { group = entry; count++; }
-                    Check(count == 1 && !group.OwnEntry, "same-app main windows were split");
-                    Check(group.ReprHwnd == second.Handle, "group did not retain the leading main window");
+                    {
+                        if (entry.ReprHwnd == first.Handle) { firstEntry = entry; firstCount++; }
+                        if (entry.ReprHwnd == second.Handle) { secondEntry = entry; secondCount++; }
+                    }
+                    Check(firstCount == 1 && secondCount == 1, "another application's main windows did not split");
+                    Check(firstEntry != null && secondEntry != null && !firstEntry.OwnEntry && !secondEntry.OwnEntry,
+                        "ordinary main windows were marked as owned entries");
+                    Check(firstEntry != null && secondEntry != null && firstEntry.Key != secondEntry.Key,
+                        "same-exe refresh keys collided");
+                    string firstKey = firstEntry == null ? null : firstEntry.Key;
+                    string secondKey = secondEntry == null ? null : secondEntry.Key;
+
                     dialog.Owner = first;
                     dialog.Show();
                     Application.DoEvents();
                     Check(ResolveActivationTarget(first.Handle) == first.Handle,
                         "enabled owner was unexpectedly redirected to a modeless popup");
-                    entries = EnumerateEntries();
-                    count = 0;
+                    entries = EnumerateEntries(IntPtr.Zero, null);
+                    firstCount = secondCount = 0;
+                    int dialogCount = 0;
+                    bool stableFirstKey = false, stableSecondKey = false;
                     foreach (var entry in entries)
-                        if (entry.Exe == exe) count++;
-                    Check(count == 1, "visible owner's popup duplicated its application");
-                    first.Hide();
-                    dialog.Show();
-                    Application.DoEvents();
-                    entries = EnumerateEntries();
-                    bool foundDialog = false;
-                    count = 0;
+                    {
+                        if (entry.ReprHwnd == first.Handle)
+                        {
+                            firstCount++;
+                            stableFirstKey = entry.Key == firstKey;
+                        }
+                        if (entry.ReprHwnd == second.Handle)
+                        {
+                            secondCount++;
+                            stableSecondKey = entry.Key == secondKey;
+                        }
+                        if (entry.ReprHwnd == dialog.Handle) dialogCount++;
+                    }
+                    Check(firstCount == 1 && secondCount == 1 && dialogCount == 0,
+                        "a visible owner's popup duplicated its window");
+                    Check(stableFirstKey && stableSecondKey, "same-exe window keys changed across refresh enumeration");
+
+                    Check(RepresentativeOf(dialog.Handle) == first.Handle,
+                        "owned popup did not normalize to its visible owner");
+                    entries = EnumerateEntries(first.Handle, exe);
+                    int sameExeCount = 0;
+                    bool foundFirst = false, foundSecond = false, foundDialog = false;
                     foreach (var entry in entries)
                         if (entry.Exe == exe)
                         {
-                            if (entry.OwnEntry)
-                                foundDialog |= entry.ReprHwnd == dialog.Handle;
-                            else count++;
+                            sameExeCount++;
+                            foundFirst |= entry.ReprHwnd == first.Handle;
+                            foundSecond |= entry.ReprHwnd == second.Handle;
+                            foundDialog |= entry.ReprHwnd == dialog.Handle;
                         }
-                    Check(count == 1 && foundDialog, "owned dialog displaced or duplicated its application");
+                    Check(sameExeCount == 1 && foundFirst && !foundSecond && !foundDialog,
+                        "current representative was not retained alone");
+
+                    first.Hide();
+                    dialog.Show();
+                    Application.DoEvents();
+                    entries = EnumerateEntries(IntPtr.Zero, null);
+                    firstCount = secondCount = dialogCount = 0;
+                    AppEntry dialogEntry = null;
+                    foreach (var entry in entries)
+                    {
+                        if (entry.ReprHwnd == first.Handle) firstCount++;
+                        if (entry.ReprHwnd == second.Handle) secondCount++;
+                        if (entry.ReprHwnd == dialog.Handle) { dialogEntry = entry; dialogCount++; }
+                    }
+                    Check(firstCount == 0 && secondCount == 1 && dialogCount == 1
+                        && dialogEntry != null && dialogEntry.OwnEntry,
+                        "hidden owner's eligible popup was lost or duplicated");
+
+                    entries = EnumerateEntries(dialog.Handle, exe);
+                    sameExeCount = 0;
+                    foundSecond = foundDialog = false;
+                    foreach (var entry in entries)
+                        if (entry.Exe == exe)
+                        {
+                            sameExeCount++;
+                            foundSecond |= entry.ReprHwnd == second.Handle;
+                            foundDialog |= entry.ReprHwnd == dialog.Handle && entry.OwnEntry;
+                        }
+                    Check(sameExeCount == 1 && foundDialog && !foundSecond,
+                        "current owned entry did not exclude its sibling windows");
+
+                    entries = EnumerateEntries(first.Handle, exe);
+                    sameExeCount = 0;
+                    foreach (var entry in entries)
+                        if (entry.Exe == exe) sameExeCount++;
+                    Check(sameExeCount == 0, "an ineligible current window or one of its siblings was manufactured");
                 }
             });
             Test("owned popup eligibility uses the cached root verdict", delegate
@@ -4458,10 +4526,10 @@ namespace AppHopper
                 try
                 {
                     _logVerbose = false;
-                    string plain = CaptureLog(delegate { EnumerateEntries(); });
+                    string plain = CaptureLog(delegate { EnumerateEntries(IntPtr.Zero, null); });
                     Check(!plain.Contains("  skip 0x"), "plain run logged per-window skip detail");
                     _logVerbose = true;
-                    string verbose = CaptureLog(delegate { EnumerateEntries(); });
+                    string verbose = CaptureLog(delegate { EnumerateEntries(IntPtr.Zero, null); });
                     Check(verbose.Contains("  skip 0x"), "verbose run lost the enumeration detail");
                 }
                 finally { _logVerbose = previous; }
