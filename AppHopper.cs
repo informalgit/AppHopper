@@ -553,13 +553,15 @@ namespace AppHopper
         }
 
 
-        // The pinned entry (the current one) sorts first; non-topmost apps keep
-        // their Z-order rank; topmost apps are offset past every non-topmost
-        // one. Which entry is pinned is decided once by the caller, so exactly
-        // one entry can ever sit in slot 0.
+        // The pinned entry (the current one) sorts first, then the switcher's
+        // own activation history (most recent first), then non-topmost apps by
+        // Z-order rank, with topmost apps offset past every non-topmost one.
+        // Which entry is pinned is decided once by the caller, so exactly one
+        // entry can ever sit in slot 0.
         public static int AppSortKey(AppEntry e, IntPtr pin)
         {
-            if (e.ReprHwnd == pin) return -1;
+            if (e.ReprHwnd == pin) return int.MinValue;
+            if (e.Mru >= 0) return int.MinValue + 1 + e.Mru;
             return (e.Topmost ? TopmostSortOffset : 0) + e.Rank;
         }
     }
@@ -575,6 +577,12 @@ namespace AppHopper
         public Icon Icon;      // shared handle (window icons) or owned clone
         public IntPtr Thumb = IntPtr.Zero;
         public int Rank;       // Z-order rank of the representative window
+        // Position in the switcher's own activation history, -1 when the
+        // window has not been activated through the overlay. Sorting by this
+        // first is what makes "Alt+Tab once" return to the window the user
+        // actually came from; Z-order is only a proxy for that and is wrong
+        // whenever the shell moves windows without a user activation.
+        public int Mru = -1;
         public bool Topmost;   // representative window is WS_EX_TOPMOST
         // Stable identity across re-enumerations: "exe|hwnd" distinguishes
         // multiple windows of the same application. The in-session refresh
@@ -936,6 +944,11 @@ namespace AppHopper
         // one activated the target, the outer one then failed its retries and
         // handed the foreground back to the source ("To Do stays in front").
         static bool _committing;
+        // Key of the card the mouse click landed on, captured when the click is
+        // handled. The posted message is dispatched later, and the 120 ms live
+        // refresh can reorder the list in between; resolving by key makes a
+        // click always commit the card the user actually clicked.
+        static string _pendingCommitKey;
         static int _index;
         static int _pageStart;
         static Logic.OverlayLayout _layout;
@@ -1313,6 +1326,21 @@ namespace AppHopper
             return OwnerChainRepresentative(hwnd);
         }
 
+        // The window that owns slot 0. A modal dialog can be the foreground
+        // while being excluded from the cycle as an owned popup; pinning the
+        // dialog itself found no entry, so every window of that application was
+        // then skipped as a "sibling of the current one" and the app vanished
+        // from its own cycle. The presentable root is what the user is in.
+        // A CoreWindow foreground has no presentable root, so it is unchanged.
+        static IntPtr EntryHandleForForeground(IntPtr fg)
+        {
+            if (fg == IntPtr.Zero) return IntPtr.Zero;
+            if (AltTabIneligibilityReason(fg) == null) return fg;
+            IntPtr root = OwnerChainRoot(fg);
+            if (root == IntPtr.Zero || root == fg) return fg;
+            return AltTabIneligibilityReason(root) == null ? root : fg;
+        }
+
         static string GetWindowTitle(IntPtr hwnd)
         {
             var t = new StringBuilder(256);
@@ -1677,7 +1705,13 @@ namespace AppHopper
                     // The index arrives from a posted message, so treat it as
                     // untrusted input rather than assuming it is in range.
                     int wanted = (int)wparam;
+                    string clickedKey = _pendingCommitKey;
+                    _pendingCommitKey = null;
+                    if (clickedKey != null)
+                        for (int i = 0; i < _apps.Count; i++)
+                            if (_apps[i].Key == clickedKey) { wanted = i; break; }
                     if (wanted < 0 || wanted >= _apps.Count) { Log("  commit-at index out of range: " + wanted); break; }
+                    Log("  commit-at slot=" + wanted + " key=" + LogText(clickedKey));
                     _index = wanted;
                     RenderChrome();
                     Commit();
@@ -1696,6 +1730,43 @@ namespace AppHopper
             if (m != IntPtr.Zero && NativeMethods.GetDpiForMonitor(m, NativeMethods.MDT_EFFECTIVE_DPI, out dx, out dy) == 0 && dx != 0)
                 return dx / 96.0;
             return 1.0;
+        }
+
+        // ================= activation history =================
+        // Slot 1 of every session is meant to be the window the user just came
+        // from. Z-order cannot answer that reliably: activating a UWP app moves
+        // a shell-hosted ApplicationFrameWindow, and the panel claim/hide
+        // sequence moves the foreground too, so the window the user left can end
+        // up two slots down (reported 2026-11-12: Settings -> tern, then one
+        // Alt+Tab landed on another application). This list is written only
+        // where the switcher itself changed the foreground, and is reset as soon
+        // as the window in front is one it did not put there.
+        static readonly List<IntPtr> _mru = new List<IntPtr>();
+        const int MruLimit = 24;
+
+        static void PushMru(IntPtr hwnd)
+        {
+            if (hwnd == IntPtr.Zero || !NativeMethods.IsWindow(hwnd)) return;
+            IntPtr key = RepresentativeOf(hwnd);
+            if (key == IntPtr.Zero) key = hwnd;
+            _mru.Remove(key);
+            _mru.Insert(0, key);
+            if (_mru.Count > MruLimit) _mru.RemoveRange(MruLimit, _mru.Count - MruLimit);
+        }
+
+        static void RememberActivation(IntPtr source, IntPtr target)
+        {
+            PushMru(source);
+            PushMru(target);
+        }
+
+        // The history is only trusted while it starts at the window now in
+        // front: anything else in front means the user switched by a route the
+        // switcher did not take (a click, the native switcher, a restore), and
+        // Z-order is the better answer for slot 1 again.
+        static void SeedOrResetMru(IntPtr foreground)
+        {
+            if (_mru.Count == 0 || _mru[0] != foreground) { _mru.Clear(); _mru.Add(foreground); }
         }
 
         // One entry per eligible top-level window, in raw Z-order. The current
@@ -1798,6 +1869,20 @@ namespace AppHopper
               }
               catch { return true; }   // skip this window; never throw across the callback boundary
             }, IntPtr.Zero);
+            // Mark the entries the switcher itself activated, most recent
+            // first. Entries it never activated keep Mru = -1 and fall back to
+            // their Z-order rank.
+            if (_mru.Count > 1)
+            {
+                var mruIndex = new Dictionary<IntPtr, int>(_mru.Count);
+                for (int i = 0; i < _mru.Count; i++)
+                    if (!mruIndex.ContainsKey(_mru[i])) mruIndex[_mru[i]] = i;
+                foreach (var e in order)
+                {
+                    int at;
+                    if (mruIndex.TryGetValue(e.ReprHwnd, out at)) e.Mru = at;
+                }
+            }
             return order;
         }
 
@@ -1823,6 +1908,24 @@ namespace AppHopper
             // its owned popup. Matching on the raw handle alone fails in both.
             IntPtr fg = RepresentativeOf(fgRaw);
             if (fg == IntPtr.Zero || !NativeMethods.IsWindowVisible(fg)) fg = fgRaw;
+            // A modal dialog is the foreground but not a card. Pin the app it
+            // belongs to, otherwise that application is dropped from its own
+            // cycle and slot 0 becomes a window the user is not in.
+            IntPtr fgEntry = EntryHandleForForeground(fg);
+            if (fgEntry != fg)
+            {
+                Log("fg entry 0x" + fg.ToInt64().ToString("X") + " -> 0x" + fgEntry.ToInt64().ToString("X")
+                    + " (foreground is not a card; pinning its root)");
+                fg = fgEntry;
+                fgExe = WindowExeCore(fg);
+                if (fgExe == null)
+                {
+                    Log("start aborted: no exe for entry 0x" + fg.ToInt64().ToString("X"));
+                    return;
+                }
+            }
+            SeedOrResetMru(fg);
+            _pendingCommitKey = null;   // a click from a previous session can never apply here
             // A fresh gesture supersedes any activation still waiting on a
             // previously unresponsive target. Without this the old request
             // keeps its ticket, and when this session's own activation fails
@@ -1890,7 +1993,11 @@ namespace AppHopper
             var sb2 = new StringBuilder("order:");
             foreach (var e in _apps)
                 sb2.Append(' ').Append(LogText(System.IO.Path.GetFileNameWithoutExtension(e.Exe)))
-                   .Append('@').Append(e.Rank).Append(e.Topmost ? "*" : "");
+                   .Append('@').Append(e.Rank).Append(e.Topmost ? "*" : "")
+                   // #N is the activation-history slot (absent when the window
+                   // was never activated through the overlay). Slot order can
+                   // only be audited against the real list if this is printed.
+                   .Append(e.Mru >= 0 ? "#" + e.Mru : "");
             Log(sb2.ToString());
 
             // CachedIcon is only a dictionary lookup on this thread: a cold
@@ -2164,7 +2271,24 @@ namespace AppHopper
                         : "activation-deferred rejected=input-unavailable");
                     activateMs = (int)activateWatch.ElapsedMilliseconds;
                 }
+                // A refused hand-over can leave the foreground on one of our own
+                // (hidden) windows. Restoring the source is safe only in that
+                // state: a foreign foreground, or the system's 0 transition, must
+                // be left alone - restoring there used to cancel an activation
+                // that was still landing.
+                IntPtr fgAfter = NativeMethods.GetForegroundWindow();
+                if (!ok && !deferred && IsOwnWindow(fgAfter) && NativeMethods.IsWindow(sourceForDeferred))
+                {
+                    HealthLog("activation-trace restoring source after failed hand-over fg=0x"
+                        + fgAfter.ToInt64().ToString("X"));
+                    NativeMethods.SetForegroundWindow(sourceForDeferred);
+                }
                 IntPtr now = NativeMethods.GetForegroundWindow();
+                // Only a hand-over that really landed is recency the switcher
+                // can vouch for. A deferred request (deferred == true) is
+                // recorded by the worker that performs it.
+                if (ok && !deferred)
+                    RememberActivation(_lastResolvedSource != IntPtr.Zero ? _lastResolvedSource : sourceForDeferred, target);
                 HealthLog("activation-trace result target=0x" + target.ToInt64().ToString("X")
                     + " foreground=0x" + now.ToInt64().ToString("X") + " ok=" + ok
                     + " path=" + _lastFocusPath + " elapsed=" + activateMs);
@@ -2438,6 +2562,12 @@ namespace AppHopper
         // Set when the queue-restore SetFocus was deliberately skipped because
         // only the top-level frame was known; drives the legacy fallback.
         static bool _skippedFrameFocus;
+        // The window a protected-shell dismissal actually left in front, when
+        // that differs from the handle captured before the claim. The hand-over
+        // history must record the window the user was really in: a dismissed
+        // Start/Search surface is a CoreWindow that no session entry can match,
+        // so recording it would silently fall back to Z-order for slot 1.
+        static IntPtr _lastResolvedSource;
         // Which branch the focus decision took: "gti-child" (the target's own
         // focused child was readable and focus was restored to it),
         // "skip-frame" (nothing better than the frame was known, so focus was
@@ -2457,7 +2587,7 @@ namespace AppHopper
             if (!claimed)
             {
                 uint current = NativeMethods.GetCurrentThreadId();
-                uint source = NativeMethods.GetWindowThreadProcessId(NativeMethods.GetForegroundWindow(), IntPtr.Zero);
+                uint source = InputQueueThread(NativeMethods.GetForegroundWindow());
                 bool attached = source != 0 && source != current && NativeMethods.AttachThreadInput(current, source, true);
                 try
                 {
@@ -2469,8 +2599,37 @@ namespace AppHopper
                 }
                 finally { if (attached) NativeMethods.AttachThreadInput(current, source, false); }
             }
-            HealthLog("activation-trace panel claim requested=" + requested + " claimed=" + claimed);
+            bool staked = false;
+            if (!claimed)
+            {
+                // Nothing was joinable: take the other documented route, the
+                // "last input process" claim, and ask once more.
+                staked = StakeInputClaim();
+                requested = NativeMethods.SetForegroundWindow(panel);
+                claimed = NativeMethods.GetForegroundWindow() == panel;
+            }
+            HealthLog("activation-trace panel claim requested=" + requested + " claimed=" + claimed
+                + " staked=" + staked);
             return claimed;
+        }
+
+        // SetForegroundWindow is granted to the process that received the last
+        // input event as well as to the foreground process. When the
+        // foreground queue cannot be joined - a UWP frame thread refuses
+        // AttachThreadInput with ERROR_ACCESS_DENIED - this is the only lever
+        // left, and it is what v1.1.1 shipped for exactly this case.
+        // F24 is deliberate: no application binds it, it is part of no
+        // shortcut, and KeyInput tags it with ReplayInputTag so the low-level
+        // hook passes it straight through instead of swallowing it.
+        static bool StakeInputClaim()
+        {
+            var inputs = new NativeMethods.INPUT[]
+            {
+                KeyInput(0x87 /*VK_F24*/, false),
+                KeyInput(0x87 /*VK_F24*/, true),
+            };
+            return NativeMethods.SendInput((uint)inputs.Length, inputs,
+                Marshal.SizeOf(typeof(NativeMethods.INPUT))) == inputs.Length;
         }
 
         // Wait off the message-pump thread for a hung target.
@@ -2596,12 +2755,23 @@ namespace AppHopper
                             return;
                         }
                         if (!ready || _session || _committing || !_enabled || _exitRequested
-                            || NativeMethods.GetForegroundWindow() != source || !DeferredInputUnchanged(baseline)
+                            // Normalized: the panel claim and hide can hand the
+                            // foreground back as a different handle for the same
+                            // window (UWP frames vs their CoreWindow), which used
+                            // to cancel a perfectly valid deferred hand-over.
+                            || RepresentativeOf(NativeMethods.GetForegroundWindow()) != RepresentativeOf(source)
+                            || !DeferredInputUnchanged(baseline)
                             || !DeferredIdentityMatches(source, sourcePid, sourceTid, sourceStart)
                             || !DeferredIdentityMatches(target, targetPid, targetTid, targetStart))
                         {
                             CancelDeferredActivation();
-                            try { HealthLog("activation-deferred cancelled reason=not-ready-or-state ticket=" + ticket); } catch (Exception) { }
+                            try
+                            {
+                                HealthLog("activation-deferred cancelled reason=not-ready-or-state ticket=" + ticket
+                                    + " fg=0x" + NativeMethods.GetForegroundWindow().ToInt64().ToString("X")
+                                    + " expected=0x" + source.ToInt64().ToString("X"));
+                            }
+                            catch (Exception) { }
                             return;
                         }
                         CancelDeferredActivation();
@@ -2610,6 +2780,7 @@ namespace AppHopper
                         try
                         {
                             bool ok = ForceForeground(target);
+                            if (ok) RememberActivation(source, target);
                             HealthLog("activation-deferred completed ok=" + ok
                                 + " foreground=0x" + NativeMethods.GetForegroundWindow().ToInt64().ToString("X")
                                 + " elapsed=" + activate.ElapsedMilliseconds + " ticket=" + ticket);
@@ -2682,8 +2853,28 @@ namespace AppHopper
                 if (now != source && !IsProtectedShellSurface(now)) break;
             }
             source = NativeMethods.GetForegroundWindow();
-            fgThread = NativeMethods.GetWindowThreadProcessId(source, IntPtr.Zero);
+            fgThread = InputQueueThread(source);
             return source != IntPtr.Zero && !IsProtectedShellSurface(source);
+        }
+
+        // The queue that owns the foreground lock is the one that receives the
+        // user's input, and for a UWP app that is NOT GetForegroundWindow():
+        // that handle is the ApplicationFrameWindow, whose thread belongs to
+        // ApplicationFrameHost and refuses AttachThreadInput with
+        // ERROR_ACCESS_DENIED (measured 2026-11-12 on the Settings window:
+        // frame thread -> error 5, hosted CoreWindow thread -> joined). Joining
+        // the frame queue was why a switch away from Settings could not be
+        // performed at all: the claim never landed and every later step
+        // inherited the refusal.
+        static uint InputQueueThread(IntPtr foreground)
+        {
+            IntPtr queue = foreground;
+            if (foreground != IntPtr.Zero && ClassNameOf(foreground) == ClassAppFrame)
+            {
+                IntPtr core = UwpCoreWindowOf(foreground);
+                if (core != IntPtr.Zero && NativeMethods.IsWindow(core)) queue = core;
+            }
+            return queue == IntPtr.Zero ? 0 : NativeMethods.GetWindowThreadProcessId(queue, IntPtr.Zero);
         }
 
         static bool IsProtectedShellSurface(IntPtr hwnd)
@@ -2714,6 +2905,7 @@ namespace AppHopper
             _lastActivationFocus = IntPtr.Zero;
             _lastPostFocus = "?";
             _skippedFrameFocus = false;
+            _lastResolvedSource = IntPtr.Zero;
             _lastFocusPath = "?";
             if (!NativeMethods.IsWindow(hwnd)) return false;
             if (ForegroundIs(hwnd)) return true;
@@ -2743,7 +2935,7 @@ namespace AppHopper
                 if (core != IntPtr.Zero) inputSource = core;
             }
             WaitForForegroundNotification(inputSource, 50);
-            uint fgThread = NativeMethods.GetWindowThreadProcessId(NativeMethods.GetForegroundWindow(), IntPtr.Zero);
+            uint fgThread = InputQueueThread(NativeMethods.GetForegroundWindow());
             uint myThread = NativeMethods.GetCurrentThreadId();
             uint targetThread = NativeMethods.GetWindowThreadProcessId(hwnd, IntPtr.Zero);
             // Joining queues changes their shared focus, so the selected
@@ -2783,6 +2975,7 @@ namespace AppHopper
                 Log("  activation attach failed err=" + attachError);
                 if (attachError == 5 && DismissProtectedSource(ref source, ref fgThread))
                 {
+                    _lastResolvedSource = source;
                     joined = fgThread != 0 && fgThread != myThread
                         && NativeMethods.AttachThreadInput(myThread, fgThread, true);
                     HealthLog("activation-trace shell source dismissed"
@@ -2805,7 +2998,8 @@ namespace AppHopper
                 _lastFocusPath = "skip-frame";
                 NativeMethods.BringWindowToTop(hwnd);
                 bool requested = NativeMethods.SetForegroundWindow(hwnd);
-                HealthLog("activation-trace first request=" + requested + " sourceJoined=" + joined);
+                HealthLog("activation-trace first request=" + requested + " sourceJoined=" + joined
+                    + " queue=0x" + fgThread.ToString("X"));
             }
             finally
             {
@@ -2815,9 +3009,16 @@ namespace AppHopper
             // Fallback that used to run on every switch. Reached only when the
             // shell-like attempt was not enough, and logged so a fallback can
             // never be mistaken for the primary path working.
-            if (!ForegroundIs(hwnd) && targetThread != 0 && targetThread != myThread)
+            // The target side obeys the same queue rule as the source side: a
+            // UWP frame's own thread refuses the join with ERROR_ACCESS_DENIED
+            // (measured: Settings/Store frames), while the hosted CoreWindow's
+            // thread accepts it. Resolving it here keeps a UWP target on the
+            // deterministic path instead of falling through to the injected
+            // input claim.
+            uint targetQueue = targetThread != 0 ? InputQueueThread(hwnd) : 0;
+            if (!ForegroundIs(hwnd) && targetQueue != 0 && targetQueue != myThread)
             {
-                bool targetJoined = NativeMethods.AttachThreadInput(myThread, targetThread, true);
+                bool targetJoined = NativeMethods.AttachThreadInput(myThread, targetQueue, true);
                 if (!targetJoined)
                 {
                     HealthLog("activation-trace target attach failed error=" + Marshal.GetLastWin32Error());
@@ -2832,7 +3033,7 @@ namespace AppHopper
                 }
                 finally
                 {
-                    if (targetJoined) NativeMethods.AttachThreadInput(myThread, targetThread, false);
+                    if (targetJoined) NativeMethods.AttachThreadInput(myThread, targetQueue, false);
                 }
             }
 
@@ -2851,7 +3052,10 @@ namespace AppHopper
             {
                 _skippedFrameFocus = false;
                 _lastFocusPath = "retry-frame";
-                Log("  force-fg retry with SetFocus(frame); first attempt left fg elsewhere");
+                // SetFocus cannot move focus here: both attach/detach pairs have
+                // already returned, so no queue is joined. The retry that matters
+                // is BringWindowToTop + SetForegroundWindow; the log says so.
+                Log("  force-fg retry after a refused hand-over (frame focus unavailable; retrying SFW)");
                 NativeMethods.SetFocus(focus);
                 NativeMethods.BringWindowToTop(hwnd);
                 NativeMethods.SetForegroundWindow(hwnd);
@@ -2863,6 +3067,29 @@ namespace AppHopper
                 Application.DoEvents();
             }
 
+            // The last lever, and the one v1.1.1 relied on: a UWP foreground
+            // can leave nothing joinable, and then only the "last input
+            // process" route remains. One injected F24 makes this process that
+            // owner, after which the same request is granted. Skipped entirely
+            // on the normal path - it runs only after two refusals.
+            if (!ForegroundIs(hwnd))
+            {
+                bool staked = StakeInputClaim();
+                _lastFocusPath = "stake-input";
+                HealthLog("activation-trace stake input sent=" + staked);
+                Log("  force-fg claiming the input lock after a refused hand-over");
+                if (staked)
+                {
+                    NativeMethods.BringWindowToTop(hwnd);
+                    NativeMethods.SetForegroundWindow(hwnd);
+                    if (!ForegroundIs(hwnd) && sw.ElapsedMilliseconds < 500)
+                    {
+                        uint remaining = (uint)Math.Max(1L, 500L - sw.ElapsedMilliseconds);
+                        WaitForForegroundNotification(hwnd, remaining);
+                    }
+                    Application.DoEvents();
+                }
+            }
             if (ForegroundIs(hwnd))
             {
                 _lastPostFocus = "not-read";
@@ -3243,6 +3470,8 @@ namespace AppHopper
                             // unswallowed up would land in a window that never
                             // saw the press and could read it as a click.
                             _swallowMouseUp = true;
+                            _pendingCommitKey = _pageStart + slot < _apps.Count
+                                ? _apps[_pageStart + slot].Key : null;
                             PostAt(NativeMethods.WM_APP_COMMITAT, _pageStart + slot);
                             return (IntPtr)1;
                         }
@@ -4443,8 +4672,136 @@ namespace AppHopper
 
                 AppEntry pinned = new AppEntry { ReprHwnd = new IntPtr(1), Rank = 20, Topmost = false };
                 AppEntry topmost = new AppEntry { ReprHwnd = new IntPtr(2), Rank = 1, Topmost = true };
-                Check(Logic.AppSortKey(pinned, new IntPtr(1)) == -1, "pinned entry did not sort first");
+                Check(Logic.AppSortKey(pinned, new IntPtr(1)) < Logic.AppSortKey(topmost, new IntPtr(1)), "pinned entry did not sort first");
                 Check(Logic.AppSortKey(topmost, IntPtr.Zero) > Logic.AppSortKey(pinned, IntPtr.Zero), "topmost entry not demoted");
+            });
+
+            Test("a window the switcher activated outranks Z-order for slot 1", delegate
+            {
+                // Slot 1 must be the window the user just came from. Z-order is
+                // only a proxy: activating a shell-hosted UWP frame or hiding
+                // our own panel moves windows without a user activation, which
+                // is how "Alt+Tab once after Settings -> tern" landed on a third
+                // application (reported 2026-11-12). The activation history
+                // therefore sorts ahead of both the Z-order rank and the
+                // topmost offset.
+                AppEntry current = new AppEntry { ReprHwnd = new IntPtr(1), Rank = 0, Mru = 0 };
+                AppEntry previous = new AppEntry { ReprHwnd = new IntPtr(2), Rank = 90, Mru = 1, Topmost = false };
+                AppEntry zOrderLeader = new AppEntry { ReprHwnd = new IntPtr(3), Rank = 1, Topmost = false };
+                AppEntry topmost = new AppEntry { ReprHwnd = new IntPtr(4), Rank = 0, Topmost = true };
+                Check(Logic.AppSortKey(current, current.ReprHwnd) < Logic.AppSortKey(previous, current.ReprHwnd),
+                    "the pinned window must still sort first");
+                Check(Logic.AppSortKey(previous, current.ReprHwnd) < Logic.AppSortKey(zOrderLeader, current.ReprHwnd),
+                    "the previous window must outrank a higher Z-order window");
+                Check(Logic.AppSortKey(previous, current.ReprHwnd) < Logic.AppSortKey(topmost, current.ReprHwnd),
+                    "the previous window must outrank the topmost offset");
+                Check(Logic.AppSortKey(new AppEntry { ReprHwnd = new IntPtr(5), Rank = 0, Topmost = true }, current.ReprHwnd)
+                    > Logic.AppSortKey(new AppEntry { ReprHwnd = new IntPtr(6), Rank = 999, Topmost = false }, current.ReprHwnd),
+                    "without activation history the Z-order/topmost rule must be unchanged");
+            });
+
+            Test("activation history records exactly the hand-over", delegate
+            {
+                var saved = new List<IntPtr>(_mru);
+                try
+                {
+                    using (var left = new GroupingTestForm())
+                    using (var entered = new GroupingTestForm())
+                    {
+                        left.Show(); entered.Show(); Application.DoEvents();
+                        _mru.Clear();
+                        SeedOrResetMru(left.Handle);
+                        RememberActivation(left.Handle, entered.Handle);
+                        Check(_mru.Count == 2, "the hand-over did not record both windows");
+                        Check(_mru[0] == RepresentativeOf(entered.Handle), "the window entered is not first");
+                        Check(_mru[1] == RepresentativeOf(left.Handle), "the window left behind is not second");
+                        RememberActivation(left.Handle, entered.Handle);
+                        Check(_mru.Count == 2, "repeating the same hand-over duplicated history entries");
+                        SeedOrResetMru(entered.Handle);
+                        Check(_mru.Count == 2 && _mru[0] == RepresentativeOf(entered.Handle),
+                            "history was dropped although it still started at the foreground window");
+                        SeedOrResetMru(left.Handle);
+                        Check(_mru.Count == 1 && _mru[0] == RepresentativeOf(left.Handle),
+                            "history was not reset after the user switched outside the switcher");
+                    }
+                }
+                finally { _mru.Clear(); _mru.AddRange(saved); }
+            });
+
+            Test("activation history stays bounded", delegate
+            {
+                var saved = new List<IntPtr>(_mru);
+                try
+                {
+                    using (var newest = new GroupingTestForm())
+                    {
+                        newest.Show(); Application.DoEvents();
+                        _mru.Clear();
+                        // Filler handles are deliberately not windows: PushMru
+                        // must still keep the list bounded and put the real
+                        // window at the head.
+                        for (int i = 0; i < MruLimit + 5; i++) _mru.Add(new IntPtr(0x1000 + i));
+                        PushMru(newest.Handle);
+                        Check(_mru.Count == MruLimit, "history grew past its bound: " + _mru.Count);
+                        Check(_mru[0] == RepresentativeOf(newest.Handle), "the newest window is not at the head");
+                    }
+                }
+                finally { _mru.Clear(); _mru.AddRange(saved); }
+            });
+
+            Test("activation history compares normalized windows", delegate
+            {
+                var saved = new List<IntPtr>(_mru);
+                try
+                {
+                    using (var root = new GroupingTestForm())
+                    using (var popup = new GroupingTestForm())
+                    {
+                        root.Show(); popup.Owner = root; popup.Show(); Application.DoEvents();
+                        // The owner-chain walk collapses an owned popup and its
+                        // root onto one representative (whichever the chain
+                        // ends at); the reset compares exactly that.
+                        IntPtr head = RepresentativeOf(root.Handle);
+                        Check(head == RepresentativeOf(popup.Handle),
+                            "an owner-chain pair normalized to two different windows: 0x"
+                            + head.ToInt64().ToString("X") + " vs 0x"
+                            + RepresentativeOf(popup.Handle).ToInt64().ToString("X"));
+                        _mru.Clear(); _mru.Add(head);
+                        // StartSession hands the reset the NORMALIZED foreground,
+                        // so a popup foreground and a root head must compare as
+                        // the same window instead of clearing the history.
+                        SeedOrResetMru(RepresentativeOf(popup.Handle));
+                        Check(_mru.Count == 1 && _mru[0] == head,
+                            "an owned popup cleared a history that still described the same window");
+                    }
+                }
+                finally { _mru.Clear(); _mru.AddRange(saved); }
+            });
+
+            Test("the opening slot follows direction and pin state", delegate
+            {
+                Check(Logic.InitialIndex(4, false, true) == 1, "forward cycling did not open on slot 1");
+                Check(Logic.InitialIndex(4, true, true) == 3, "reverse cycling did not open on the last slot");
+                Check(Logic.InitialIndex(4, false, false) == 0, "an unidentified foreground did not open on slot 0");
+                Check(Logic.InitialIndex(1, false, true) == 0, "a one-app cycle did not preselect its only entry");
+            });
+
+            Test("a non-card foreground pins the application root", delegate
+            {
+                using (var root = new GroupingTestForm())
+                using (var dialog = new GroupingTestForm())
+                {
+                    root.Show(); dialog.Show(); Application.DoEvents();
+                    dialog.Owner = root;
+                    Application.DoEvents();
+                    Check(AltTabIneligibilityReason(dialog.Handle) == "owned-popup",
+                        "the fixture dialog is not excluded as an owned popup: " + AltTabIneligibilityReason(dialog.Handle));
+                    Check(EntryHandleForForeground(dialog.Handle) == root.Handle,
+                        "slot 0 was pinned to the dialog instead of the application root: 0x"
+                        + EntryHandleForForeground(dialog.Handle).ToInt64().ToString("X"));
+                    Check(EntryHandleForForeground(root.Handle) == root.Handle,
+                        "a presentable window was not used as its own slot-0 handle");
+                }
             });
 
             Test("panel is centred on the monitor the source window is on", delegate
