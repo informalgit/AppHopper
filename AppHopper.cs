@@ -5406,9 +5406,21 @@ namespace AppHopper
                 return;
             }
 
+            // A switcher sits idle ~99.9% of the time but must preempt
+            // background load the instant the user presses Alt+Tab. Under
+            // heavy system load (2026-11-21: 55% CPU, 1.5 GB free) every stage
+            // of the first paint inflated 10-100x and one invocation took
+            // 27 s; the stages grew proportionally, i.e. the process was
+            // starved and paged, not slow. High keeps the whole chain - hook
+            // callback, enumeration, render - schedulable during that burst
+            // and costs nothing while idle (event-driven, near-zero CPU).
+            try { Process.GetCurrentProcess().PriorityClass = ProcessPriorityClass.High; }
+            catch { }   // A denied raise degrades to Normal; read back at startup logging.
+
             _healthLogPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
                 "AppHopper", "apphopper-health.log");
-            HealthLog("AppHopper v" + AppVersion + " starting enabled=" + _enabled + " hook-recovery=1");
+            HealthLog("AppHopper v" + AppVersion + " starting enabled=" + _enabled + " hook-recovery=1"
+                + " priority=" + Process.GetCurrentProcess().PriorityClass);
             if (logRequested)
             {
                 try
