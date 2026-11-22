@@ -244,6 +244,16 @@ namespace AppHopper
         public static extern bool IsIconic(IntPtr hWnd);
         [DllImport("user32.dll")]
         public static extern bool SetForegroundWindow(IntPtr hWnd);
+        public delegate void WinEventProc(IntPtr hook, uint eventType, IntPtr hwnd, int objectId, int childId, uint threadId, uint eventTime);
+        public const uint EVENT_SYSTEM_FOREGROUND = 3;
+        public const uint WINEVENT_OUTOFCONTEXT = 0;
+        public const uint WINEVENT_SKIPOWNPROCESS = 2;
+        [DllImport("user32.dll", SetLastError = true)]
+        public static extern IntPtr SetWinEventHook(uint first, uint last, IntPtr module, WinEventProc callback, uint pid, uint thread, uint flags);
+        [DllImport("user32.dll")]
+        public static extern bool UnhookWinEvent(IntPtr hook);
+        [DllImport("user32.dll")]
+        public static extern uint MsgWaitForMultipleObjectsEx(uint count, IntPtr handles, uint milliseconds, uint wakeMask, uint flags);
         [DllImport("user32.dll", SetLastError = true)]
         public static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool attach);
         [DllImport("user32.dll")]
@@ -356,6 +366,19 @@ namespace AppHopper
         public static extern bool QueryFullProcessImageNameW(IntPtr hProcess, uint dwFlags, StringBuilder lpExeName, ref int lpdwSize);
         [DllImport("kernel32.dll", SetLastError = true)]
         public static extern bool CloseHandle(IntPtr hObject);
+        [DllImport("kernel32.dll", ExactSpelling = true, CharSet = CharSet.Unicode)]
+        public static extern int GetApplicationUserModelId(IntPtr process, ref uint length, StringBuilder appId);
+
+        [ComImport, Guid("45BA127D-10A8-46EA-8AB7-56EA9078943C")]
+        public class ApplicationActivationManagerClass { }
+
+        [ComImport, Guid("2E941141-7F97-4756-BA1D-9DECDE894A3D"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+        public interface IApplicationActivationManager
+        {
+            [PreserveSig]
+            int ActivateApplication([MarshalAs(UnmanagedType.LPWStr)] string appId,
+                [MarshalAs(UnmanagedType.LPWStr)] string arguments, uint options, out uint pid);
+        }
         [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
         public static extern IntPtr SHGetFileInfoW(string pszPath, uint dwFileAttributes, ref SHFILEINFOW psfi, uint cbFileInfo, uint uFlags);
 
@@ -600,16 +623,15 @@ namespace AppHopper
 
         static NativeMethods.IVirtualDesktopManager _vdm;
 
-        static bool OnCurrentDesktop(IntPtr hwnd)
+        static bool OnCurrentDesktop(IntPtr hwnd, bool fallback = true)
         {
             try
             {
-                if (_vdm == null) return true;
                 bool on;
-                if (_vdm.IsWindowOnCurrentVirtualDesktop(hwnd, out on) != 0) return true;
+                if (_vdm == null || _vdm.IsWindowOnCurrentVirtualDesktop(hwnd, out on) != 0) return fallback;
                 return on;
             }
-            catch { return true; }
+            catch { return fallback; }
         }
 
         // ================= theme / accent =================
@@ -1350,10 +1372,21 @@ namespace AppHopper
         static IntPtr EntryHandleForForeground(IntPtr fg)
         {
             if (fg == IntPtr.Zero) return IntPtr.Zero;
-            if (AltTabIneligibilityReason(fg) == null) return fg;
             IntPtr root = OwnerChainRoot(fg);
             if (root == IntPtr.Zero || root == fg) return fg;
+            if (AltTabIneligibilityReason(fg) == null) return fg;
             return AltTabIneligibilityReason(root) == null ? root : fg;
+        }
+
+        // Normalize a raw foreground window onto the handle that represents it
+        // in the switcher cycle (UWP frame, visible owned-popup representative,
+        // or the presentable owner-chain root for a modal dialog).
+        static IntPtr NormalizeForeground(IntPtr raw)
+        {
+            if (raw == IntPtr.Zero) return IntPtr.Zero;
+            IntPtr fg = RepresentativeOf(raw);
+            if (fg == IntPtr.Zero || !NativeMethods.IsWindowVisible(fg)) fg = raw;
+            return EntryHandleForForeground(fg);
         }
 
         static string GetWindowTitle(IntPtr hwnd)
@@ -1388,10 +1421,23 @@ namespace AppHopper
             return count == 1 ? found : IntPtr.Zero;
         }
 
-        static bool IsCloaked(IntPtr hwnd)
+        static int WindowCloak(IntPtr hwnd)
         {
-            int v;
-            return NativeMethods.DwmGetWindowAttribute(hwnd, 14 /*DWMWA_CLOAKED*/, out v, 4) == 0 && v != 0;
+            int cloak;
+            return NativeMethods.DwmGetWindowAttribute(hwnd, 14 /*DWMWA_CLOAKED*/, out cloak, 4) == 0 ? cloak : 0;
+        }
+
+        static bool IsCloaked(IntPtr hwnd) { return WindowCloak(hwnd) != 0; }
+
+        static bool HasDisqualifyingCloak(IntPtr hwnd)
+        {
+            int cloak = WindowCloak(hwnd);
+            if (cloak == 0) return false;
+            // A recent window may be marked shell-cloaked on this desktop (e.g. a
+            // suspended UWP replacement frame or a transient DWM shell cloak).
+            // An app-cloaked classic window is explicitly hidden by its app.
+            if (cloak != 2 /* DWM_CLOAKED_SHELL */ && ClassNameOf(hwnd) != ClassAppFrame) return true;
+            return !WasRecentlyForeground(hwnd) || !OnCurrentDesktop(hwnd, false);
         }
 
         // A layered window with alpha 0 is "visible" and uncloaked but shows
@@ -1486,14 +1532,7 @@ namespace AppHopper
             // rather than relying on the empty title it happens to have.
             if (cn == "#32769" || cn == "Progman" || cn == "WorkerW") return "desktop";
 
-            // Cloak rule (native/Hopper parity): any cloaked window is out.
-            // DWM_CLOAKED_SHELL (2) covers windows parked on other virtual
-            // desktops (Windows implements virtual desktops by cloaking);
-            // DWM_CLOAKED_APP (1) covers windows an app hid itself (suspended
-            // UWP helper windows, background UI). A suspended UWP app's frame
-            // itself stays uncloaked, so suspended apps remain listed - and
-            // activating one wakes it.
-            if (IsCloaked(hwnd)) return "cloaked";
+            if (HasDisqualifyingCloak(hwnd)) return "cloaked";
 
             // Fully transparent (opacity 0) - see IsAlphaInvisible. Same
             // user-visible effect as cloaked/invisible: nothing to show, no
@@ -1748,40 +1787,243 @@ namespace AppHopper
         }
 
         // ================= activation history =================
-        // Slot 1 of every session is meant to be the window the user just came
-        // from. Z-order cannot answer that reliably: activating a UWP app moves
-        // a shell-hosted ApplicationFrameWindow, and the panel claim/hide
-        // sequence moves the foreground too, so the window the user left can end
-        // up two slots down (reported 2026-11-12: Settings -> tern, then one
-        // Alt+Tab landed on another application). This list is written only
-        // where the switcher itself changed the foreground, and is reset as soon
-        // as the window in front is one it did not put there.
-        static readonly List<IntPtr> _mru = new List<IntPtr>();
-        const int MruLimit = 24;
-
-        static void PushMru(IntPtr hwnd)
+        struct ForegroundWindow
         {
-            if (hwnd == IntPtr.Zero || !NativeMethods.IsWindow(hwnd)) return;
-            IntPtr key = RepresentativeOf(hwnd);
-            if (key == IntPtr.Zero) key = hwnd;
-            _mru.Remove(key);
-            _mru.Insert(0, key);
+            public IntPtr Hwnd;
+            public uint Thread;
+            public uint Pid;
+            public string AppId;
+            public uint Tick;
+        }
+
+        static readonly List<ForegroundWindow> _mru = new List<ForegroundWindow>();
+        static ForegroundWindow _observedForeground;
+        static uint _ignoreForegroundThrough;
+        static IntPtr _foregroundHook;
+        static NativeMethods.WinEventProc _foregroundCallback;
+        const int MruLimit = 24;
+        const uint ShortRoundTripMs = 400;
+        const uint RecentlyForegroundMs = 5000;
+
+        static uint CurrentTick() { return unchecked((uint)Environment.TickCount); }
+
+        static string AppIdOfProcess(uint pid)
+        {
+            if (pid == 0) return null;
+            IntPtr process = NativeMethods.OpenProcess(NativeMethods.PROCESS_QUERY_LIMITED_INFORMATION, false, pid);
+            if (process == IntPtr.Zero) return null;
+            try
+            {
+                var appId = new StringBuilder(130);
+                uint length = (uint)appId.Capacity;
+                int result = NativeMethods.GetApplicationUserModelId(process, ref length, appId);
+                if (result == 122 && length > appId.Capacity && length <= 1024)
+                {
+                    appId.Capacity = (int)length;
+                    result = NativeMethods.GetApplicationUserModelId(process, ref length, appId);
+                }
+                return result == 0 && appId.Length != 0 ? appId.ToString() : null;
+            }
+            finally { NativeMethods.CloseHandle(process); }
+        }
+
+        static string UwpAppId(IntPtr frame)
+        {
+            if (frame == IntPtr.Zero || ClassNameOf(frame) != ClassAppFrame) return null;
+            IntPtr core = UwpCoreWindowOf(frame);
+            if (core != IntPtr.Zero)
+            {
+                uint pid;
+                NativeMethods.GetWindowThreadProcessId(core, out pid);
+                string id = AppIdOfProcess(pid);
+                if (id != null) return id;
+            }
+            uint hostPid;
+            NativeMethods.GetWindowThreadProcessId(frame, out hostPid);
+            string found = null;
+            NativeMethods.EnumChildWindows(frame, delegate(IntPtr child, IntPtr lp)
+            {
+                uint cpid;
+                NativeMethods.GetWindowThreadProcessId(child, out cpid);
+                if (cpid == 0 || cpid == hostPid) return true;
+                string id = AppIdOfProcess(cpid);
+                if (id != null) { found = id; return false; }
+                return true;
+            }, IntPtr.Zero);
+            return found;
+        }
+
+        static ForegroundWindow CaptureForeground(IntPtr hwnd, uint tick)
+        {
+            uint pid;
+            uint thread = NativeMethods.GetWindowThreadProcessId(hwnd, out pid);
+            if (thread == 0) return new ForegroundWindow();
+            return new ForegroundWindow { Hwnd = hwnd, Thread = thread, Pid = pid, AppId = UwpAppId(hwnd), Tick = tick };
+        }
+
+        static bool SameForegroundWindow(ForegroundWindow first, ForegroundWindow second)
+        {
+            return first.Hwnd == second.Hwnd && first.Thread == second.Thread && first.Pid == second.Pid;
+        }
+
+        static bool IsOriginalWindow(ForegroundWindow window)
+        {
+            uint pid;
+            uint thread = NativeMethods.GetWindowThreadProcessId(window.Hwnd, out pid);
+            return thread != 0 && thread == window.Thread && pid == window.Pid;
+        }
+
+        static void PushMru(ForegroundWindow window, uint tick)
+        {
+            if (window.Hwnd == IntPtr.Zero) return;
+            _mru.RemoveAll(entry => entry.Hwnd == window.Hwnd);
+            window.Tick = tick;
+            _mru.Insert(0, window);
             if (_mru.Count > MruLimit) _mru.RemoveRange(MruLimit, _mru.Count - MruLimit);
+        }
+
+        static void ObserveForeground(ForegroundWindow entered)
+        {
+            if (entered.Hwnd == IntPtr.Zero || SameForegroundWindow(entered, _observedForeground)) return;
+            // Only collapse a short round trip to the window that just lost
+            // foreground. A -> B -> C always records B, even for rapid clicks.
+            bool shortRoundTrip = _mru.Count > 0 && SameForegroundWindow(entered, _mru[0])
+                && unchecked(entered.Tick - _observedForeground.Tick) < ShortRoundTripMs;
+            if (!shortRoundTrip) PushMru(_observedForeground, entered.Tick);
+            _observedForeground = entered;
+        }
+
+        static void SyncForegroundMru(IntPtr foreground)
+        {
+            uint tick = CurrentTick();
+            ObserveForeground(CaptureForeground(foreground, tick));
+            PushMru(_observedForeground, tick);
         }
 
         static void RememberActivation(IntPtr source, IntPtr target)
         {
-            PushMru(source);
-            PushMru(target);
+            uint tick = CurrentTick();
+            IntPtr targetNorm = NormalizeForeground(target);
+            if (targetNorm == IntPtr.Zero) targetNorm = RepresentativeOf(target);
+            var entered = CaptureForeground(targetNorm, tick);
+            if (entered.Hwnd == IntPtr.Zero) return;
+            IntPtr sourceNorm = NormalizeForeground(source);
+            if (sourceNorm == IntPtr.Zero) sourceNorm = RepresentativeOf(source);
+            var left = CaptureForeground(sourceNorm, tick);
+            if (left.Hwnd == IntPtr.Zero && _mru.Count > 0 && _mru[0].Hwnd == source) left = _mru[0];
+            PushMru(left, tick);
+            PushMru(entered, tick);
+            _observedForeground = entered;
         }
 
-        // The history is only trusted while it starts at the window now in
-        // front: anything else in front means the user switched by a route the
-        // switcher did not take (a click, the native switcher, a restore), and
-        // Z-order is the better answer for slot 1 again.
-        static void SeedOrResetMru(IntPtr foreground)
+        static void HandleForegroundEvent(IntPtr hwnd, uint eventTime, bool ignoreOwn)
         {
-            if (_mru.Count == 0 || _mru[0] != foreground) { _mru.Clear(); _mru.Add(foreground); }
+            // OUTOFCONTEXT callbacks arrive on our UI thread. Use Windows'
+            // generation time to reject queued events from a finished hand-off.
+            if (hwnd == IntPtr.Zero || _session || _committing) return;
+            if (unchecked((int)(eventTime - _ignoreForegroundThrough)) <= 0) return;
+            try
+            {
+                if (ignoreOwn && IsOwnWindow(hwnd)) return;
+                IntPtr representative = NormalizeForeground(hwnd);
+                if (representative == IntPtr.Zero) return;
+                ObserveForeground(CaptureForeground(representative, eventTime));
+                _ignoreForegroundThrough = unchecked(eventTime - 1);
+            }
+            catch (Exception) { }  // never unwind the native callback
+        }
+
+        static void OnForegroundEvent(IntPtr hook, uint type, IntPtr hwnd, int objectId, int childId, uint threadId, uint eventTime)
+        {
+            if (objectId != 0 || childId != 0) return;
+            HandleForegroundEvent(hwnd, eventTime, true);
+        }
+
+        static void InstallForegroundHook()
+        {
+            _ignoreForegroundThrough = CurrentTick();
+            _foregroundCallback = OnForegroundEvent;
+            _foregroundHook = NativeMethods.SetWinEventHook(NativeMethods.EVENT_SYSTEM_FOREGROUND,
+                NativeMethods.EVENT_SYSTEM_FOREGROUND, IntPtr.Zero, _foregroundCallback, 0, 0,
+                NativeMethods.WINEVENT_OUTOFCONTEXT | NativeMethods.WINEVENT_SKIPOWNPROCESS);
+            int error = _foregroundHook == IntPtr.Zero ? Marshal.GetLastWin32Error() : 0;
+            HealthLog("foreground hook installed=" + (_foregroundHook != IntPtr.Zero) + " error=" + error);
+            IntPtr foreground = NativeMethods.GetForegroundWindow();
+            if (foreground != IntPtr.Zero && !IsOwnWindow(foreground))
+                SyncForegroundMru(NormalizeForeground(foreground));
+        }
+
+        static void FinishForegroundHandoff()
+        {
+            _ignoreForegroundThrough = CurrentTick();
+            _committing = false;
+        }
+
+        static bool WasRecentlyForeground(IntPtr hwnd)
+        {
+            return WasRecentlyForeground(hwnd, CurrentTick(), UwpAppId);
+        }
+
+        static bool WasRecentlyForeground(IntPtr hwnd, uint now, Func<IntPtr, string> appIdOf)
+        {
+            if (_observedForeground.Hwnd == hwnd && IsOriginalWindow(_observedForeground)) return true;
+            string appId = null;
+            bool checkedAppId = false;
+            if (_observedForeground.AppId != null && !IsOriginalWindow(_observedForeground)
+                && unchecked(now - _observedForeground.Tick) < RecentlyForegroundMs)
+            {
+                appId = appIdOf(hwnd);
+                checkedAppId = true;
+                if (String.Equals(_observedForeground.AppId, appId, StringComparison.OrdinalIgnoreCase)) return true;
+            }
+            foreach (var entry in _mru)
+            {
+                if (unchecked(now - entry.Tick) >= RecentlyForegroundMs) break;
+                if (entry.Hwnd == hwnd && IsOriginalWindow(entry)) return true;
+                if (entry.AppId == null || IsOriginalWindow(entry)) continue;
+                if (!checkedAppId) { appId = appIdOf(hwnd); checkedAppId = true; }
+                if (String.Equals(entry.AppId, appId, StringComparison.OrdinalIgnoreCase)) return true;
+            }
+            return false;
+        }
+
+        static void RankForegroundHistory(List<AppEntry> order)
+        {
+            RankForegroundHistory(order, UwpAppId);
+        }
+
+        static void RankForegroundHistory(List<AppEntry> order, Func<IntPtr, string> appIdOf)
+        {
+            if (_mru.Count == 0 || order.Count == 0) return;
+            Dictionary<IntPtr, string> appIds = null;
+            for (int i = 0; i < _mru.Count; i++)
+            {
+                var previous = _mru[i];
+                if (IsOriginalWindow(previous))
+                {
+                    var exact = order.Find(entry => entry.ReprHwnd == previous.Hwnd);
+                    if (exact != null && exact.Mru < 0) exact.Mru = i;
+                    continue;
+                }
+                if (previous.AppId == null) continue;
+                // An app ID can recover a recycled frame, but cannot identify
+                // a particular view when several windows share that app ID.
+                if (appIds == null) appIds = new Dictionary<IntPtr, string>();
+                AppEntry replacement = null;
+                foreach (var entry in order)
+                {
+                    string candidateId;
+                    if (!appIds.TryGetValue(entry.ReprHwnd, out candidateId))
+                    {
+                        candidateId = appIdOf(entry.ReprHwnd);
+                        appIds[entry.ReprHwnd] = candidateId;
+                    }
+                    if (!String.Equals(previous.AppId, candidateId, StringComparison.OrdinalIgnoreCase)) continue;
+                    if (replacement != null) { replacement = null; break; }
+                    replacement = entry;
+                }
+                if (replacement != null && replacement.Mru < 0) replacement.Mru = i;
+            }
         }
 
         // One entry per eligible top-level window, in raw Z-order. The current
@@ -1884,20 +2126,7 @@ namespace AppHopper
               }
               catch { return true; }   // skip this window; never throw across the callback boundary
             }, IntPtr.Zero);
-            // Mark the entries the switcher itself activated, most recent
-            // first. Entries it never activated keep Mru = -1 and fall back to
-            // their Z-order rank.
-            if (_mru.Count > 1)
-            {
-                var mruIndex = new Dictionary<IntPtr, int>(_mru.Count);
-                for (int i = 0; i < _mru.Count; i++)
-                    if (!mruIndex.ContainsKey(_mru[i])) mruIndex[_mru[i]] = i;
-                foreach (var e in order)
-                {
-                    int at;
-                    if (mruIndex.TryGetValue(e.ReprHwnd, out at)) e.Mru = at;
-                }
-            }
+            RankForegroundHistory(order);
             return order;
         }
 
@@ -1939,7 +2168,7 @@ namespace AppHopper
                     return;
                 }
             }
-            SeedOrResetMru(fg);
+            SyncForegroundMru(fg);
             _pendingCommitKey = null;   // a click from a previous session can never apply here
             // A fresh gesture supersedes any activation still waiting on a
             // previously unresponsive target. Without this the old request
@@ -2218,6 +2447,7 @@ namespace AppHopper
                 // A modal dialog disables its owner. The owner remains the
                 // grouped entry, but activation must go to its active dialog.
                 IntPtr sourceForDeferred = NativeMethods.GetForegroundWindow();
+                IntPtr historySource = _sessionForeground;
                 var inputBeforeHandoff = new NativeMethods.LASTINPUTINFO { cbSize = (uint)Marshal.SizeOf(typeof(NativeMethods.LASTINPUTINFO)) };
                 bool inputBeforeHandoffKnown = NativeMethods.GetLastInputInfo(ref inputBeforeHandoff);
                 IntPtr entryTarget = app.ReprHwnd;
@@ -2246,16 +2476,20 @@ namespace AppHopper
                 HealthLog("activation-trace commit target=0x" + target.ToInt64().ToString("X")
                     + " source=0x" + NativeMethods.GetForegroundWindow().ToInt64().ToString("X")
                     + " index=" + _index + " count=" + _apps.Count);
+                // Synchronize Alt-up with the real source before claiming the panel,
+                // then keep the claimed panel alive until foreground is handed directly
+                // to the target. Hiding a foreground panel makes Windows reactivate the
+                // old source in between, causing flicker and letting a slow-activating
+                // source (e.g. WebView2/Wails) land after the target and steal focus back.
+                SyncInputSource(sourceForDeferred);
                 ClaimForegroundForHandoff();
-                // Like Window Hopper, hide the non-activating overlay first.
-                HideOverlay();
                 var activateWatch = Stopwatch.StartNew();
                 bool ok = ForceForeground(target);
                 bool deferred = _lastActivationDeferred;
                 // A dialog can close or be replaced while the handoff is in
                 // progress. Resolve the original entry once more before
                 // giving up, so a stale popup does not lose the switch.
-                if (!ok && !deferred && NativeMethods.IsWindow(entryTarget))
+                if (!ok && !deferred && !_shellActivationRequested && NativeMethods.IsWindow(entryTarget))
                 {
                     IntPtr retryTarget = ResolveActivationTarget(entryTarget);
                     if (retryTarget != target && NativeMethods.IsWindow(retryTarget))
@@ -2267,8 +2501,18 @@ namespace AppHopper
                         deferred = _lastActivationDeferred;
                     }
                 }
+                HideOverlay();
                 if (!ok && !deferred) ok = ForegroundIs(target);   // FF's verdict can lag the real foreground; trust the latter
-                if (!ok && !deferred) ok = WaitForForegroundLanding(target);   // see below: fg==0 is a transition, not a failure
+                if (!ok && !deferred && _shellWakeAppId != null)
+                {
+                    IntPtr landed;
+                    if (UwpForegroundLanded(target, _shellWakeAppId, out landed))
+                    {
+                        _landedUwpFrame = landed;
+                        ok = true;
+                    }
+                }
+                if (!ok && !deferred && !_shellActivationRequested) ok = WaitForForegroundLanding(target);   // see below: fg==0 is a transition, not a failure
                 // Measured AFTER the landing check, so the number in the log
                 // is the whole hand-over the user waited through, not just the
                 // part inside ForceForeground.
@@ -2279,6 +2523,8 @@ namespace AppHopper
                 EndSession(keepHandoffMouseHook);
                 if (deferred)
                 {
+                    if (IsOwnWindow(NativeMethods.GetForegroundWindow()) && NativeMethods.IsWindow(sourceForDeferred))
+                        NativeMethods.SetForegroundWindow(sourceForDeferred);
                     if (keepHandoffMouseHook)
                         QueueDeferredActivation(target, sourceForDeferred, inputBeforeHandoff.dwTime);
                     else HealthLog(inputBeforeHandoffKnown
@@ -2292,7 +2538,7 @@ namespace AppHopper
                 // be left alone - restoring there used to cancel an activation
                 // that was still landing.
                 IntPtr fgAfter = NativeMethods.GetForegroundWindow();
-                if (!ok && !deferred && IsOwnWindow(fgAfter) && NativeMethods.IsWindow(sourceForDeferred))
+                if (!ok && !deferred && !_shellActivationRequested && IsOwnWindow(fgAfter) && NativeMethods.IsWindow(sourceForDeferred))
                 {
                     HealthLog("activation-trace restoring source after failed hand-over fg=0x"
                         + fgAfter.ToInt64().ToString("X"));
@@ -2303,7 +2549,8 @@ namespace AppHopper
                 // can vouch for. A deferred request (deferred == true) is
                 // recorded by the worker that performs it.
                 if (ok && !deferred)
-                    RememberActivation(_lastResolvedSource != IntPtr.Zero ? _lastResolvedSource : sourceForDeferred, target);
+                    RememberActivation(_lastResolvedSource != IntPtr.Zero ? _lastResolvedSource : historySource,
+                        _landedUwpFrame != IntPtr.Zero ? _landedUwpFrame : target);
                 HealthLog("activation-trace result target=0x" + target.ToInt64().ToString("X")
                     + " foreground=0x" + now.ToInt64().ToString("X") + " ok=" + ok
                     + " path=" + _lastFocusPath + " elapsed=" + activateMs);
@@ -2321,7 +2568,7 @@ namespace AppHopper
             finally
             {
                 if (!_session && !_deferredPending) UninstallMouseHook();
-                _committing = false;
+                FinishForegroundHandoff();
                 // Replay a Tab the hook swallowed while this commit was in
                 // flight. Posted, not called, so the pump runs it only after
                 // this frame is fully unwound.
@@ -2391,7 +2638,7 @@ namespace AppHopper
                 EndSession();
                 Log("cancel");
             }
-            finally { _committing = false; }
+            finally { FinishForegroundHandoff(); }
         }
 
 
@@ -2428,7 +2675,7 @@ namespace AppHopper
                 EndSession();
                 Log("session aborted: no windows left");
             }
-            finally { _committing = false; }
+            finally { FinishForegroundHandoff(); }
         }
 
         // ================= live refresh =================
@@ -2444,7 +2691,7 @@ namespace AppHopper
             for (int i = 0; i < _apps.Count; i++)
             {
                 IntPtr h = _apps[i].ReprHwnd;
-                if (!NativeMethods.IsWindow(h) || !NativeMethods.IsWindowVisible(h) || IsCloaked(h))
+                if (!NativeMethods.IsWindow(h) || !NativeMethods.IsWindowVisible(h) || HasDisqualifyingCloak(h))
                 {
                     Log("refresh: entry \"" + LogText(_apps[i].Title) + "\" is gone");
                     RefreshEntries();
@@ -2795,7 +3042,9 @@ namespace AppHopper
                         try
                         {
                             bool ok = ForceForeground(target);
-                            if (ok) RememberActivation(source, target);
+                            if (ok)
+                                RememberActivation(_lastResolvedSource != IntPtr.Zero ? _lastResolvedSource : source,
+                                    _landedUwpFrame != IntPtr.Zero ? _landedUwpFrame : target);
                             HealthLog("activation-deferred completed ok=" + ok
                                 + " foreground=0x" + NativeMethods.GetForegroundWindow().ToInt64().ToString("X")
                                 + " elapsed=" + activate.ElapsedMilliseconds + " ticket=" + ticket);
@@ -2803,7 +3052,7 @@ namespace AppHopper
                         catch (Exception ex) { HealthLog("activation-deferred failed=" + ex.GetType().Name + " ticket=" + ticket); }
                         finally
                         {
-                            _committing = false;
+                            FinishForegroundHandoff();
                             if (_pendingStart)
                             {
                                 _pendingStart = false;
@@ -2912,11 +3161,129 @@ namespace AppHopper
             catch { return false; }
         }
 
+        static bool _shellActivationRequested;
+        static string _shellWakeAppId;
+        static IntPtr _landedUwpFrame;
+
+        static bool TryRequestUwpActivation(IntPtr target, out string appId)
+        {
+            appId = UwpAppId(target);
+            if (appId == null) return false;
+            string requestedId = appId;
+            bool ambiguous = false;
+            NativeMethods.EnumWindows(delegate(IntPtr window, IntPtr unused)
+            {
+                if (window == target || !NativeMethods.IsWindowVisible(window)) return true;
+                if (ClassNameOf(window) != ClassAppFrame || IsCloaked(window) || !OnCurrentDesktop(window, true)) return true;
+                if (!String.Equals(requestedId, UwpAppId(window), StringComparison.OrdinalIgnoreCase)) return true;
+                ambiguous = true;
+                return false;
+            }, IntPtr.Zero);
+            if (ambiguous) return false;
+
+            NativeMethods.IApplicationActivationManager manager = null;
+            try
+            {
+                manager = (NativeMethods.IApplicationActivationManager)new NativeMethods.ApplicationActivationManagerClass();
+                uint pid;
+                int result = manager.ActivateApplication(appId, null, 0, out pid);
+                HealthLog("activation-trace shell wake hr=0x" + result.ToString("X8"));
+                return result >= 0;
+            }
+            catch (COMException ex)
+            {
+                HealthLog("activation-trace shell wake failed hr=0x" + ex.ErrorCode.ToString("X8"));
+                return false;
+            }
+            catch (Exception ex)
+            {
+                HealthLog("activation-trace shell wake failed ex=" + ex.GetType().Name);
+                return false;
+            }
+            finally
+            {
+                if (manager != null) try { Marshal.ReleaseComObject(manager); } catch { }
+            }
+        }
+
+        static bool UwpForegroundLanded(IntPtr target, string appId, out IntPtr landedFrame)
+        {
+            if (ForegroundIs(target)) { landedFrame = target; return true; }
+            IntPtr now = NativeMethods.GetForegroundWindow();
+            if (now != IntPtr.Zero && !IsOwnWindow(now))
+            {
+                IntPtr frame = NormalizeForeground(now);
+                if (frame != IntPtr.Zero && String.Equals(appId, UwpAppId(frame), StringComparison.OrdinalIgnoreCase))
+                {
+                    landedFrame = frame;
+                    return true;
+                }
+            }
+            landedFrame = IntPtr.Zero;
+            return false;
+        }
+
+        static bool TryWakeUwp(IntPtr target)
+        {
+            string appId;
+            if (!TryRequestUwpActivation(target, out appId)) return false;
+
+            // A shell launch can finish after ActivateApplication returns and
+            // may replace a suspended frame handle while doing so. Wait briefly
+            // and accept either the original handle or a recycled frame for
+            // the same AUMID.
+            _shellActivationRequested = true;
+            _shellWakeAppId = appId;
+            _lastFocusPath = "uwp-shell";
+            const uint QS_ALLINPUT = 0x04FF;
+            const uint MWMO_INPUTAVAILABLE = 4;
+            var wait = Stopwatch.StartNew();
+            do
+            {
+                IntPtr landed;
+                if (UwpForegroundLanded(target, appId, out landed))
+                {
+                    _landedUwpFrame = landed;
+                    return true;
+                }
+
+                long remaining = 600 - wait.ElapsedMilliseconds;
+                if (remaining <= 0)
+                {
+                    if (UwpForegroundLanded(target, appId, out landed)) { _landedUwpFrame = landed; return true; }
+                    return false;
+                }
+                uint result = NativeMethods.MsgWaitForMultipleObjectsEx(0, IntPtr.Zero, (uint)remaining,
+                    QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+                if (result != 0)
+                {
+                    if (UwpForegroundLanded(target, appId, out landed)) { _landedUwpFrame = landed; return true; }
+                    return false;
+                }
+                Application.DoEvents();
+            } while (true);
+        }
+
+        static void SyncInputSource(IntPtr source)
+        {
+            if (source == IntPtr.Zero) return;
+            IntPtr inputSource = source;
+            if (ClassNameOf(source) == ClassAppFrame)
+            {
+                IntPtr core = UwpCoreWindowOf(source);
+                if (core != IntPtr.Zero) inputSource = core;
+            }
+            WaitForForegroundNotification(inputSource, 50);
+        }
+
         static bool ForceForeground(IntPtr hwnd)
         {
             // Cleared up front so an early return cannot report the previous
             // switch's activation focus as if it belonged to this one.
             _lastActivationDeferred = false;
+            _shellActivationRequested = false;
+            _shellWakeAppId = null;
+            _landedUwpFrame = IntPtr.Zero;
             _lastActivationFocus = IntPtr.Zero;
             _lastPostFocus = "?";
             _skippedFrameFocus = false;
@@ -2941,15 +3308,10 @@ namespace AppHopper
             }
 
             IntPtr source = NativeMethods.GetForegroundWindow();
-            // Commit is posted by the input hook. Synchronize with the source
-            // before transferring foreground so it can process the Alt release.
-            IntPtr inputSource = source;
-            if (ClassNameOf(source) == ClassAppFrame)
-            {
-                IntPtr core = UwpCoreWindowOf(source);
-                if (core != IntPtr.Zero) inputSource = core;
-            }
-            WaitForForegroundNotification(inputSource, 50);
+            // Commit already synced the pre-claim source before ClaimForegroundForHandoff.
+            // Deferred activations enter ForceForeground directly while a foreign source
+            // is still in front, so synchronize when foreground is not one of our windows.
+            if (!IsOwnWindow(source)) SyncInputSource(source);
             uint fgThread = InputQueueThread(NativeMethods.GetForegroundWindow());
             uint myThread = NativeMethods.GetCurrentThreadId();
             uint targetThread = NativeMethods.GetWindowThreadProcessId(hwnd, IntPtr.Zero);
@@ -2964,8 +3326,22 @@ namespace AppHopper
             // frame was the harmful case anyway - it stripped the control the
             // user was typing in and ended live TSF composition.
             IntPtr focus = hwnd;
+            bool isUwpFrame = ClassNameOf(hwnd) == ClassAppFrame;
+            bool wakeAttempted = false;
+            if (isUwpFrame && IsCloaked(hwnd))
+            {
+                wakeAttempted = true;
+                if (TryWakeUwp(hwnd)) return true;
+                if (_shellActivationRequested && (!NativeMethods.IsWindow(hwnd) || IsCloaked(hwnd))) return false;
+            }
             if (!WaitForForegroundNotification(hwnd, 50) && targetThread != 0 && NativeMethods.IsWindow(hwnd))
             {
+                if (isUwpFrame && !wakeAttempted)
+                {
+                    wakeAttempted = true;
+                    if (TryWakeUwp(hwnd)) return true;
+                    if (_shellActivationRequested) return false;
+                }
                 _lastActivationDeferred = true;
                 _lastFocusPath = "deferred-unresponsive";
                 return false;
@@ -3080,6 +3456,13 @@ namespace AppHopper
                     WaitForForegroundNotification(hwnd, remaining);
                 }
                 Application.DoEvents();
+            }
+
+            if (isUwpFrame && !wakeAttempted && !ForegroundIs(hwnd))
+            {
+                wakeAttempted = true;
+                if (TryWakeUwp(hwnd)) return true;
+                if (!NativeMethods.IsWindow(hwnd) || IsCloaked(hwnd)) return false;
             }
 
             // The last lever, and the one v1.1.1 relied on: a UWP foreground
@@ -4717,7 +5100,8 @@ namespace AppHopper
 
             Test("activation history records exactly the hand-over", delegate
             {
-                var saved = new List<IntPtr>(_mru);
+                var saved = new List<ForegroundWindow>(_mru);
+                var savedObserved = _observedForeground;
                 try
                 {
                     using (var left = new GroupingTestForm())
@@ -4725,27 +5109,66 @@ namespace AppHopper
                     {
                         left.Show(); entered.Show(); Application.DoEvents();
                         _mru.Clear();
-                        SeedOrResetMru(left.Handle);
+                        _observedForeground = new ForegroundWindow();
+                        SyncForegroundMru(left.Handle);
                         RememberActivation(left.Handle, entered.Handle);
                         Check(_mru.Count == 2, "the hand-over did not record both windows");
-                        Check(_mru[0] == RepresentativeOf(entered.Handle), "the window entered is not first");
-                        Check(_mru[1] == RepresentativeOf(left.Handle), "the window left behind is not second");
+                        Check(_mru[0].Hwnd == RepresentativeOf(entered.Handle), "the window entered is not first");
+                        Check(_mru[1].Hwnd == RepresentativeOf(left.Handle), "the window left behind is not second");
                         RememberActivation(left.Handle, entered.Handle);
                         Check(_mru.Count == 2, "repeating the same hand-over duplicated history entries");
-                        SeedOrResetMru(entered.Handle);
-                        Check(_mru.Count == 2 && _mru[0] == RepresentativeOf(entered.Handle),
+                        SyncForegroundMru(entered.Handle);
+                        Check(_mru.Count == 2 && _mru[0].Hwnd == RepresentativeOf(entered.Handle),
                             "history was dropped although it still started at the foreground window");
-                        SeedOrResetMru(left.Handle);
-                        Check(_mru.Count == 1 && _mru[0] == RepresentativeOf(left.Handle),
-                            "history was not reset after the user switched outside the switcher");
+                        SyncForegroundMru(left.Handle);
+                        Check(_mru.Count == 2 && _mru[0].Hwnd == RepresentativeOf(left.Handle)
+                            && _mru[1].Hwnd == RepresentativeOf(entered.Handle),
+                            "a mouse-driven foreground change lost the previous window");
                     }
                 }
-                finally { _mru.Clear(); _mru.AddRange(saved); }
+                finally { _mru.Clear(); _mru.AddRange(saved); _observedForeground = savedObserved; }
+            });
+
+            Test("foreground history preserves rapid switches and ignores brief round trips", delegate
+            {
+                var saved = new List<ForegroundWindow>(_mru);
+                var savedObserved = _observedForeground;
+                try
+                {
+                    var first = new ForegroundWindow { Hwnd = new IntPtr(1), Pid = 1, Thread = 1, Tick = 100 };
+                    var second = new ForegroundWindow { Hwnd = new IntPtr(2), Pid = 2, Thread = 2, Tick = 150 };
+                    var third = new ForegroundWindow { Hwnd = new IntPtr(3), Pid = 3, Thread = 3, Tick = 200 };
+                    _mru.Clear();
+                    _observedForeground = first;
+                    ObserveForeground(second);
+                    ObserveForeground(third);
+                    Check(_mru.Count == 2 && _mru[0].Hwnd == second.Hwnd,
+                        "a rapid switch through a third window lost the previous selection");
+
+                    _mru.Clear();
+                    _observedForeground = first;
+                    ObserveForeground(second);
+                    first.Tick = 200;
+                    ObserveForeground(first);
+                    Check(_mru.Count == 1 && _mru[0].Hwnd == first.Hwnd,
+                        "a brief return to the same window recorded the interruption");
+
+                    _mru.Clear();
+                    _observedForeground = first;
+                    second.Tick = 250;
+                    ObserveForeground(second);
+                    first.Tick = 1500;
+                    ObserveForeground(first);
+                    Check(_mru.Count == 2 && _mru[0].Hwnd == second.Hwnd,
+                        "a longer real stay was discarded when its events were processed together");
+                }
+                finally { _mru.Clear(); _mru.AddRange(saved); _observedForeground = savedObserved; }
             });
 
             Test("activation history stays bounded", delegate
             {
-                var saved = new List<IntPtr>(_mru);
+                var saved = new List<ForegroundWindow>(_mru);
+                var savedObserved = _observedForeground;
                 try
                 {
                     using (var newest = new GroupingTestForm())
@@ -4755,18 +5178,19 @@ namespace AppHopper
                         // Filler handles are deliberately not windows: PushMru
                         // must still keep the list bounded and put the real
                         // window at the head.
-                        for (int i = 0; i < MruLimit + 5; i++) _mru.Add(new IntPtr(0x1000 + i));
-                        PushMru(newest.Handle);
+                        for (int i = 0; i < MruLimit + 5; i++) _mru.Add(new ForegroundWindow { Hwnd = new IntPtr(0x1000 + i) });
+                        PushMru(CaptureForeground(newest.Handle, 100), 100);
                         Check(_mru.Count == MruLimit, "history grew past its bound: " + _mru.Count);
-                        Check(_mru[0] == RepresentativeOf(newest.Handle), "the newest window is not at the head");
+                        Check(_mru[0].Hwnd == RepresentativeOf(newest.Handle), "the newest window is not at the head");
                     }
                 }
-                finally { _mru.Clear(); _mru.AddRange(saved); }
+                finally { _mru.Clear(); _mru.AddRange(saved); _observedForeground = savedObserved; }
             });
 
             Test("activation history compares normalized windows", delegate
             {
-                var saved = new List<IntPtr>(_mru);
+                var saved = new List<ForegroundWindow>(_mru);
+                var savedObserved = _observedForeground;
                 try
                 {
                     using (var root = new GroupingTestForm())
@@ -4781,16 +5205,144 @@ namespace AppHopper
                             "an owner-chain pair normalized to two different windows: 0x"
                             + head.ToInt64().ToString("X") + " vs 0x"
                             + RepresentativeOf(popup.Handle).ToInt64().ToString("X"));
-                        _mru.Clear(); _mru.Add(head);
-                        // StartSession hands the reset the NORMALIZED foreground,
-                        // so a popup foreground and a root head must compare as
-                        // the same window instead of clearing the history.
-                        SeedOrResetMru(RepresentativeOf(popup.Handle));
-                        Check(_mru.Count == 1 && _mru[0] == head,
+                        _mru.Clear();
+                        _observedForeground = new ForegroundWindow();
+                        SyncForegroundMru(head);
+                        SyncForegroundMru(RepresentativeOf(popup.Handle));
+                        Check(_mru.Count == 1 && _mru[0].Hwnd == head,
                             "an owned popup cleared a history that still described the same window");
                     }
                 }
+                finally { _mru.Clear(); _mru.AddRange(saved); _observedForeground = savedObserved; }
+            });
+
+            Test("recycled UWP frame inherits dead history slot uniquely", delegate
+            {
+                var saved = new List<ForegroundWindow>(_mru);
+                try
+                {
+                    using (var live = new GroupingTestForm())
+                    {
+                        live.Show(); Application.DoEvents();
+                        var liveEntry = CaptureForeground(live.Handle, 100);
+
+                        _mru.Clear();
+                        _mru.Add(new ForegroundWindow { Hwnd = new IntPtr(0xDEAD), Pid = 111, Thread = 222, AppId = "App!WinOTP", Tick = 90 });
+                        var recycled = new AppEntry { ReprHwnd = new IntPtr(0x2222), Key = "uwp-new" };
+                        var unrelated = new AppEntry { ReprHwnd = live.Handle, Key = "live" };
+                        var order = new List<AppEntry> { recycled, unrelated };
+                        RankForegroundHistory(order, h => h == recycled.ReprHwnd ? "App!WinOTP" : null);
+                        Check(recycled.Mru == 0, "recycled UWP frame did not inherit the dead history slot");
+                        Check(unrelated.Mru == -1, "unrelated window matched the dead UWP identity");
+
+                        // Live exact match outranks repaired slot when placed ahead in history.
+                        recycled.Mru = -1;
+                        _mru.Insert(0, liveEntry);
+                        RankForegroundHistory(order, h => h == recycled.ReprHwnd ? "App!WinOTP" : null);
+                        Check(unrelated.Mru == 0 && recycled.Mru == 1, "live handle did not keep priority over recycled repair");
+
+                        // Ambiguous multi-window UWP app must not guess a slot.
+                        var secondView = new AppEntry { ReprHwnd = new IntPtr(0x3333), Key = "uwp-second" };
+                        recycled.Mru = -1; unrelated.Mru = -1;
+                        var multi = new List<AppEntry> { recycled, secondView };
+                        RankForegroundHistory(multi, h => (h == recycled.ReprHwnd || h == secondView.ReprHwnd) ? "App!WinOTP" : null);
+                        Check(recycled.Mru == -1 && secondView.Mru == -1, "ambiguous UWP app ID claimed a slot");
+                    }
+                }
                 finally { _mru.Clear(); _mru.AddRange(saved); }
+            });
+
+            Test("recent foreground cloak exemption expires and respects identity", delegate
+            {
+                var saved = new List<ForegroundWindow>(_mru);
+                var savedObserved = _observedForeground;
+                try
+                {
+                    using (var live = new GroupingTestForm())
+                    {
+                        live.Show(); Application.DoEvents();
+                        var liveEntry = CaptureForeground(live.Handle, 1000);
+                        liveEntry.AppId = "App!Live";
+
+                        _mru.Clear();
+                        _observedForeground = liveEntry;
+                        Check(WasRecentlyForeground(live.Handle, 1200, h => null),
+                            "current foreground was not exempt");
+                        Check(!WasRecentlyForeground(new IntPtr(0x9999), 1200, h => "App!Live"),
+                            "another window of a live UWP app was wrongly exempt");
+
+                        _observedForeground = new ForegroundWindow { Hwnd = new IntPtr(0xDEAD1), Pid = 1, Thread = 1, AppId = "App!Dead", Tick = 1000 };
+                        Check(WasRecentlyForeground(new IntPtr(0x8888), 2000, h => h == (IntPtr)0x8888 ? "App!Dead" : null),
+                            "recycled frame of recently foreground UWP was not exempt");
+                        Check(!WasRecentlyForeground(new IntPtr(0x8888), 1000 + RecentlyForegroundMs, h => "App!Dead"),
+                            "expired UWP entry stayed exempt");
+
+                        _observedForeground = new ForegroundWindow();
+                        _mru.Add(new ForegroundWindow { Hwnd = live.Handle, Pid = liveEntry.Pid, Thread = liveEntry.Thread, Tick = 1000 });
+                        Check(WasRecentlyForeground(live.Handle, 1000 + RecentlyForegroundMs - 1, h => null),
+                            "fresh MRU window was not exempt");
+                        Check(!WasRecentlyForeground(live.Handle, 1000 + RecentlyForegroundMs, h => null),
+                            "expired MRU window stayed exempt");
+                    }
+                }
+                finally { _mru.Clear(); _mru.AddRange(saved); _observedForeground = savedObserved; }
+            });
+
+            Test("foreground event watermark drops stale post-handoff callbacks", delegate
+            {
+                var saved = new List<ForegroundWindow>(_mru);
+                var savedObserved = _observedForeground;
+                var savedSession = _session;
+                var savedCommitting = _committing;
+                var savedIgnore = _ignoreForegroundThrough;
+                try
+                {
+                    using (var a = new GroupingTestForm())
+                    using (var b = new GroupingTestForm())
+                    {
+                        a.Show(); b.Show(); Application.DoEvents();
+                        _mru.Clear();
+                        _session = false;
+                        _committing = true;
+                        _observedForeground = CaptureForeground(a.Handle, 100);
+                        _ignoreForegroundThrough = 500;
+                        HandleForegroundEvent(b.Handle, 600, false);
+                        Check(_observedForeground.Hwnd == a.Handle, "callback mutated history while committing");
+
+                        _committing = false;
+                        HandleForegroundEvent(b.Handle, 500, false);
+                        Check(_observedForeground.Hwnd == a.Handle, "stale event at or before watermark was not dropped");
+
+                        HandleForegroundEvent(b.Handle, 501, false);
+                        Check(_observedForeground.Hwnd == RepresentativeOf(b.Handle), "post-watermark event was dropped");
+
+                        _session = true;
+                        HandleForegroundEvent(a.Handle, 700, false);
+                        Check(_observedForeground.Hwnd == RepresentativeOf(b.Handle), "callback mutated history while session was open");
+                    }
+                }
+                finally
+                {
+                    _mru.Clear(); _mru.AddRange(saved); _observedForeground = savedObserved;
+                    _session = savedSession; _committing = savedCommitting; _ignoreForegroundThrough = savedIgnore;
+                }
+            });
+
+            Test("foreground normalization handles hidden owner with visible popup", delegate
+            {
+                using (var owner = new GroupingTestForm())
+                using (var popup = new GroupingTestForm())
+                {
+                    owner.Show();
+                    popup.Owner = owner;
+                    popup.Show();
+                    Application.DoEvents();
+                    owner.Hide();
+                    Application.DoEvents();
+                    IntPtr normalized = NormalizeForeground(popup.Handle);
+                    Check(normalized == popup.Handle,
+                        "hidden owner + visible popup normalized to 0x" + normalized.ToInt64().ToString("X"));
+                }
             });
 
             Test("the opening slot follows direction and pin state", delegate
@@ -5460,6 +6012,7 @@ namespace AppHopper
             _hookProc = KbHookProc;
             _mouseHookProc = MouseHookProc;
             InstallKeyboardHook("startup");
+            InstallForegroundHook();
             // A silently missing hook leaves the app looking alive but doing
             // nothing, and the failure is invisible from the outside - the
             // user just sees the OS switcher instead. Record it either way.
@@ -5573,6 +6126,12 @@ namespace AppHopper
 
             Application.Run();
 
+            if (_foregroundHook != IntPtr.Zero)
+            {
+                try { NativeMethods.UnhookWinEvent(_foregroundHook); } catch { }
+                _foregroundHook = IntPtr.Zero;
+                _foregroundCallback = null;
+            }
             _hookHealthTimer.Dispose();
             sessionWatchdog.Dispose();
             if (_iconRefreshTimer != null) _iconRefreshTimer.Dispose();
