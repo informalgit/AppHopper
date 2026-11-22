@@ -652,10 +652,14 @@ namespace AppHopper
         static Color FocusShadowC(bool light) { return light ? Color.FromArgb(120, 255, 255, 255) : Color.FromArgb(150, 0, 0, 0); }
 
         // ================= tray icon =================
-        // Drawn at runtime so it follows the OS accent color (same source the
-        // panel's focus ring uses) instead of shipping a .ico asset - keeps the
-        // build single-file and zero-dependency. Redrawn on Personal preference
-        // changes, so a live accent switch recolors the tray too.
+        // Drawn at runtime so the build stays single-file and zero-dependency
+        // (no .ico asset shipped). Colors are a fixed brand palette, not the
+        // OS accent: a #F7630C orange plate (from the Windows system accent
+        // palette) with white window cards, readable on light and dark
+        // taskbars alike. The composition is the window switcher's own visual
+        // language - filled front card lower-left, outlined back card
+        // upper-right - the same two-window mark as Windows Task View and
+        // AltTab macOS.
         static Icon _trayIcon;   // NotifyIcon does not own its Icon; keep this alive or the HICON gets finalized away
 
         static Icon MakeTrayIcon()
@@ -669,44 +673,54 @@ namespace AppHopper
             catch { }
             if ((size & 1) == 1) size++;   // even sizes rasterize cleaner
 
-            Color accent = AccentColor();
-            // white-on-accent normally; dark glyph when the accent itself is light (yellows)
-            double lum = (0.299 * accent.R + 0.587 * accent.G + 0.114 * accent.B) / 255.0;
-            Color glyph = lum > 0.55 ? Color.FromArgb(24, 24, 24) : Color.White;
+            Color plate = Color.FromArgb(255, 0xF7, 0x63, 0x0C);
+            Color glyph = Color.White;
 
             using (var bmp = new Bitmap(size, size))
             using (var g2 = Graphics.FromImage(bmp))
             {
                 g2.SmoothingMode = SmoothingMode.AntiAlias;
-                float r = size * 0.24f;
                 float m = 0.5f;   // keeps the AA edge off the bitmap border
+                // rounded plate
+                float pr = size * 0.27f;
                 using (var path = new GraphicsPath())
                 {
-                    path.AddArc(m, m, 2 * r, 2 * r, 180, 90);
-                    path.AddArc(size - m - 2 * r, m, 2 * r, 2 * r, 270, 90);
-                    path.AddArc(size - m - 2 * r, size - m - 2 * r, 2 * r, 2 * r, 0, 90);
-                    path.AddArc(m, size - m - 2 * r, 2 * r, 2 * r, 90, 90);
+                    path.AddArc(m, m, 2 * pr, 2 * pr, 180, 90);
+                    path.AddArc(size - m - 2 * pr, m, 2 * pr, 2 * pr, 270, 90);
+                    path.AddArc(size - m - 2 * pr, size - m - 2 * pr, 2 * pr, 2 * pr, 0, 90);
+                    path.AddArc(m, size - m - 2 * pr, 2 * pr, 2 * pr, 90, 90);
                     path.CloseFigure();
-                    using (var b = new SolidBrush(accent))
+                    using (var b = new SolidBrush(plate))
                         g2.FillPath(b, path);
                 }
-                float w = Math.Max(2f, size * 0.14f);   // shaft thickness
-                float inset = size * 0.22f;
-                // The caps are GDI+ objects the Pen does NOT take ownership
-                // of, so they need disposing explicitly - they are rebuilt on
-                // every theme/accent change otherwise.
-                using (var endCap = new AdjustableArrowCap(w, w * 2.0f, true))
-                using (var startCap = new AdjustableArrowCap(w, w * 2.0f, true))
-                using (var pen = new Pen(glyph, w))
+                float cr = size * 0.075f;   // window-card corner radius
+                float sw = size * 0.07f;    // back-card stroke width
+                // back card: outlined, upper-right
+                float bx = size * 0.30f, by = size * 0.08f;
+                float bw = size * 0.54f, bh = size * 0.40f;
+                using (var path = new GraphicsPath())
                 {
-                    pen.StartCap = LineCap.Round;
-                    pen.EndCap = LineCap.Custom;
-                    pen.CustomEndCap = endCap;
-                    g2.DrawLine(pen, inset, size * 0.36f, size - inset, size * 0.36f);   // ->
-                    pen.EndCap = LineCap.Round;
-                    pen.StartCap = LineCap.Custom;
-                    pen.CustomStartCap = startCap;
-                    g2.DrawLine(pen, inset, size * 0.64f, size - inset, size * 0.64f);   // <-
+                    path.AddArc(bx, by, 2 * cr, 2 * cr, 180, 90);
+                    path.AddArc(bx + bw - 2 * cr, by, 2 * cr, 2 * cr, 270, 90);
+                    path.AddArc(bx + bw - 2 * cr, by + bh - 2 * cr, 2 * cr, 2 * cr, 0, 90);
+                    path.AddArc(bx, by + bh - 2 * cr, 2 * cr, 2 * cr, 90, 90);
+                    path.CloseFigure();
+                    using (var pen = new Pen(glyph, sw))
+                        g2.DrawPath(pen, path);
+                }
+                // front card: filled, lower-left; no overlap, so the pair can
+                // only ever read as two windows (never as a lock, copy or "S")
+                float fx = size * 0.16f, fy = size * 0.52f;
+                float fw = size * 0.54f, fh = size * 0.40f;
+                using (var path = new GraphicsPath())
+                {
+                    path.AddArc(fx, fy, 2 * cr, 2 * cr, 180, 90);
+                    path.AddArc(fx + fw - 2 * cr, fy, 2 * cr, 2 * cr, 270, 90);
+                    path.AddArc(fx + fw - 2 * cr, fy + fh - 2 * cr, 2 * cr, 2 * cr, 0, 90);
+                    path.AddArc(fx, fy + fh - 2 * cr, 2 * cr, 2 * cr, 90, 90);
+                    path.CloseFigure();
+                    using (var b = new SolidBrush(glyph))
+                        g2.FillPath(b, path);
                 }
                 IntPtr h = bmp.GetHicon();
                 try { return (Icon)Icon.FromHandle(h).Clone(); }
@@ -5495,24 +5509,10 @@ namespace AppHopper
             icon.ContextMenu = menu;
             icon.Visible = true;
 
-            // Recolor the tray icon when the user changes the accent color or
-            // theme, so it always matches the panel's accent. (Accent/theme
-            // changes surface as Color or General; redraw on either.)
-            Microsoft.Win32.SystemEvents.UserPreferenceChanged += delegate(object s, Microsoft.Win32.UserPreferenceChangedEventArgs e)
-            {
-                var cat = e.Category;
-                if (cat != Microsoft.Win32.UserPreferenceCategory.Color && cat != Microsoft.Win32.UserPreferenceCategory.General) return;
-                // SystemEvents raises this on its own thread; rebuild the icon
-                // on the UI thread like every other tray/icon mutation.
-                if (_msg == null || _msg.IsDisposed || !_msg.IsHandleCreated) return;
-                _msg.BeginInvoke((Action)delegate
-                {
-                    Icon old = _trayIcon;
-                    _trayIcon = MakeTrayIcon();
-                    icon.Icon = _trayIcon;
-                    if (old != null) old.Dispose();
-                });
-            };
+            // The tray icon uses a fixed brand palette (see MakeTrayIcon), so
+            // there is nothing to recolor on accent/theme changes - unlike the
+            // panel's focus ring, the tray deliberately has no
+            // UserPreferenceChanged hook.
 
             // Watchdog: if the Alt release never arrives through the hook
             // (timeout, injection hiccup, focus race), commit anyway instead of
