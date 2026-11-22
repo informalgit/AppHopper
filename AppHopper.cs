@@ -1,7 +1,8 @@
 // AppHopper - macOS-AltTab-style application switcher for Windows.
-// Alt+Tab is fully taken over: one entry per application (grouped by exe,
-// Z-order MRU), live DWM thumbnails, click an entry to switch, click outside /
-// press Esc to cancel, hold Alt and tap Tab to cycle, Shift+Tab reverses.
+// Alt+Tab is fully taken over: one entry per window of every other app (the
+// current app keeps only its foreground window), live DWM thumbnails, click
+// an entry to switch, click outside / press Esc to cancel, hold Alt and tap
+// Tab to cycle, Shift+Tab reverses.
 // Alt+` (PowerToys Window Hopper) and Win+Tab stay untouched.
 //
 // The switcher UI is a faithful port of PowerToys Window Hopper's overlay
@@ -5517,7 +5518,7 @@ namespace AppHopper
             var icon = new NotifyIcon();
             _trayIcon = MakeTrayIcon();
             icon.Icon = _trayIcon;
-            icon.Text = "AppHopper " + AppVersion + " - one entry per app";
+            icon.Text = "AppHopper " + AppVersion + " - Alt+Tab across windows";
             icon.ContextMenu = menu;
             icon.Visible = true;
 
