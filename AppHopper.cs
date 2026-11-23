@@ -334,12 +334,34 @@ namespace AppHopper
         public static extern IntPtr MonitorFromWindow(IntPtr hwnd, uint dwFlags);
         [DllImport("user32.dll", CharSet = CharSet.Unicode)]
         public static extern bool GetMonitorInfoW(IntPtr hMonitor, ref MONITORINFO lpmi);
+        [StructLayout(LayoutKind.Sequential)]
+        public struct UPDATELAYEREDWINDOWINFO
+        {
+            public int cbSize;
+            public IntPtr hdcDst;
+            public IntPtr pptDst;
+            public IntPtr psize;
+            public IntPtr hdcSrc;
+            public IntPtr pptSrc;
+            public int crKey;
+            public IntPtr pblend;
+            public int dwFlags;
+            public IntPtr prcDirty;
+        }
         [DllImport("user32.dll")]
         public static extern IntPtr GetDC(IntPtr hWnd);
         [DllImport("user32.dll")]
         public static extern int ReleaseDC(IntPtr hWnd, IntPtr hDC);
         [DllImport("user32.dll", SetLastError = true)]
         public static extern bool UpdateLayeredWindow(IntPtr hwnd, IntPtr hdcDst, ref POINT pptDst, ref SIZE psize, IntPtr hdcSrc, ref POINT pprSrc, int crKey, ref BLENDFUNCTION pblend, int dwFlags);
+        [DllImport("user32.dll", SetLastError = true)]
+        public static extern bool UpdateLayeredWindowIndirect(IntPtr hwnd, ref UPDATELAYEREDWINDOWINFO pULWInfo);
+        [DllImport("user32.dll")]
+        public static extern IntPtr BeginDeferWindowPos(int nNumWindows);
+        [DllImport("user32.dll")]
+        public static extern IntPtr DeferWindowPos(IntPtr hWinPosInfo, IntPtr hWnd, IntPtr hWndInsertAfter, int x, int y, int cx, int cy, uint uFlags);
+        [DllImport("user32.dll")]
+        public static extern bool EndDeferWindowPos(IntPtr hWinPosInfo);
         [DllImport("gdi32.dll")]
         public static extern IntPtr CreateCompatibleDC(IntPtr hdc);
         [DllImport("gdi32.dll")]
@@ -348,6 +370,10 @@ namespace AppHopper
         public static extern IntPtr SelectObject(IntPtr hdc, IntPtr hgdiobj);
         [DllImport("gdi32.dll")]
         public static extern IntPtr CreateDIBSection(IntPtr hdc, ref BITMAPINFOHEADER pbmi, uint iUsage, out IntPtr ppvBits, IntPtr hSection, uint dwOffset);
+        [DllImport("kernel32.dll", EntryPoint = "RtlZeroMemory")]
+        public static extern void ZeroMemory(IntPtr destination, UIntPtr length);
+        [DllImport("kernel32.dll", EntryPoint = "RtlMoveMemory")]
+        public static extern void CopyMemory(IntPtr destination, IntPtr source, UIntPtr length);
         [DllImport("dwmapi.dll")]
         public static extern int DwmRegisterThumbnail(IntPtr hwndDestination, IntPtr hwndSource, out IntPtr phThumbnailId);
         [DllImport("dwmapi.dll")]
@@ -813,6 +839,7 @@ namespace AppHopper
         static int _hookGestureGeneration;
         static System.Windows.Forms.Timer _hookHealthTimer;
         static string _healthLogPath;
+        static string _healthLogDirReady;
         const long MaxHealthLogBytes = 256 * 1024;
 
         // Sparse diagnostics remain available without --log. Retain previous
@@ -822,7 +849,12 @@ namespace AppHopper
             if (_healthLogPath == null) return;
             try
             {
-                Directory.CreateDirectory(Path.GetDirectoryName(_healthLogPath));
+                string dir = Path.GetDirectoryName(_healthLogPath);
+                if (!string.IsNullOrEmpty(dir) && !string.Equals(_healthLogDirReady, dir, StringComparison.OrdinalIgnoreCase))
+                {
+                    Directory.CreateDirectory(dir);
+                    _healthLogDirReady = dir;
+                }
                 if (File.Exists(_healthLogPath) && new FileInfo(_healthLogPath).Length >= MaxHealthLogBytes)
                 {
                     File.Delete(_healthLogPath + ".2");
@@ -832,7 +864,7 @@ namespace AppHopper
                 File.AppendAllText(_healthLogPath, DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss.fff ")
                     + "pid=" + Process.GetCurrentProcess().Id + " " + message + Environment.NewLine, new UTF8Encoding(false));
             }
-            catch (IOException) { }
+            catch (IOException) { _healthLogDirReady = null; }
             catch (UnauthorizedAccessException) { }
             // Logging is best effort and runs from the activation path, where a
             // throw between AttachThreadInput and its finally would leave the
@@ -992,11 +1024,50 @@ namespace AppHopper
         static NativeMethods.RECT _panelRect;
         static NativeMethods.RECT _work;    // work area of the monitor the overlay lives on
         static double _scale = 1.0;
-        // One font + brush per chrome repaint, rebuilt by RenderChrome and
-        // disposed in its finally. Fields rather than locals so the drawing
-        // helpers can share them.
+        // Persistent layered chrome surface and cached GDI+ drawing objects.
+        // Reused across sessions and Tab repaints on the UI thread to avoid
+        // reallocating 32bpp DIBs, card geometry paths, fonts, and scaled
+        // icon bitmaps on every keypress.
+        static IntPtr _chromeDib;
+        static IntPtr _chromeBits;
+        static IntPtr _chromeMemDc;
+        static IntPtr _chromeOldObj;
+        static Bitmap _chromeBmp;
+        static Graphics _chromeG;
+        static int _chromeW, _chromeH;
+        static IntPtr _ringBackup;
+        static long _ringBackupCap;
+        static NativeMethods.RECT _ringBackupRect;
+        static bool _chromePageValid;
+        static int _chromeDrawnIndex = -1;
+        static bool _chromeSubmittedOnce;
+        static int _chromeSubmittedX, _chromeSubmittedY, _chromeSubmittedW, _chromeSubmittedH;
+
+        static bool _sessionLight;
+        static Color _sessionAccent;
         static Font _headerFont;
+        static int _cachedFontPx;
         static SolidBrush _headerBrush;
+        static Color _cachedHeaderColor;
+        static Pen _panelStrokePen, _focusShadowPen, _focusAccentPen;
+        static Color _cachedPanelStrokeColor, _cachedFocusShadowColor, _cachedFocusAccentColor;
+        static int _cachedPanelStrokeW, _cachedFocusShadowW, _cachedFocusAccentW;
+        static GraphicsPath _panelPath;
+        static int _cachedPanelPathW, _cachedPanelPathH, _cachedPanelPathR;
+        static readonly StringFormat _headerFormat = new StringFormat { FormatFlags = StringFormatFlags.NoWrap, Trimming = StringTrimming.EllipsisCharacter, LineAlignment = StringAlignment.Center };
+        static readonly StringFormat _pageFormat = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Far };
+
+        static Bitmap _cardSolidTemplate, _cardThumbTemplate;
+        static int _tplTileW, _tplTileH, _tplHeaderH, _tplRadius, _tplPvInset, _tplStrokeW, _tplPad;
+        static bool _tplLight;
+
+        static bool _panelHasBounds, _panelHasRgn, _panelHasBg;
+        static int _panelAppliedX, _panelAppliedY, _panelAppliedW, _panelAppliedH;
+        static int _panelRgnW, _panelRgnH, _panelRgnCorner;
+        static Color _panelBg;
+
+        static int _moveCount;
+        static long _moveTotalTicks, _moveMaxTicks;
         // Polls for windows that disappeared while the overlay is up. Only
         // runs during a session; see RefreshTick.
         static System.Windows.Forms.Timer _refreshTimer;
@@ -1136,12 +1207,21 @@ namespace AppHopper
             protected override void WndProc(ref Message m)
             {
                 if (m.Msg == 0x02B1 /*WM_WTSSESSION_CHANGE*/)
+                {
+                    InvalidateOverlayCache();
                     RequestHookRecovery("session change " + m.WParam.ToInt32());
+                }
                 else if (m.Msg == 0x007E /*WM_DISPLAYCHANGE*/)
+                {
+                    InvalidateOverlayCache();
                     RequestHookRecovery("display change");
+                }
                 else if (m.Msg == 0x0218 /*WM_POWERBROADCAST*/
                     && (m.WParam.ToInt32() == 7 || m.WParam.ToInt32() == 18))
+                {
+                    InvalidateOverlayCache();
                     RequestHookRecovery("resume");
+                }
                 if (_shellHookMessage != 0 && m.Msg == _shellHookMessage && m.WParam == new IntPtr(0x8006))
                     Log("shell flash hwnd=0x" + m.LParam.ToInt64().ToString("X")
                         + " fg=0x" + NativeMethods.GetForegroundWindow().ToInt64().ToString("X"));
@@ -1630,6 +1710,10 @@ namespace AppHopper
         // dictionary lookup. Entries are owned by the cache, NEVER disposed
         // by a session.
         static Dictionary<string, Icon> _iconCache = new Dictionary<string, Icon>(StringComparer.OrdinalIgnoreCase);
+        // UI-thread-only cache of pre-scaled 96-DPI premultiplied bitmaps per Icon.
+        // Avoids paying GDI/HICON conversion in Graphics.DrawIcon on every frame.
+        static readonly Dictionary<Icon, Bitmap> _iconBitmapCache = new Dictionary<Icon, Bitmap>();
+        static int _iconBitmapSize;
         static Func<IntPtr, string, Icon> _iconLoader = GetAppIcon;
         struct IconRequest { public string Exe; public IntPtr Hwnd; }
         static readonly Queue<IconRequest> _iconQueue = new Queue<IconRequest>();
@@ -1638,6 +1722,44 @@ namespace AppHopper
         static Thread _iconWorker;
         static int _iconQueuedCount;
         static System.Windows.Forms.Timer _iconRefreshTimer;
+
+        static void ClearIconBitmapCache()
+        {
+            foreach (var kv in _iconBitmapCache)
+                if (kv.Value != null) kv.Value.Dispose();
+            _iconBitmapCache.Clear();
+        }
+
+        static Bitmap GetIconBitmap(Icon icon, int size)
+        {
+            if (icon == null || size <= 0) return null;
+            if (size != _iconBitmapSize)
+            {
+                ClearIconBitmapCache();
+                _iconBitmapSize = size;
+            }
+            Bitmap cached;
+            if (_iconBitmapCache.TryGetValue(icon, out cached)) return cached;
+            if (_iconBitmapCache.Count >= 256) ClearIconBitmapCache();
+            Bitmap bmp = null;
+            try
+            {
+                bmp = new Bitmap(size, size, PixelFormat.Format32bppPArgb);
+                bmp.SetResolution(96f, 96f);
+                using (var g = Graphics.FromImage(bmp))
+                {
+                    g.InterpolationMode = InterpolationMode.HighQualityBicubic;
+                    g.DrawIcon(icon, new Rectangle(0, 0, size, size));
+                }
+                _iconBitmapCache[icon] = bmp;
+                return bmp;
+            }
+            catch
+            {
+                if (bmp != null) bmp.Dispose();
+                return null;
+            }
+        }
 
         static void QueueIcon(string exe, IntPtr hwnd)
         {
@@ -1677,6 +1799,7 @@ namespace AppHopper
                     {
                         _iconsPending.Remove(request.Exe);
                         _iconCache[request.Exe] = completed;
+                        if (_iconBitmapSize > 0) GetIconBitmap(completed, _iconBitmapSize);
                         bool changed = false;
                         foreach (var entry in _apps)
                         {
@@ -1691,7 +1814,7 @@ namespace AppHopper
                                 _iconRefreshTimer.Tick += delegate
                                 {
                                     _iconRefreshTimer.Stop();
-                                    if (_session && !_committing) RenderChrome();
+                                    if (_session && !_committing) RenderChrome(true, true);
                                 };
                             }
                             _iconRefreshTimer.Stop();
@@ -1767,7 +1890,14 @@ namespace AppHopper
                     if (wanted < 0 || wanted >= _apps.Count) { Log("  commit-at index out of range: " + wanted); break; }
                     Log("  commit-at slot=" + wanted + " key=" + LogText(clickedKey));
                     _index = wanted;
-                    RenderChrome();
+                    int commitPage = Logic.PageStartFor(_index, _apps.Count, _layout.pageSize);
+                    if (commitPage != _pageStart)
+                    {
+                        _pageStart = commitPage;
+                        RegisterThumbnails();
+                        RenderChrome(true, true);
+                    }
+                    else RenderChrome(false, true);
                     Commit();
                     break;
             }
@@ -1799,11 +1929,13 @@ namespace AppHopper
         static readonly List<ForegroundWindow> _mru = new List<ForegroundWindow>();
         static ForegroundWindow _observedForeground;
         static uint _ignoreForegroundThrough;
+        static bool _hasForegroundWatermark;
         static IntPtr _foregroundHook;
         static NativeMethods.WinEventProc _foregroundCallback;
         const int MruLimit = 24;
         const uint ShortRoundTripMs = 400;
         const uint RecentlyForegroundMs = 5000;
+        const uint ForegroundWatermarkWindowMs = 30000;
 
         static uint CurrentTick() { return unchecked((uint)Environment.TickCount); }
 
@@ -1918,17 +2050,30 @@ namespace AppHopper
 
         static void HandleForegroundEvent(IntPtr hwnd, uint eventTime, bool ignoreOwn)
         {
-            // OUTOFCONTEXT callbacks arrive on our UI thread. Use Windows'
-            // generation time to reject queued events from a finished hand-off.
+            HandleForegroundEvent(hwnd, eventTime, CurrentTick(), ignoreOwn);
+        }
+
+        static void HandleForegroundEvent(IntPtr hwnd, uint eventTime, uint now, bool ignoreOwn)
+        {
+            // OUTOFCONTEXT callbacks arrive on our UI thread. Use a bounded
+            // post-handoff watermark to reject stale queued events without risking
+            // signed 32-bit TickCount wraparound after 24.85 days of uptime.
             if (hwnd == IntPtr.Zero || _session || _committing) return;
-            if (unchecked((int)(eventTime - _ignoreForegroundThrough)) <= 0) return;
+            if (_hasForegroundWatermark)
+            {
+                if (unchecked(now - _ignoreForegroundThrough) >= ForegroundWatermarkWindowMs)
+                    _hasForegroundWatermark = false;
+                else if (unchecked((int)(eventTime - _ignoreForegroundThrough)) <= 0)
+                    return;
+                else
+                    _hasForegroundWatermark = false;
+            }
             try
             {
                 if (ignoreOwn && IsOwnWindow(hwnd)) return;
                 IntPtr representative = NormalizeForeground(hwnd);
                 if (representative == IntPtr.Zero) return;
                 ObserveForeground(CaptureForeground(representative, eventTime));
-                _ignoreForegroundThrough = unchecked(eventTime - 1);
             }
             catch (Exception) { }  // never unwind the native callback
         }
@@ -1942,6 +2087,7 @@ namespace AppHopper
         static void InstallForegroundHook()
         {
             _ignoreForegroundThrough = CurrentTick();
+            _hasForegroundWatermark = true;
             _foregroundCallback = OnForegroundEvent;
             _foregroundHook = NativeMethods.SetWinEventHook(NativeMethods.EVENT_SYSTEM_FOREGROUND,
                 NativeMethods.EVENT_SYSTEM_FOREGROUND, IntPtr.Zero, _foregroundCallback, 0, 0,
@@ -1956,6 +2102,7 @@ namespace AppHopper
         static void FinishForegroundHandoff()
         {
             _ignoreForegroundThrough = CurrentTick();
+            _hasForegroundWatermark = true;
             _committing = false;
         }
 
@@ -2184,9 +2331,10 @@ namespace AppHopper
             // Capture the source monitor before enumerating windows.
             NativeMethods.RECT work;
             double scale = MonitorScale(fg, out work);
-            Log("fg 0x" + fgRaw.ToInt64().ToString("X") + " [" + ClassNameOf(fgRaw) + "] \""
-                + LogText(GetWindowTitle(fgRaw)) + "\" -> repr 0x" + fg.ToInt64().ToString("X")
-                + " exe=" + LogText(Path.GetFileName(fgExe)));
+            if (_log != null)
+                Log("fg 0x" + fgRaw.ToInt64().ToString("X") + " [" + ClassNameOf(fgRaw) + "] \""
+                    + LogText(GetWindowTitle(fgRaw)) + "\" -> repr 0x" + fg.ToInt64().ToString("X")
+                    + " exe=" + LogText(Path.GetFileName(fgExe)));
 
             var order = EnumerateEntries(fg, fgExe);
             long perfEnumerate = paintWatch.ElapsedMilliseconds;
@@ -2232,17 +2380,19 @@ namespace AppHopper
             bool fgPinned = pin != IntPtr.Zero;
             _index = Logic.InitialIndex(order.Count, reverse, fgPinned);
             _pageStart = Logic.PageStartFor(_index, _apps.Count, _layout.pageSize);
-            Log("fgPinned=" + fgPinned + " index=" + _index);
-
-            var sb2 = new StringBuilder("order:");
-            foreach (var e in _apps)
-                sb2.Append(' ').Append(LogText(System.IO.Path.GetFileNameWithoutExtension(e.Exe)))
-                   .Append('@').Append(e.Rank).Append(e.Topmost ? "*" : "")
-                   // #N is the activation-history slot (absent when the window
-                   // was never activated through the overlay). Slot order can
-                   // only be audited against the real list if this is printed.
-                   .Append(e.Mru >= 0 ? "#" + e.Mru : "");
-            Log(sb2.ToString());
+            if (_log != null)
+            {
+                Log("fgPinned=" + fgPinned + " index=" + _index);
+                var sb2 = new StringBuilder("order:");
+                foreach (var e in _apps)
+                    sb2.Append(' ').Append(LogText(System.IO.Path.GetFileNameWithoutExtension(e.Exe)))
+                       .Append('@').Append(e.Rank).Append(e.Topmost ? "*" : "")
+                       // #N is the activation-history slot (absent when the window
+                       // was never activated through the overlay). Slot order can
+                       // only be audited against the real list if this is printed.
+                       .Append(e.Mru >= 0 ? "#" + e.Mru : "");
+                Log(sb2.ToString());
+            }
 
             // CachedIcon is only a dictionary lookup on this thread: a cold
             // entry just queues a background load (IconWorkerLoop) and returns
@@ -2253,12 +2403,17 @@ namespace AppHopper
             int perfIconCacheBefore = _iconQueuedCount;
             foreach (var e in _apps) e.Icon = CachedIcon(e.Exe, e.ReprHwnd);
             long perfIcons = paintWatch.ElapsedMilliseconds;
-            ShowPanel();
+            _sessionLight = LightTheme();
+            _sessionAccent = AccentColor();
+            _moveCount = 0; _moveTotalTicks = 0; _moveMaxTicks = 0;
+            PreparePanel();
             long perfPanel = paintWatch.ElapsedMilliseconds;
             RegisterThumbnails();
             long perfThumbs = paintWatch.ElapsedMilliseconds;
-            RenderChrome();
+            RenderChrome(true, false);
             long perfChrome = paintWatch.ElapsedMilliseconds;
+            RevealOverlay();
+            long perfReveal = paintWatch.ElapsedMilliseconds;
             InstallMouseHook();
             if (_refreshTimer != null) _refreshTimer.Start();
 
@@ -2271,9 +2426,10 @@ namespace AppHopper
                 HealthLog("switcher session started generation=" + _hookGeneration);
             }
             HealthLog("perf start enum=" + perfEnumerate + " icons=" + (perfIcons - perfEnumerate)
-                + " panel=" + (perfPanel - perfIcons) + " thumbs=" + (perfThumbs - perfPanel)
+                + " panel=" + ((perfPanel - perfIcons) + (perfReveal - perfChrome)) + " thumbs=" + (perfThumbs - perfPanel)
                 + " chrome=" + (perfChrome - perfThumbs) + " total=" + paintWatch.ElapsedMilliseconds
-                + " newIcons=" + (_iconQueuedCount - perfIconCacheBefore) + " apps=" + _apps.Count);
+                + " newIcons=" + (_iconQueuedCount - perfIconCacheBefore) + " apps=" + _apps.Count
+                + " reveal=" + (perfReveal - perfChrome));
             // firstPaintMs is entirely our own synchronous work (enumerate,
             // layout, show, icons, thumbnails, chrome submit). Icons are the
             // only part of it that reaches into another process without a
@@ -2288,34 +2444,111 @@ namespace AppHopper
                 + " iconCache=" + _iconCache.Count);
         }
 
-        static void ShowPanel()
+        static void InvalidateOverlayCache()
         {
-            _panel.BackColor = PanelFillC(LightTheme());
-            // Showing or refreshing either overlay must not activate it.
-            NativeMethods.SetWindowPos(_panel.Handle, IntPtr.Zero, _layout.panelX, _layout.panelY, _layout.panelW, _layout.panelH,
-                                       0x0040 /*SWP_SHOWWINDOW*/ | 0x0010 /*SWP_NOACTIVATE*/);
-            _panel.Show(); // Keep WinForms visibility in sync so Hide() works.
-            IntPtr rgn = NativeMethods.CreateRoundRectRgn(0, 0, _layout.panelW + 1, _layout.panelH + 1, 2 * Logic.Scaled(_scale, 8), 2 * Logic.Scaled(_scale, 8));
-            if (rgn != IntPtr.Zero)
+            _panelHasBounds = false;
+            _panelHasRgn = false;
+            _chromeSubmittedOnce = false;
+            _chromePageValid = false;
+        }
+
+        static void EnsurePanelBackColor()
+        {
+            if (_panel == null || !_panel.IsHandleCreated) return;
+            Color bg = PanelFillC(_sessionLight);
+            if (!_panelHasBg || _panelBg.ToArgb() != bg.ToArgb())
             {
-                if (!NativeMethods.SetWindowRgn(_panel.Handle, rgn, false)) NativeMethods.DeleteObject(rgn);
+                _panel.BackColor = bg;
+                _panelBg = bg;
+                _panelHasBg = true;
             }
-            // Resize/region changes queue background paint, while the layered
-            // cards are submitted immediately. Complete paint before the cards
-            // can expose the previous session's background surface.
-            _panel.Refresh();
+        }
+
+        static void EnsurePanelRegion()
+        {
+            if (_panel == null || !_panel.IsHandleCreated) return;
+            int w = _layout.panelW, h = _layout.panelH;
+            int corner = 2 * Logic.Scaled(_scale, 8);
+            if (!_panelHasRgn || w != _panelRgnW || h != _panelRgnH || corner != _panelRgnCorner)
+            {
+                IntPtr rgn = NativeMethods.CreateRoundRectRgn(0, 0, w + 1, h + 1, corner, corner);
+                if (rgn != IntPtr.Zero)
+                {
+                    if (NativeMethods.SetWindowRgn(_panel.Handle, rgn, false))
+                    {
+                        _panelRgnW = w; _panelRgnH = h; _panelRgnCorner = corner;
+                        _panelHasRgn = true;
+                    }
+                    else NativeMethods.DeleteObject(rgn);
+                }
+            }
+        }
+
+        static void PreparePanel(bool applyBoundsAndRegion = true)
+        {
+            if (_panel == null || !_panel.IsHandleCreated) return;
+            EnsurePanelBackColor();
+            if (!applyBoundsAndRegion) return;
+            int x = _layout.panelX, y = _layout.panelY, w = _layout.panelW, h = _layout.panelH;
+            if (!_panelHasBounds || x != _panelAppliedX || y != _panelAppliedY || w != _panelAppliedW || h != _panelAppliedH)
+            {
+                // Keep the panel hidden until thumbnails and layered chrome are ready.
+                NativeMethods.SetWindowPos(_panel.Handle, IntPtr.Zero, x, y, w, h,
+                    0x0010 /*SWP_NOACTIVATE*/ | 0x0004 /*SWP_NOZORDER*/);
+                _panelAppliedX = x; _panelAppliedY = y; _panelAppliedW = w; _panelAppliedH = h;
+                _panelHasBounds = true;
+            }
+            EnsurePanelRegion();
+        }
+
+        static void RevealOverlay()
+        {
+            if (_panel == null || !_panel.IsHandleCreated || _chrome == null || !_chrome.IsHandleCreated) return;
+            EnsurePanelRegion();
+            IntPtr chrome = _chrome.Handle, panel = _panel.Handle;
+            IntPtr hdwp = NativeMethods.BeginDeferWindowPos(2);
+            if (hdwp != IntPtr.Zero)
+            {
+                hdwp = NativeMethods.DeferWindowPos(hdwp, chrome, IntPtr.Zero, 0, 0, 0, 0,
+                    0x0001 | 0x0002 | 0x0010 | 0x0040 /*NOSIZE|NOMOVE|NOACTIVATE|SHOWWINDOW*/);
+                if (hdwp != IntPtr.Zero)
+                    hdwp = NativeMethods.DeferWindowPos(hdwp, panel, chrome,
+                        _layout.panelX, _layout.panelY, _layout.panelW, _layout.panelH,
+                        0x0010 | 0x0040 /*NOACTIVATE|SHOWWINDOW*/);
+                if (hdwp != IntPtr.Zero && !NativeMethods.EndDeferWindowPos(hdwp)) hdwp = IntPtr.Zero;
+            }
+            if (hdwp == IntPtr.Zero)
+            {
+                NativeMethods.SetWindowPos(chrome, IntPtr.Zero, 0, 0, 0, 0,
+                    0x0001 | 0x0002 | 0x0010 | 0x0040);
+                NativeMethods.SetWindowPos(panel, chrome,
+                    _layout.panelX, _layout.panelY, _layout.panelW, _layout.panelH,
+                    0x0010 | 0x0040);
+            }
+            _panelAppliedX = _layout.panelX; _panelAppliedY = _layout.panelY;
+            _panelAppliedW = _layout.panelW; _panelAppliedH = _layout.panelH;
+            _panelHasBounds = true;
+            if (!_panel.Visible) _panel.Show();
+            if (!_chrome.Visible) _chrome.Show();
+            _panel.Update();
         }
 
         static void MoveIndex(int delta)
         {
+            var sw = Stopwatch.StartNew();
             _index = ((_index + delta) % _apps.Count + _apps.Count) % _apps.Count;
             int ps = Logic.PageStartFor(_index, _apps.Count, _layout.pageSize);
             if (ps != _pageStart)
             {
                 _pageStart = ps;
                 RegisterThumbnails();
+                RenderChrome(true, true);
             }
-            RenderChrome();
+            else RenderChrome(false, true);
+            long ticks = sw.ElapsedTicks;
+            _moveCount++;
+            _moveTotalTicks += ticks;
+            if (ticks > _moveMaxTicks) _moveMaxTicks = ticks;
         }
 
         static void RegisterThumbnails()
@@ -2411,9 +2644,29 @@ namespace AppHopper
         // The overlay never owns foreground; hiding it needs no handback.
         static void HideOverlay()
         {
-            UnregisterThumbnails();
-            if (_panel != null && _panel.IsHandleCreated) _panel.Hide();
+            _chromeSubmittedOnce = false;
+            _chromePageValid = false;
+            _chromeDrawnIndex = -1;
+            _ringBackupRect = new NativeMethods.RECT();
+            bool panelUp = _panel != null && _panel.IsHandleCreated
+                && (_panel.Visible || NativeMethods.IsWindowVisible(_panel.Handle));
+            bool chromeUp = _chrome != null && _chrome.IsHandleCreated
+                && (_chrome.Visible || NativeMethods.IsWindowVisible(_chrome.Handle));
+            if (panelUp && chromeUp)
+            {
+                IntPtr hdwp = NativeMethods.BeginDeferWindowPos(2);
+                if (hdwp != IntPtr.Zero)
+                {
+                    const uint hideFlags = 0x0001 | 0x0002 | 0x0004 | 0x0010 | 0x0080 /*NOSIZE|NOMOVE|NOZORDER|NOACTIVATE|HIDEWINDOW*/;
+                    hdwp = NativeMethods.DeferWindowPos(hdwp, _chrome.Handle, IntPtr.Zero, 0, 0, 0, 0, hideFlags);
+                    if (hdwp != IntPtr.Zero)
+                        hdwp = NativeMethods.DeferWindowPos(hdwp, _panel.Handle, IntPtr.Zero, 0, 0, 0, 0, hideFlags);
+                    if (hdwp != IntPtr.Zero) NativeMethods.EndDeferWindowPos(hdwp);
+                }
+            }
             if (_chrome != null && _chrome.IsHandleCreated) _chrome.Hide();
+            if (_panel != null && _panel.IsHandleCreated) _panel.Hide();
+            UnregisterThumbnails();
         }
 
         static void Commit()
@@ -2471,6 +2724,21 @@ namespace AppHopper
                         + " skipped=single-app");
                     Log("commit -> no target: single app in cycle, staying on 0x"
                         + target.ToInt64().ToString("X"));
+                    return;
+                }
+                if (ForegroundIs(target) && !NativeMethods.IsIconic(target))
+                {
+                    CancelDeferredActivation();
+                    HideOverlay();
+                    EndSession();
+                    IntPtr currentNorm = NormalizeForeground(target);
+                    if (currentNorm != IntPtr.Zero && historySource != IntPtr.Zero && currentNorm != historySource)
+                        RememberActivation(historySource, currentNorm);
+                    HealthLog("activation-trace result target=0x" + target.ToInt64().ToString("X")
+                        + " foreground=0x" + NativeMethods.GetForegroundWindow().ToInt64().ToString("X")
+                        + " skipped=already-foreground");
+                    if (_log != null)
+                        Log("commit -> no-op: target already foreground 0x" + target.ToInt64().ToString("X"));
                     return;
                 }
                 HealthLog("activation-trace commit target=0x" + target.ToInt64().ToString("X")
@@ -2558,12 +2826,13 @@ namespace AppHopper
                 // overlay is already hidden: restore wait, queue attaches, the
                 // SetFocus of the selected window, retries and the bounded
                 // landing check. Focus/caret problems live in here.
-                Log("commit -> 0x" + target.ToInt64().ToString("X") + " " + LogText(Path.GetFileName(targetExe))
-                    + " sfw=" + (ok ? "ok" : "FAILED") + " activateMs=" + activateMs
-                    + " forcedFocus=0x" + _lastActivationFocus.ToInt64().ToString("X")
-                    + " focusPath=" + _lastFocusPath
-                    + " postFocus=" + _lastPostFocus
-                    + " fgNow=0x" + now.ToInt64().ToString("X") + " [" + ClassNameOf(now) + "]");
+                if (_log != null)
+                    Log("commit -> 0x" + target.ToInt64().ToString("X") + " " + LogText(Path.GetFileName(targetExe))
+                        + " sfw=" + (ok ? "ok" : "FAILED") + " activateMs=" + activateMs
+                        + " forcedFocus=0x" + _lastActivationFocus.ToInt64().ToString("X")
+                        + " focusPath=" + _lastFocusPath
+                        + " postFocus=" + _lastPostFocus
+                        + " fgNow=0x" + now.ToInt64().ToString("X") + " [" + ClassNameOf(now) + "]");
             }
             finally
             {
@@ -2647,6 +2916,16 @@ namespace AppHopper
             // Reentrancy guard first: the watchdog timer must not re-enter
             // Commit/Cancel while we tear down.
             _session = false;
+            if (_moveCount > 0)
+            {
+                double freq = Stopwatch.Frequency > 0 ? Stopwatch.Frequency : 1.0;
+                double avgMs = (_moveTotalTicks * 1000.0) / (_moveCount * freq);
+                double maxMs = (_moveMaxTicks * 1000.0) / freq;
+                HealthLog("perf moves count=" + _moveCount
+                    + " avgMs=" + avgMs.ToString("0.00", System.Globalization.CultureInfo.InvariantCulture)
+                    + " maxMs=" + maxMs.ToString("0.00", System.Globalization.CultureInfo.InvariantCulture));
+                _moveCount = 0; _moveTotalTicks = 0; _moveMaxTicks = 0;
+            }
             if (_refreshTimer != null) _refreshTimer.Stop();
             if (_iconRefreshTimer != null) _iconRefreshTimer.Stop();
             if (keepMouseHook) _swallowMouseUp = false;
@@ -2751,17 +3030,24 @@ namespace AppHopper
             _index = idx;
             long perfMerge = perfWatch.ElapsedMilliseconds;
 
+            _sessionLight = LightTheme();
+            _sessionAccent = AccentColor();
             Logic.ComputeLayout(_work, _apps.Count, _scale, ref _layout);
             _pageStart = Logic.PageStartFor(_index, _apps.Count, _layout.pageSize);
-            ShowPanel();
+            bool alreadyVisible = _panel != null && _panel.IsHandleCreated
+                && (_panel.Visible || NativeMethods.IsWindowVisible(_panel.Handle));
+            PreparePanel(!alreadyVisible);
             UpdatePanelRect();
             long perfPanel = perfWatch.ElapsedMilliseconds;
             RegisterThumbnails();
             long perfThumbs = perfWatch.ElapsedMilliseconds;
-            RenderChrome();
+            RenderChrome(true, false);
+            long perfChrome = perfWatch.ElapsedMilliseconds;
+            RevealOverlay();
+            long perfReveal = perfWatch.ElapsedMilliseconds;
             HealthLog("perf refresh enum=" + perfEnumerate + " mergeIcons=" + (perfMerge - perfEnumerate)
-                + " panel=" + (perfPanel - perfMerge) + " thumbs=" + (perfThumbs - perfPanel)
-                + " chrome=" + (perfWatch.ElapsedMilliseconds - perfThumbs)
+                + " panel=" + ((perfPanel - perfMerge) + (perfReveal - perfChrome)) + " thumbs=" + (perfThumbs - perfPanel)
+                + " chrome=" + (perfChrome - perfThumbs)
                 + " total=" + perfWatch.ElapsedMilliseconds + " apps=" + _apps.Count);
             Log("refresh: " + _apps.Count + " entries, index=" + _index
                 + ", panel=" + _layout.panelW + "x" + _layout.panelH
@@ -3021,7 +3307,7 @@ namespace AppHopper
                             // foreground back as a different handle for the same
                             // window (UWP frames vs their CoreWindow), which used
                             // to cancel a perfectly valid deferred hand-over.
-                            || RepresentativeOf(NativeMethods.GetForegroundWindow()) != RepresentativeOf(source)
+                            || NormalizeForeground(NativeMethods.GetForegroundWindow()) != NormalizeForeground(source)
                             || !DeferredInputUnchanged(baseline)
                             || !DeferredIdentityMatches(source, sourcePid, sourceTid, sourceStart)
                             || !DeferredIdentityMatches(target, targetPid, targetTid, targetStart))
@@ -3520,138 +3806,512 @@ namespace AppHopper
         }
 
         // ================= chrome rendering (UpdateLayeredWindow, Hopper-style) =================
-        static void RenderChrome()
+        static bool EnsureChromeSurface(int w, int h, IntPtr screenDc)
         {
-            int w = _layout.panelW, h = _layout.panelH;
-            if (w <= 0 || h <= 0) return;
-            bool light = LightTheme();
-            Color accent = AccentColor();
-            // One font + one text brush per repaint instead of one per card.
-            // RenderChrome runs on every Tab keypress; constructing (and
-            // disposing) a Font per tile was pure overhead on the hot path.
-            // Fields rather than locals so the drawing helpers can reach them.
-            _headerFont = new Font("Segoe UI", Math.Max(1, Logic.Scaled(_scale, 14)), GraphicsUnit.Pixel);
-            _headerBrush = new SolidBrush(HeaderTextC(light));
-
-            IntPtr screenDc = NativeMethods.GetDC(IntPtr.Zero);
+            if (_chromeDib != IntPtr.Zero && _chromeW == w && _chromeH == h
+                && _chromeBmp != null && _chromeG != null && _chromeMemDc != IntPtr.Zero)
+                return true;
+            DisposeChromeSurface();
             var bmi = new NativeMethods.BITMAPINFOHEADER();
             bmi.biSize = Marshal.SizeOf(typeof(NativeMethods.BITMAPINFOHEADER));
             bmi.biWidth = w; bmi.biHeight = -h; bmi.biPlanes = 1; bmi.biBitCount = 32; bmi.biCompression = 0;
-            IntPtr bits;
-            IntPtr dib = NativeMethods.CreateDIBSection(screenDc, ref bmi, 0, out bits, IntPtr.Zero, 0);
-            if (dib == IntPtr.Zero) { _headerBrush.Dispose(); _headerFont.Dispose(); NativeMethods.ReleaseDC(IntPtr.Zero, screenDc); return; }
-
+            _chromeDib = NativeMethods.CreateDIBSection(screenDc, ref bmi, 0, out _chromeBits, IntPtr.Zero, 0);
+            if (_chromeDib == IntPtr.Zero || _chromeBits == IntPtr.Zero) { DisposeChromeSurface(); return false; }
+            _chromeMemDc = NativeMethods.CreateCompatibleDC(screenDc);
+            if (_chromeMemDc == IntPtr.Zero) { DisposeChromeSurface(); return false; }
+            _chromeOldObj = NativeMethods.SelectObject(_chromeMemDc, _chromeDib);
             try
             {
-                using (var bmp = new Bitmap(w, h, w * 4, PixelFormat.Format32bppPArgb, bits))
-                using (var g = Graphics.FromImage(bmp))
+                _chromeBmp = new Bitmap(w, h, w * 4, PixelFormat.Format32bppPArgb, _chromeBits);
+                // Match 96-DPI coordinates so DrawImage with cached templates/icons stays 1:1 on high-DPI monitors.
+                _chromeBmp.SetResolution(96f, 96f);
+                _chromeG = Graphics.FromImage(_chromeBmp);
+                _chromeG.SmoothingMode = SmoothingMode.AntiAlias;
+                _chromeG.TextRenderingHint = System.Drawing.Text.TextRenderingHint.AntiAliasGridFit;
+                _chromeW = w;
+                _chromeH = h;
+                return true;
+            }
+            catch
+            {
+                DisposeChromeSurface();
+                return false;
+            }
+        }
+
+        static void DisposeChromeSurface()
+        {
+            if (_chromeG != null) { _chromeG.Dispose(); _chromeG = null; }
+            if (_chromeBmp != null) { _chromeBmp.Dispose(); _chromeBmp = null; }
+            if (_chromeMemDc != IntPtr.Zero)
+            {
+                if (_chromeOldObj != IntPtr.Zero)
                 {
-                    g.SmoothingMode = SmoothingMode.AntiAlias;
-                    g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.AntiAliasGridFit;
-
-                    var panelPath = RoundRect(0, 0, w, h, Logic.Scaled(_scale, 8));
-                    using (var pen = new Pen(PanelStrokeC(light), Math.Max(1, Logic.Scaled(_scale, 1))))
-                        g.DrawPath(pen, panelPath);
-                    panelPath.Dispose();
-
-                    DrawCards(g, w, h, light, accent);
-                    DrawPageIndicator(g, w, h, light);
-                    g.Flush(FlushIntention.Sync);
+                    NativeMethods.SelectObject(_chromeMemDc, _chromeOldObj);
+                    _chromeOldObj = IntPtr.Zero;
                 }
-                SubmitChrome(w, h, screenDc, dib);
+                NativeMethods.DeleteDC(_chromeMemDc);
+                _chromeMemDc = IntPtr.Zero;
+            }
+            if (_chromeDib != IntPtr.Zero) { NativeMethods.DeleteObject(_chromeDib); _chromeDib = IntPtr.Zero; }
+            if (_ringBackup != IntPtr.Zero) { Marshal.FreeHGlobal(_ringBackup); _ringBackup = IntPtr.Zero; }
+            _ringBackupCap = 0;
+            _ringBackupRect = new NativeMethods.RECT();
+            _chromeBits = IntPtr.Zero;
+            _chromeW = 0; _chromeH = 0;
+            _chromePageValid = false;
+            _chromeDrawnIndex = -1;
+            _chromeSubmittedOnce = false;
+        }
+
+        static void DisposeRenderCache()
+        {
+            if (_headerFont != null) { _headerFont.Dispose(); _headerFont = null; }
+            _cachedFontPx = 0;
+            if (_headerBrush != null) { _headerBrush.Dispose(); _headerBrush = null; }
+            _cachedHeaderColor = Color.Empty;
+            if (_panelStrokePen != null) { _panelStrokePen.Dispose(); _panelStrokePen = null; }
+            _cachedPanelStrokeColor = Color.Empty; _cachedPanelStrokeW = 0;
+            if (_focusShadowPen != null) { _focusShadowPen.Dispose(); _focusShadowPen = null; }
+            _cachedFocusShadowColor = Color.Empty; _cachedFocusShadowW = 0;
+            if (_focusAccentPen != null) { _focusAccentPen.Dispose(); _focusAccentPen = null; }
+            _cachedFocusAccentColor = Color.Empty; _cachedFocusAccentW = 0;
+            if (_panelPath != null) { _panelPath.Dispose(); _panelPath = null; }
+            _cachedPanelPathW = 0; _cachedPanelPathH = 0; _cachedPanelPathR = 0;
+            if (_cardSolidTemplate != null) { _cardSolidTemplate.Dispose(); _cardSolidTemplate = null; }
+            if (_cardThumbTemplate != null) { _cardThumbTemplate.Dispose(); _cardThumbTemplate = null; }
+            _tplTileW = 0; _tplTileH = 0; _tplHeaderH = 0; _tplRadius = 0; _tplPvInset = 0; _tplStrokeW = 0; _tplPad = 0;
+            ClearIconBitmapCache();
+            _iconBitmapSize = 0;
+        }
+
+        static void EnsureRenderResources(double scale, bool light, Color accent)
+        {
+            int fontPx = Math.Max(1, Logic.Scaled(scale, 14));
+            if (_headerFont == null || _cachedFontPx != fontPx)
+            {
+                if (_headerFont != null) _headerFont.Dispose();
+                _headerFont = new Font("Segoe UI", fontPx, GraphicsUnit.Pixel);
+                _cachedFontPx = fontPx;
+            }
+            Color hdrColor = HeaderTextC(light);
+            if (_headerBrush == null || _cachedHeaderColor.ToArgb() != hdrColor.ToArgb())
+            {
+                if (_headerBrush != null) _headerBrush.Dispose();
+                _headerBrush = new SolidBrush(hdrColor);
+                _cachedHeaderColor = hdrColor;
+            }
+            int strokeW = Math.Max(1, Logic.Scaled(scale, 1));
+            Color panelStroke = PanelStrokeC(light);
+            if (_panelStrokePen == null || _cachedPanelStrokeW != strokeW || _cachedPanelStrokeColor.ToArgb() != panelStroke.ToArgb())
+            {
+                if (_panelStrokePen != null) _panelStrokePen.Dispose();
+                _panelStrokePen = new Pen(panelStroke, strokeW);
+                _cachedPanelStrokeW = strokeW;
+                _cachedPanelStrokeColor = panelStroke;
+            }
+            Color focusShadow = FocusShadowC(light);
+            if (_focusShadowPen == null || _cachedFocusShadowW != strokeW || _cachedFocusShadowColor.ToArgb() != focusShadow.ToArgb())
+            {
+                if (_focusShadowPen != null) _focusShadowPen.Dispose();
+                _focusShadowPen = new Pen(focusShadow, strokeW);
+                _cachedFocusShadowW = strokeW;
+                _cachedFocusShadowColor = focusShadow;
+            }
+            int ringW = Math.Max(2, Logic.Scaled(scale, 4));
+            if (_focusAccentPen == null || _cachedFocusAccentW != ringW || _cachedFocusAccentColor.ToArgb() != accent.ToArgb())
+            {
+                if (_focusAccentPen != null) _focusAccentPen.Dispose();
+                _focusAccentPen = new Pen(accent, ringW);
+                _cachedFocusAccentW = ringW;
+                _cachedFocusAccentColor = accent;
+            }
+        }
+
+        static void EnsurePanelPath(int w, int h, int radius)
+        {
+            if (_panelPath != null && _cachedPanelPathW == w && _cachedPanelPathH == h && _cachedPanelPathR == radius)
+                return;
+            if (_panelPath != null) _panelPath.Dispose();
+            _panelPath = RoundRect(0, 0, w, h, radius);
+            _cachedPanelPathW = w;
+            _cachedPanelPathH = h;
+            _cachedPanelPathR = radius;
+        }
+
+        static Bitmap BuildCardTemplate(int tileW, int tileH, int headerH, int radius, int pvInset, int strokeW, int pad, bool light, bool withHole)
+        {
+            var bmp = new Bitmap(tileW + 2 * pad, tileH + 2 * pad, PixelFormat.Format32bppPArgb);
+            bmp.SetResolution(96f, 96f);
+            using (var g = Graphics.FromImage(bmp))
+            {
+                g.SmoothingMode = SmoothingMode.AntiAlias;
+                using (var cardPath = RoundRect(pad, pad, pad + tileW, pad + tileH, radius))
+                using (var b = new SolidBrush(CardColor(light)))
+                using (var p = new Pen(CardStrokeC(light), strokeW))
+                {
+                    g.FillPath(b, cardPath);
+                    g.DrawPath(p, cardPath);
+                    int pw = tileW - 2 * pvInset;
+                    int ph = tileH - pvInset - headerH;
+                    if (pw > 0 && ph > 0)
+                    {
+                        using (var back = new SolidBrush(CardSolid(light)))
+                        {
+                            g.SetClip(cardPath);
+                            g.FillRectangle(back, pad + pvInset, pad + headerH, pw, ph);
+                            g.ResetClip();
+                        }
+                        if (withHole)
+                        {
+                            var pvF = new RectangleF(pad + pvInset, pad + headerH, pw, ph);
+                            using (var hole = BottomRoundRect(pvF, radius))
+                            using (var tr = new SolidBrush(Color.FromArgb(0, 0, 0, 0)))
+                            {
+                                g.CompositingMode = CompositingMode.SourceCopy;
+                                g.FillPath(tr, hole);
+                                g.CompositingMode = CompositingMode.SourceOver;
+                            }
+                        }
+                    }
+                }
+            }
+            return bmp;
+        }
+
+        static void EnsureCardTemplates(ref Logic.OverlayLayout layout, bool light)
+        {
+            if (layout.tileW <= 0 || layout.tileH <= 0) return;
+            int pvInset = Logic.Scaled(layout.scale, 1);
+            int strokeW = Math.Max(1, pvInset);
+            if (_cardSolidTemplate != null && _cardThumbTemplate != null
+                && _tplTileW == layout.tileW && _tplTileH == layout.tileH
+                && _tplHeaderH == layout.headerH && _tplRadius == layout.radius
+                && _tplPvInset == pvInset && _tplStrokeW == strokeW && _tplLight == light)
+                return;
+            if (_cardSolidTemplate != null) { _cardSolidTemplate.Dispose(); _cardSolidTemplate = null; }
+            if (_cardThumbTemplate != null) { _cardThumbTemplate.Dispose(); _cardThumbTemplate = null; }
+            int pad = strokeW + 1;
+            _cardSolidTemplate = BuildCardTemplate(layout.tileW, layout.tileH, layout.headerH, layout.radius, pvInset, strokeW, pad, light, false);
+            _cardThumbTemplate = BuildCardTemplate(layout.tileW, layout.tileH, layout.headerH, layout.radius, pvInset, strokeW, pad, light, true);
+            _tplTileW = layout.tileW;
+            _tplTileH = layout.tileH;
+            _tplHeaderH = layout.headerH;
+            _tplRadius = layout.radius;
+            _tplPvInset = pvInset;
+            _tplStrokeW = strokeW;
+            _tplPad = pad;
+            _tplLight = light;
+        }
+
+        static NativeMethods.RECT FocusRingBounds(NativeMethods.RECT tile, double scale, int panelW, int panelH)
+        {
+            int gPad = Logic.Scaled(scale, 6), gOut = gPad + Logic.Scaled(scale, 2);
+            int ringW = Math.Max(2, Logic.Scaled(scale, 4));
+            int margin = gOut + (ringW + 1) / 2 + 3;
+            return new NativeMethods.RECT
+            {
+                Left = Math.Max(0, tile.Left - margin),
+                Top = Math.Max(0, tile.Top - margin),
+                Right = Math.Min(panelW, tile.Right + margin),
+                Bottom = Math.Min(panelH, tile.Bottom + margin)
+            };
+        }
+
+        static void SaveRingPatch(NativeMethods.RECT rc)
+        {
+            int rw = rc.Right - rc.Left, rh = rc.Bottom - rc.Top;
+            if (rw <= 0 || rh <= 0 || _chromeBits == IntPtr.Zero || _chromeW <= 0) return;
+            long needed = (long)rw * rh * 4;
+            if (_ringBackup == IntPtr.Zero || _ringBackupCap < needed)
+            {
+                if (_ringBackup != IntPtr.Zero) Marshal.FreeHGlobal(_ringBackup);
+                _ringBackup = Marshal.AllocHGlobal((IntPtr)needed);
+                _ringBackupCap = needed;
+            }
+            long stride = (long)_chromeW * 4;
+            int rowBytes = rw * 4;
+            long bitsBase = _chromeBits.ToInt64();
+            long bufBase = _ringBackup.ToInt64();
+            for (int y = 0; y < rh; y++)
+                NativeMethods.CopyMemory(new IntPtr(bufBase + (long)y * rowBytes),
+                    new IntPtr(bitsBase + (long)(rc.Top + y) * stride + (long)rc.Left * 4), (UIntPtr)(uint)rowBytes);
+        }
+
+        static void RestoreRingPatch(NativeMethods.RECT rc)
+        {
+            int rw = rc.Right - rc.Left, rh = rc.Bottom - rc.Top;
+            if (rw <= 0 || rh <= 0 || _chromeBits == IntPtr.Zero || _ringBackup == IntPtr.Zero || _chromeW <= 0) return;
+            if ((long)rw * rh * 4 > _ringBackupCap) return;
+            long stride = (long)_chromeW * 4;
+            int rowBytes = rw * 4;
+            long bitsBase = _chromeBits.ToInt64();
+            long bufBase = _ringBackup.ToInt64();
+            for (int y = 0; y < rh; y++)
+                NativeMethods.CopyMemory(new IntPtr(bitsBase + (long)(rc.Top + y) * stride + (long)rc.Left * 4),
+                    new IntPtr(bufBase + (long)y * rowBytes), (UIntPtr)(uint)rowBytes);
+        }
+
+        static void DrawFocusRing(Graphics g, NativeMethods.RECT tile, double scale)
+        {
+            int gPad = Logic.Scaled(scale, 6), gOut = gPad + Logic.Scaled(scale, 2);
+            int outerR = Logic.Scaled(scale, 18), innerR = outerR - Logic.Scaled(scale, 2);
+            using (var ringIn = RoundRect(tile.Left - gPad, tile.Top - gPad, tile.Right + gPad, tile.Bottom + gPad, innerR))
+            using (var ringOut = RoundRect(tile.Left - gOut, tile.Top - gOut, tile.Right + gOut, tile.Bottom + gOut, outerR))
+            {
+                g.DrawPath(_focusShadowPen, ringIn);
+                g.DrawPath(_focusAccentPen, ringOut);
+            }
+        }
+
+        static void WarmupOverlay()
+        {
+            try
+            {
+                if (_exitRequested || _session || _committing) return;
+                IntPtr refHwnd = NativeMethods.GetForegroundWindow();
+                if (refHwnd == IntPtr.Zero && _msg != null && _msg.IsHandleCreated) refHwnd = _msg.Handle;
+                NativeMethods.RECT work;
+                double scale = MonitorScale(refHwnd, out work);
+                bool light = LightTheme();
+                Color accent = AccentColor();
+                var layout = new Logic.OverlayLayout();
+                Logic.ComputeLayout(work, 12, scale, ref layout);
+                if (layout.scale > 0 && layout.tileW > 0 && layout.tileH > 0)
+                {
+                    EnsureCardTemplates(ref layout, light);
+                    EnsureRenderResources(layout.scale, light, accent);
+                    IntPtr screenDc = NativeMethods.GetDC(IntPtr.Zero);
+                    IntPtr memDc = IntPtr.Zero, dib = IntPtr.Zero, old = IntPtr.Zero, bits = IntPtr.Zero;
+                    try
+                    {
+                        if (screenDc != IntPtr.Zero)
+                        {
+                            var bmi = new NativeMethods.BITMAPINFOHEADER();
+                            bmi.biSize = Marshal.SizeOf(typeof(NativeMethods.BITMAPINFOHEADER));
+                            bmi.biWidth = 32; bmi.biHeight = -32; bmi.biPlanes = 1; bmi.biBitCount = 32; bmi.biCompression = 0;
+                            dib = NativeMethods.CreateDIBSection(screenDc, ref bmi, 0, out bits, IntPtr.Zero, 0);
+                            if (dib != IntPtr.Zero && bits != IntPtr.Zero)
+                            {
+                                memDc = NativeMethods.CreateCompatibleDC(screenDc);
+                                if (memDc != IntPtr.Zero) old = NativeMethods.SelectObject(memDc, dib);
+                                using (var tmp = new Bitmap(32, 32, 32 * 4, PixelFormat.Format32bppPArgb, bits))
+                                {
+                                    tmp.SetResolution(96f, 96f);
+                                    using (var g = Graphics.FromImage(tmp))
+                                    {
+                                        g.SmoothingMode = SmoothingMode.AntiAlias;
+                                        g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.AntiAliasGridFit;
+                                        g.DrawString("A", _headerFont, _headerBrush, new RectangleF(0, 0, 32, 32), _headerFormat);
+                                        DrawFocusRing(g, new NativeMethods.RECT { Left = 8, Top = 8, Right = 24, Bottom = 24 }, layout.scale);
+                                        g.Flush(FlushIntention.Sync);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    finally
+                    {
+                        if (memDc != IntPtr.Zero)
+                        {
+                            if (old != IntPtr.Zero) NativeMethods.SelectObject(memDc, old);
+                            NativeMethods.DeleteDC(memDc);
+                        }
+                        if (dib != IntPtr.Zero) NativeMethods.DeleteObject(dib);
+                        if (screenDc != IntPtr.Zero) NativeMethods.ReleaseDC(IntPtr.Zero, screenDc);
+                    }
+                    if (_iconBitmapSize == 0 && layout.iconSize > 0) _iconBitmapSize = layout.iconSize;
+                }
+                var entries = EnumerateEntries(IntPtr.Zero, null);
+                foreach (var e in entries) CachedIcon(e.Exe, e.ReprHwnd);
+            }
+            catch { }
+        }
+
+        static void RenderChrome() { RenderChrome(true, true); }
+
+        static void RenderChrome(bool full, bool showWindow)
+        {
+            int w = _layout.panelW, h = _layout.panelH;
+            if (w <= 0 || h <= 0) return;
+            IntPtr screenDc = NativeMethods.GetDC(IntPtr.Zero);
+            if (screenDc == IntPtr.Zero) return;
+            try
+            {
+                if (!EnsureChromeSurface(w, h, screenDc)) return;
+
+                if (!full && _chromePageValid && _chromeW == w && _chromeH == h)
+                {
+                    if (_chromeDrawnIndex == _index && _chromeSubmittedOnce
+                        && (!showWindow || (_chrome != null && _chrome.Visible && NativeMethods.IsWindowVisible(_chrome.Handle))))
+                        return;
+                    EnsureRenderResources(_scale, _sessionLight, _sessionAccent);
+                    bool hasDirty = false;
+                    var dirty = new NativeMethods.RECT();
+                    if (_chromeDrawnIndex >= 0 && _ringBackupRect.Right > _ringBackupRect.Left && _ringBackupRect.Bottom > _ringBackupRect.Top)
+                    {
+                        RestoreRingPatch(_ringBackupRect);
+                        dirty = _ringBackupRect;
+                        hasDirty = true;
+                    }
+                    _ringBackupRect = new NativeMethods.RECT();
+                    _chromeDrawnIndex = -1;
+                    int pageEnd = Math.Min(_pageStart + _layout.pageSize, _apps.Count);
+                    if (_index >= _pageStart && _index < pageEnd)
+                    {
+                        int slot = _index - _pageStart;
+                        NativeMethods.RECT tile = Logic.TileRect(ref _layout, slot);
+                        NativeMethods.RECT newRect = FocusRingBounds(tile, _scale, w, h);
+                        SaveRingPatch(newRect);
+                        _chromeG.CompositingMode = CompositingMode.SourceOver;
+                        DrawFocusRing(_chromeG, tile, _scale);
+                        _chromeG.Flush(FlushIntention.Sync);
+                        _ringBackupRect = newRect;
+                        _chromeDrawnIndex = _index;
+                        if (hasDirty)
+                        {
+                            dirty.Left = Math.Min(dirty.Left, newRect.Left);
+                            dirty.Top = Math.Min(dirty.Top, newRect.Top);
+                            dirty.Right = Math.Max(dirty.Right, newRect.Right);
+                            dirty.Bottom = Math.Max(dirty.Bottom, newRect.Bottom);
+                        }
+                        else { dirty = newRect; hasDirty = true; }
+                    }
+                    SubmitChrome(w, h, screenDc, showWindow, hasDirty ? (NativeMethods.RECT?)dirty : null);
+                    return;
+                }
+
+                _chromePageValid = false;
+                _chromeDrawnIndex = -1;
+                _ringBackupRect = new NativeMethods.RECT();
+                bool light = _sessionLight;
+                Color accent = _sessionAccent;
+                EnsureRenderResources(_scale, light, accent);
+                EnsurePanelPath(w, h, Logic.Scaled(_scale, 8));
+                EnsureCardTemplates(ref _layout, light);
+
+                NativeMethods.ZeroMemory(_chromeBits, (UIntPtr)((long)w * h * 4));
+                _chromeG.CompositingMode = CompositingMode.SourceOver;
+                _chromeG.DrawPath(_panelStrokePen, _panelPath);
+                DrawCardsBase(_chromeG, w, h, light);
+                DrawPageIndicator(_chromeG, w, h, light);
+                _chromeG.Flush(FlushIntention.Sync);
+
+                int fullEnd = Math.Min(_pageStart + _layout.pageSize, _apps.Count);
+                if (_index >= _pageStart && _index < fullEnd)
+                {
+                    int slot = _index - _pageStart;
+                    NativeMethods.RECT tile = Logic.TileRect(ref _layout, slot);
+                    NativeMethods.RECT ringRect = FocusRingBounds(tile, _scale, w, h);
+                    SaveRingPatch(ringRect);
+                    DrawFocusRing(_chromeG, tile, _scale);
+                    _chromeG.Flush(FlushIntention.Sync);
+                    _ringBackupRect = ringRect;
+                    _chromeDrawnIndex = _index;
+                }
+                _chromePageValid = true;
+                SubmitChrome(w, h, screenDc, showWindow, null);
             }
             finally
             {
-                NativeMethods.DeleteObject(dib);
-                _headerBrush.Dispose();
-                _headerFont.Dispose();
                 NativeMethods.ReleaseDC(IntPtr.Zero, screenDc);
             }
         }
 
-        // Draws every card on the current page. Each card's GraphicsPaths are
-        // released in a finally so a draw error on one card cannot leak the
-        // rest of the page's paths.
-        static void DrawCards(Graphics g, int w, int h, bool light, Color accent)
+        static void DrawCardHeader(Graphics g, AppEntry app, NativeMethods.RECT tile)
+        {
+            NativeMethods.RECT hdr = Logic.HeaderRect(ref _layout, tile);
+            int textLeft = hdr.Left;
+            if (app.Icon != null)
+            {
+                int iy = tile.Top + (_layout.headerH - _layout.iconSize) / 2;
+                Bitmap iconBmp = GetIconBitmap(app.Icon, _layout.iconSize);
+                if (iconBmp != null) g.DrawImage(iconBmp, hdr.Left, iy, iconBmp.Width, iconBmp.Height);
+                else g.DrawIcon(app.Icon, new Rectangle(hdr.Left, iy, _layout.iconSize, _layout.iconSize));
+                textLeft = hdr.Left + _layout.iconSize + Logic.Scaled(_scale, 8);
+            }
+            string title = string.IsNullOrEmpty(app.Title) ? Path.GetFileName(app.Exe) : app.Title;
+            var rect = new RectangleF(textLeft, tile.Top, hdr.Right - textLeft, _layout.headerH);
+            g.DrawString(title, _headerFont, _headerBrush, rect, _headerFormat);
+        }
+
+        static void DrawCardDirect(Graphics g, AppEntry app, NativeMethods.RECT tile, bool light)
+        {
+            NativeMethods.RECT pv = Logic.PreviewRect(ref _layout, tile);
+            GraphicsPath cardPath = RoundRect(tile.Left, tile.Top, tile.Right, tile.Bottom, _layout.radius);
+            GraphicsPath hole = null;
+            try
+            {
+                using (var b = new SolidBrush(CardColor(light))) g.FillPath(b, cardPath);
+                using (var p = new Pen(CardStrokeC(light), Math.Max(1, Logic.Scaled(_scale, 1)))) g.DrawPath(p, cardPath);
+
+                int pw = pv.Right - pv.Left, ph = pv.Bottom - pv.Top;
+                if (pw > 0 && ph > 0)
+                {
+                    var pvF = new RectangleF(pv.Left, pv.Top, pw, ph);
+                    using (var back = new SolidBrush(CardSolid(light)))
+                    {
+                        g.SetClip(cardPath);
+                        g.FillRectangle(back, pv.Left, pv.Top, pw, ph);
+                        g.ResetClip();
+                    }
+                    if (app.Thumb != IntPtr.Zero)
+                    {
+                        hole = BottomRoundRect(pvF, _layout.radius);
+                        g.CompositingMode = CompositingMode.SourceCopy;
+                        using (var tr = new SolidBrush(Color.FromArgb(0, 0, 0, 0)))
+                            g.FillPath(tr, hole);
+                        g.CompositingMode = CompositingMode.SourceOver;
+                        hole.Dispose(); hole = null;
+                    }
+                }
+                DrawCardHeader(g, app, tile);
+            }
+            finally
+            {
+                if (hole != null) hole.Dispose();
+                cardPath.Dispose();
+            }
+        }
+
+        // Draws every base card on the current page (without the selection ring,
+        // which RenderChrome applies on top via a single-tile backup patch).
+        static void DrawCardsBase(Graphics g, int w, int h, bool light)
         {
             int pageEnd = Math.Min(_pageStart + _layout.pageSize, _apps.Count);
-            for (int i = _pageStart, slot = 0; i < pageEnd; ++i, ++slot)
+            int strokeW = Math.Max(1, Logic.Scaled(_scale, 1));
+            bool canStamp = _cardSolidTemplate != null && _cardThumbTemplate != null
+                && _tplTileW == _layout.tileW && _tplTileH == _layout.tileH && _layout.gap >= 2 * _tplPad;
+            if (canStamp)
             {
-                var app = _apps[i];
-                NativeMethods.RECT tile = Logic.TileRect(ref _layout, slot);
-                bool sel = i == _index;
-                NativeMethods.RECT pv = Logic.PreviewRect(ref _layout, tile);
-
-                GraphicsPath cardPath = RoundRect(tile.Left, tile.Top, tile.Right, tile.Bottom, _layout.radius);
-                GraphicsPath ringIn = null, ringOut = null, hole = null;
-                try
+                for (int i = _pageStart, slot = 0; i < pageEnd; ++i, ++slot)
                 {
-                    using (var b = new SolidBrush(CardColor(light))) g.FillPath(b, cardPath);
-                    using (var p = new Pen(CardStrokeC(light), Math.Max(1, Logic.Scaled(_scale, 1)))) g.DrawPath(p, cardPath);
-
-                    int pw = pv.Right - pv.Left, ph = pv.Bottom - pv.Top;
-                    if (pw > 0 && ph > 0)
+                    NativeMethods.RECT tile = Logic.TileRect(ref _layout, slot);
+                    if (tile.Left - _tplPad <= strokeW || tile.Top - _tplPad <= strokeW
+                        || tile.Right + _tplPad >= w - strokeW || tile.Bottom + _tplPad >= h - strokeW)
                     {
-                        var pvF = new RectangleF(pv.Left, pv.Top, pw, ph);
-                        using (var back = new SolidBrush(CardSolid(light)))
-                        {
-                            g.SetClip(cardPath);
-                            g.FillRectangle(back, pv.Left, pv.Top, pw, ph);
-                            g.ResetClip();
-                        }
-                        if (app.Thumb != IntPtr.Zero)
-                        {
-                            // Punch the preview area transparent: the live DWM
-                            // thumbnail is hosted by the panel window underneath
-                            // and shows through the hole.
-                            hole = BottomRoundRect(pvF, _layout.radius);
-                            g.CompositingMode = CompositingMode.SourceCopy;
-                            using (var tr = new SolidBrush(Color.FromArgb(0, 0, 0, 0)))
-                                g.FillPath(tr, hole);
-                            g.CompositingMode = CompositingMode.SourceOver;
-                            hole.Dispose(); hole = null;
-                        }
-                        // No thumbnail: leave the card solid. Nothing is drawn
-                        // (in particular no oversized app icon) - DWM supplies
-                        // the window's last composed frame even after it is
-                        // minimized, so an empty tile means DWM genuinely has no
-                        // content, and a big icon there only drew attention to
-                        // the gap.
+                        canStamp = false;
+                        break;
                     }
-
-                    NativeMethods.RECT hdr = Logic.HeaderRect(ref _layout, tile);
-                    int textLeft = hdr.Left;
-                    if (app.Icon != null)
-                    {
-                        int iy = tile.Top + (_layout.headerH - _layout.iconSize) / 2;
-                        g.DrawIcon(app.Icon, new Rectangle(hdr.Left, iy, _layout.iconSize, _layout.iconSize));
-                        textLeft = hdr.Left + _layout.iconSize + Logic.Scaled(_scale, 8);
-                    }
-                    string title = string.IsNullOrEmpty(app.Title) ? Path.GetFileName(app.Exe) : app.Title;
-                    var rect = new RectangleF(textLeft, tile.Top, hdr.Right - textLeft, _layout.headerH);
-                    using (var sf = new StringFormat { FormatFlags = StringFormatFlags.NoWrap, Trimming = StringTrimming.EllipsisCharacter, LineAlignment = StringAlignment.Center })
-                        g.DrawString(title, _headerFont, _headerBrush, rect, sf);
-
-                    if (sel)
-                    {
-                        int gPad = Logic.Scaled(_scale, 6), gOut = gPad + Logic.Scaled(_scale, 2);
-                        int outerR = Logic.Scaled(_scale, 18), innerR = outerR - Logic.Scaled(_scale, 2);
-                        ringIn = RoundRect(tile.Left - gPad, tile.Top - gPad, tile.Right + gPad, tile.Bottom + gPad, innerR);
-                        ringOut = RoundRect(tile.Left - gOut, tile.Top - gOut, tile.Right + gOut, tile.Bottom + gOut, outerR);
-                        using (var p1 = new Pen(FocusShadowC(light), Math.Max(1, Logic.Scaled(_scale, 1))))
-                            g.DrawPath(p1, ringIn);
-                        using (var p2 = new Pen(accent, Math.Max(2, Logic.Scaled(_scale, 4))))
-                            g.DrawPath(p2, ringOut);
-                    }
-                }
-                finally
-                {
-                    if (hole != null) hole.Dispose();
-                    if (ringIn != null) ringIn.Dispose();
-                    if (ringOut != null) ringOut.Dispose();
-                    cardPath.Dispose();
                 }
             }
+            if (canStamp)
+            {
+                g.CompositingMode = CompositingMode.SourceCopy;
+                for (int i = _pageStart, slot = 0; i < pageEnd; ++i, ++slot)
+                {
+                    var app = _apps[i];
+                    NativeMethods.RECT tile = Logic.TileRect(ref _layout, slot);
+                    Bitmap tpl = app.Thumb != IntPtr.Zero ? _cardThumbTemplate : _cardSolidTemplate;
+                    g.DrawImage(tpl, tile.Left - _tplPad, tile.Top - _tplPad, tpl.Width, tpl.Height);
+                }
+                g.CompositingMode = CompositingMode.SourceOver;
+                for (int i = _pageStart, slot = 0; i < pageEnd; ++i, ++slot)
+                    DrawCardHeader(g, _apps[i], Logic.TileRect(ref _layout, slot));
+                return;
+            }
+            for (int i = _pageStart, slot = 0; i < pageEnd; ++i, ++slot)
+                DrawCardDirect(g, _apps[i], Logic.TileRect(ref _layout, slot), light);
         }
 
         static void DrawPageIndicator(Graphics g, int w, int h, bool light)
@@ -3661,41 +4321,67 @@ namespace AppHopper
             if (totalPages <= 1) return;
             int cur = _pageStart / pageSize + 1;
             var rect = new RectangleF(_layout.pad, h - _layout.pad, w - 2 * _layout.pad, _layout.pad);
-            using (var sf = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Far })
-                g.DrawString(cur + " / " + totalPages, _headerFont, _headerBrush, rect, sf);
+            g.DrawString(cur + " / " + totalPages, _headerFont, _headerBrush, rect, _pageFormat);
         }
 
-        // Pushes the finished surface to the layered chrome window. The memory
-        // DC is released in a finally: a throw between CreateCompatibleDC and
-        // DeleteDC would otherwise leak a GDI DC for the process lifetime.
-        static void SubmitChrome(int w, int h, IntPtr screenDc, IntPtr dib)
+        // Pushes the persistent surface to the layered chrome window, using a
+        // dirty rectangle for same-page focus moves when already visible.
+        static void SubmitChrome(int w, int h, IntPtr screenDc, bool showWindow, NativeMethods.RECT? dirtyRect)
         {
-            IntPtr memDc = NativeMethods.CreateCompatibleDC(screenDc);
-            if (memDc == IntPtr.Zero) { Log("chrome: CreateCompatibleDC failed"); return; }
-            IntPtr old = IntPtr.Zero;
-            try
-            {
-                old = NativeMethods.SelectObject(memDc, dib);
-                var dst = new NativeMethods.POINT { X = _layout.panelX, Y = _layout.panelY };
-                var size = new NativeMethods.SIZE { cx = w, cy = h };
-                var src = new NativeMethods.POINT { X = 0, Y = 0 };
-                var blend = new NativeMethods.BLENDFUNCTION { BlendOp = NativeMethods.AC_SRC_OVER, BlendFlags = 0, SourceConstantAlpha = 255, AlphaFormat = NativeMethods.AC_SRC_ALPHA };
-                bool ulw = NativeMethods.UpdateLayeredWindow(_chrome.Handle, screenDc, ref dst, ref size, memDc, ref src, 0, ref blend, NativeMethods.ULW_ALPHA);
-                if (!ulw) { Log("NativeMethods.UpdateLayeredWindow failed err=" + Marshal.GetLastWin32Error()); return; }
+            if (_chrome == null || !_chrome.IsHandleCreated || _chromeMemDc == IntPtr.Zero) return;
+            var dst = new NativeMethods.POINT { X = _layout.panelX, Y = _layout.panelY };
+            var size = new NativeMethods.SIZE { cx = w, cy = h };
+            var src = new NativeMethods.POINT { X = 0, Y = 0 };
+            var blend = new NativeMethods.BLENDFUNCTION { BlendOp = NativeMethods.AC_SRC_OVER, BlendFlags = 0, SourceConstantAlpha = 255, AlphaFormat = NativeMethods.AC_SRC_ALPHA };
 
-                // UpdateLayeredWindow does NOT make a hidden window visible;
-                // Hopper shows both windows explicitly (SWP_SHOWWINDOW).
-                _chrome.Show();
-                NativeMethods.SetWindowPos(_chrome.Handle, IntPtr.Zero, 0, 0, 0, 0,
-                             0x1 | 0x2 | 0x10 | 0x40 /*NOSIZE|NOMOVE|NOACTIVATE|SHOWWINDOW*/);
-                // keep the opaque panel strictly below the chrome layer
-                NativeMethods.SetWindowPos(_panel.Handle, _chrome.Handle, 0, 0, 0, 0, 0x1 | 0x2 | 0x10);
-            }
-            finally
+            bool updated = false;
+            if (dirtyRect.HasValue
+                && dirtyRect.Value.Right > dirtyRect.Value.Left && dirtyRect.Value.Bottom > dirtyRect.Value.Top
+                && _chromeSubmittedOnce && NativeMethods.IsWindowVisible(_chrome.Handle)
+                && _chromeSubmittedX == dst.X && _chromeSubmittedY == dst.Y
+                && _chromeSubmittedW == w && _chromeSubmittedH == h)
             {
-                if (old != IntPtr.Zero) NativeMethods.SelectObject(memDc, old);
-                NativeMethods.DeleteDC(memDc);
+                NativeMethods.RECT dirty = dirtyRect.Value;
+                GCHandle hDst = GCHandle.Alloc(dst, GCHandleType.Pinned);
+                GCHandle hSize = GCHandle.Alloc(size, GCHandleType.Pinned);
+                GCHandle hSrc = GCHandle.Alloc(src, GCHandleType.Pinned);
+                GCHandle hBlend = GCHandle.Alloc(blend, GCHandleType.Pinned);
+                GCHandle hDirty = GCHandle.Alloc(dirty, GCHandleType.Pinned);
+                try
+                {
+                    var info = new NativeMethods.UPDATELAYEREDWINDOWINFO
+                    {
+                        cbSize = Marshal.SizeOf(typeof(NativeMethods.UPDATELAYEREDWINDOWINFO)),
+                        hdcDst = screenDc,
+                        pptDst = hDst.AddrOfPinnedObject(),
+                        psize = hSize.AddrOfPinnedObject(),
+                        hdcSrc = _chromeMemDc,
+                        pptSrc = hSrc.AddrOfPinnedObject(),
+                        crKey = 0,
+                        pblend = hBlend.AddrOfPinnedObject(),
+                        dwFlags = NativeMethods.ULW_ALPHA,
+                        prcDirty = hDirty.AddrOfPinnedObject()
+                    };
+                    updated = NativeMethods.UpdateLayeredWindowIndirect(_chrome.Handle, ref info);
+                }
+                finally
+                {
+                    hDirty.Free();
+                    hBlend.Free();
+                    hSrc.Free();
+                    hSize.Free();
+                    hDst.Free();
+                }
             }
+            if (!updated)
+            {
+                bool ulw = NativeMethods.UpdateLayeredWindow(_chrome.Handle, screenDc, ref dst, ref size, _chromeMemDc, ref src, 0, ref blend, NativeMethods.ULW_ALPHA);
+                if (!ulw) { Log("NativeMethods.UpdateLayeredWindow failed err=" + Marshal.GetLastWin32Error()); return; }
+                _chromeSubmittedOnce = true;
+                _chromeSubmittedX = dst.X; _chromeSubmittedY = dst.Y; _chromeSubmittedW = w; _chromeSubmittedH = h;
+            }
+            if (showWindow && (!_chrome.Visible || !NativeMethods.IsWindowVisible(_chrome.Handle)))
+                RevealOverlay();
         }
 
         static GraphicsPath RoundRect(int l, int t, int r, int b, int rad)
@@ -5295,6 +5981,7 @@ namespace AppHopper
                 var savedSession = _session;
                 var savedCommitting = _committing;
                 var savedIgnore = _ignoreForegroundThrough;
+                var savedHasWatermark = _hasForegroundWatermark;
                 try
                 {
                     using (var a = new GroupingTestForm())
@@ -5306,25 +5993,39 @@ namespace AppHopper
                         _committing = true;
                         _observedForeground = CaptureForeground(a.Handle, 100);
                         _ignoreForegroundThrough = 500;
-                        HandleForegroundEvent(b.Handle, 600, false);
+                        _hasForegroundWatermark = true;
+                        HandleForegroundEvent(b.Handle, 600, 600, false);
                         Check(_observedForeground.Hwnd == a.Handle, "callback mutated history while committing");
 
                         _committing = false;
-                        HandleForegroundEvent(b.Handle, 500, false);
-                        Check(_observedForeground.Hwnd == a.Handle, "stale event at or before watermark was not dropped");
+                        HandleForegroundEvent(b.Handle, 500, 510, false);
+                        Check(_observedForeground.Hwnd == a.Handle && _hasForegroundWatermark,
+                            "stale event at or before watermark was not dropped");
 
-                        HandleForegroundEvent(b.Handle, 501, false);
-                        Check(_observedForeground.Hwnd == RepresentativeOf(b.Handle), "post-watermark event was dropped");
+                        HandleForegroundEvent(b.Handle, 501, 510, false);
+                        Check(_observedForeground.Hwnd == RepresentativeOf(b.Handle) && !_hasForegroundWatermark,
+                            "post-watermark event was dropped or left watermark armed");
+
+                        // After 24.85 days (> 2^31 ms), signed subtraction flips sign;
+                        // expiry must disarm the watermark before comparing timestamps.
+                        _hasForegroundWatermark = true;
+                        _ignoreForegroundThrough = 500;
+                        uint wrappedNow = unchecked(500u + 0x80000000u);
+                        HandleForegroundEvent(a.Handle, wrappedNow, wrappedNow, false);
+                        Check(_observedForeground.Hwnd == RepresentativeOf(a.Handle) && !_hasForegroundWatermark,
+                            "watermark stayed armed past wraparound window");
 
                         _session = true;
-                        HandleForegroundEvent(a.Handle, 700, false);
-                        Check(_observedForeground.Hwnd == RepresentativeOf(b.Handle), "callback mutated history while session was open");
+                        HandleForegroundEvent(b.Handle, wrappedNow + 100, wrappedNow + 100, false);
+                        Check(_observedForeground.Hwnd == RepresentativeOf(a.Handle),
+                            "callback mutated history while session was open");
                     }
                 }
                 finally
                 {
                     _mru.Clear(); _mru.AddRange(saved); _observedForeground = savedObserved;
-                    _session = savedSession; _committing = savedCommitting; _ignoreForegroundThrough = savedIgnore;
+                    _session = savedSession; _committing = savedCommitting;
+                    _ignoreForegroundThrough = savedIgnore; _hasForegroundWatermark = savedHasWatermark;
                 }
             });
 
@@ -5899,6 +6600,255 @@ namespace AppHopper
                 }
             });
 
+            Test("incremental focus-ring chrome update matches full render pixel-for-pixel", delegate
+            {
+                PanelForm savedPanel = _panel;
+                ChromeForm savedChrome = _chrome;
+                var savedApps = new List<AppEntry>(_apps);
+                var savedLayout = _layout;
+                double savedScale = _scale;
+                int savedIndex = _index, savedPageStart = _pageStart;
+                bool savedLight = _sessionLight;
+                Color savedAccent = _sessionAccent;
+                bool savedHasBounds = _panelHasBounds, savedHasRgn = _panelHasRgn, savedHasBg = _panelHasBg;
+                try
+                {
+                    DisposeChromeSurface();
+                    DisposeRenderCache();
+                    _panelHasBounds = _panelHasRgn = _panelHasBg = false;
+                    using (var panel = new PanelForm())
+                    using (var chrome = new ChromeForm())
+                    {
+                        chrome.Owner = panel;
+                        IntPtr hp = panel.Handle, hc = chrome.Handle;
+                        GC.KeepAlive(hp); GC.KeepAlive(hc);
+                        _panel = panel;
+                        _chrome = chrome;
+                        _scale = 1.5;
+                        _sessionLight = false;
+                        _sessionAccent = Color.FromArgb(255, 0, 120, 215);
+                        Logic.ComputeLayout(new NativeMethods.RECT { Left = 0, Top = 0, Right = 1920, Bottom = 1080 }, 4, _scale, ref _layout);
+                        _scale = _layout.scale;
+                        _apps.Clear();
+                        _apps.Add(new AppEntry { ReprHwnd = new IntPtr(1), Exe = "a.exe", Key = "a|1", Title = "Window Zero", Icon = SystemIcons.Application, Thumb = new IntPtr(1) });
+                        _apps.Add(new AppEntry { ReprHwnd = new IntPtr(2), Exe = "b.exe", Key = "b|2", Title = "Window One", Icon = SystemIcons.Information, Thumb = new IntPtr(2) });
+                        _apps.Add(new AppEntry { ReprHwnd = new IntPtr(3), Exe = "c.exe", Key = "c|3", Title = "Cloaked Window", Icon = SystemIcons.Warning, Thumb = IntPtr.Zero });
+                        _apps.Add(new AppEntry { ReprHwnd = new IntPtr(4), Exe = "d.exe", Key = "d|4", Title = "Window Three", Icon = SystemIcons.Error, Thumb = new IntPtr(4) });
+                        _pageStart = 0;
+
+                        _index = 0;
+                        RenderChrome(true, false);
+                        Check(_chromeBits != IntPtr.Zero && _chromeW == _layout.panelW && _chromeH == _layout.panelH,
+                            "chrome DIB surface was not initialized");
+                        int byteCount = _chromeW * _chromeH * 4;
+                        byte[] fullAt0 = new byte[byteCount];
+                        Marshal.Copy(_chromeBits, fullAt0, 0, byteCount);
+
+                        // Preview hole center on card 0 (Thumb != 0) must be transparent; card 2 (Thumb == 0) must be opaque.
+                        NativeMethods.RECT t0 = Logic.TileRect(ref _layout, 0);
+                        NativeMethods.RECT pv0 = Logic.PreviewRect(ref _layout, t0);
+                        int cx0 = (pv0.Left + pv0.Right) / 2, cy0 = (pv0.Top + pv0.Bottom) / 2;
+                        Check(fullAt0[(cy0 * _chromeW + cx0) * 4 + 3] == 0, "thumbnail preview hole was not transparent");
+
+                        NativeMethods.RECT t2 = Logic.TileRect(ref _layout, 2);
+                        NativeMethods.RECT pv2 = Logic.PreviewRect(ref _layout, t2);
+                        int cx2 = (pv2.Left + pv2.Right) / 2, cy2 = (pv2.Top + pv2.Bottom) / 2;
+                        Check(fullAt0[(cy2 * _chromeW + cx2) * 4 + 3] == 255, "solid card preview center was not opaque");
+
+                        NativeMethods.RECT hdr0 = Logic.HeaderRect(ref _layout, t0);
+                        byte maxHdrAlpha = 0;
+                        byte baseHeaderAlpha = CardColor(_sessionLight).A;
+                        for (int y = t0.Top + 4; y < t0.Top + _layout.headerH - 4; y++)
+                            for (int x = hdr0.Left; x < hdr0.Right; x++)
+                            {
+                                byte a = fullAt0[(y * _chromeW + x) * 4 + 3];
+                                if (a > maxHdrAlpha) maxHdrAlpha = a;
+                            }
+                        Check(maxHdrAlpha > baseHeaderAlpha, "card header icon/title did not render onto header surface");
+
+                        // Incremental 0 -> 1 must match full render at 1 byte-for-byte.
+                        _index = 1;
+                        RenderChrome(false, false);
+                        byte[] incAt1 = new byte[byteCount];
+                        Marshal.Copy(_chromeBits, incAt1, 0, byteCount);
+
+                        _index = 1;
+                        RenderChrome(true, false);
+                        byte[] fullAt1 = new byte[byteCount];
+                        Marshal.Copy(_chromeBits, fullAt1, 0, byteCount);
+
+                        for (int k = 0; k < byteCount; k++)
+                            if (incAt1[k] != fullAt1[k])
+                                throw new Exception("incremental 0->1 differed from full render at byte " + k
+                                    + " (pixel " + ((k / 4) % _chromeW) + "," + ((k / 4) / _chromeW)
+                                    + " ch=" + (k % 4) + ": inc=" + incAt1[k] + " vs full=" + fullAt1[k] + ")");
+
+                        // Incremental 1 -> 0 must match full render at 0 byte-for-byte.
+                        _index = 0;
+                        RenderChrome(false, false);
+                        byte[] incBackTo0 = new byte[byteCount];
+                        Marshal.Copy(_chromeBits, incBackTo0, 0, byteCount);
+
+                        for (int k = 0; k < byteCount; k++)
+                            if (incBackTo0[k] != fullAt0[k])
+                                throw new Exception("incremental 1->0 differed from full render at byte " + k
+                                    + " (pixel " + ((k / 4) % _chromeW) + "," + ((k / 4) / _chromeW)
+                                    + " ch=" + (k % 4) + ": inc=" + incBackTo0[k] + " vs full=" + fullAt0[k] + ")");
+                    }
+                }
+                finally
+                {
+                    HideOverlay();
+                    DisposeChromeSurface();
+                    DisposeRenderCache();
+                    _panel = savedPanel; _chrome = savedChrome;
+                    _apps.Clear(); _apps.AddRange(savedApps);
+                    _layout = savedLayout; _scale = savedScale;
+                    _index = savedIndex; _pageStart = savedPageStart;
+                    _sessionLight = savedLight; _sessionAccent = savedAccent;
+                    _panelHasBounds = savedHasBounds; _panelHasRgn = savedHasRgn; _panelHasBg = savedHasBg;
+                }
+            });
+
+            Test("atomic overlay reveal keeps chrome above panel without stealing foreground", delegate
+            {
+                PanelForm savedPanel = _panel;
+                ChromeForm savedChrome = _chrome;
+                var savedApps = new List<AppEntry>(_apps);
+                var savedLayout = _layout;
+                double savedScale = _scale;
+                int savedIndex = _index, savedPageStart = _pageStart;
+                bool savedLight = _sessionLight;
+                Color savedAccent = _sessionAccent;
+                bool savedHasBounds = _panelHasBounds, savedHasRgn = _panelHasRgn, savedHasBg = _panelHasBg;
+                try
+                {
+                    DisposeChromeSurface();
+                    DisposeRenderCache();
+                    _panelHasBounds = _panelHasRgn = _panelHasBg = false;
+                    using (var panel = new PanelForm())
+                    using (var chrome = new ChromeForm())
+                    {
+                        chrome.Owner = panel;
+                        IntPtr hp = panel.Handle, hc = chrome.Handle;
+                        _panel = panel;
+                        _chrome = chrome;
+                        _scale = 1.0;
+                        _sessionLight = false;
+                        _sessionAccent = Color.FromArgb(255, 0, 120, 215);
+                        Logic.ComputeLayout(new NativeMethods.RECT { Left = 0, Top = 0, Right = 1920, Bottom = 1080 }, 2, _scale, ref _layout);
+                        _scale = _layout.scale;
+                        _apps.Clear();
+                        _apps.Add(new AppEntry { ReprHwnd = new IntPtr(1), Exe = "a.exe", Key = "a|1", Title = "First", Icon = SystemIcons.Application });
+                        _apps.Add(new AppEntry { ReprHwnd = new IntPtr(2), Exe = "b.exe", Key = "b|2", Title = "Second", Icon = SystemIcons.Application });
+                        _index = 1;
+                        _pageStart = 0;
+
+                        IntPtr fgBefore = NativeMethods.GetForegroundWindow();
+                        PreparePanel();
+                        RenderChrome(true, false);
+                        Check(!NativeMethods.IsWindowVisible(hp) && !NativeMethods.IsWindowVisible(hc),
+                            "overlay windows became visible before atomic reveal");
+
+                        RevealOverlay();
+                        Application.DoEvents();
+                        Check(NativeMethods.IsWindowVisible(hp) && NativeMethods.IsWindowVisible(hc)
+                            && panel.Visible && chrome.Visible, "atomic reveal did not show both windows");
+                        Check(NativeMethods.GetForegroundWindow() == fgBefore, "atomic reveal changed foreground");
+
+                        bool chromeAbovePanel = false;
+                        for (IntPtr cur = NativeMethods.GetWindow(hc, 2 /*GW_HWNDNEXT*/); cur != IntPtr.Zero; cur = NativeMethods.GetWindow(cur, 2))
+                        {
+                            if (cur == hp) { chromeAbovePanel = true; break; }
+                        }
+                        Check(chromeAbovePanel, "chrome was not above panel in Z-order after reveal");
+
+                        _index = 0;
+                        RenderChrome(false, true);
+                        Application.DoEvents();
+                        Check(NativeMethods.IsWindowVisible(hp) && NativeMethods.IsWindowVisible(hc),
+                            "incremental update hid overlay windows");
+                        Check(NativeMethods.GetForegroundWindow() == fgBefore, "incremental update changed foreground");
+
+                        HideOverlay();
+                        Application.DoEvents();
+                        Check(!NativeMethods.IsWindowVisible(hp) && !NativeMethods.IsWindowVisible(hc)
+                            && !panel.Visible && !chrome.Visible, "hide left overlay visible");
+                        Check(NativeMethods.GetForegroundWindow() == fgBefore, "hide changed foreground");
+                    }
+                }
+                finally
+                {
+                    HideOverlay();
+                    DisposeChromeSurface();
+                    DisposeRenderCache();
+                    _panel = savedPanel; _chrome = savedChrome;
+                    _apps.Clear(); _apps.AddRange(savedApps);
+                    _layout = savedLayout; _scale = savedScale;
+                    _index = savedIndex; _pageStart = savedPageStart;
+                    _sessionLight = savedLight; _sessionAccent = savedAccent;
+                    _panelHasBounds = savedHasBounds; _panelHasRgn = savedHasRgn; _panelHasBg = savedHasBg;
+                }
+            });
+
+            Test("overlay cache invalidation resets panel and chrome cache flags", delegate
+            {
+                bool savedHasBounds = _panelHasBounds, savedHasRgn = _panelHasRgn;
+                bool savedSubmitted = _chromeSubmittedOnce, savedPageValid = _chromePageValid;
+                try
+                {
+                    _panelHasBounds = true;
+                    _panelHasRgn = true;
+                    _chromeSubmittedOnce = true;
+                    _chromePageValid = true;
+                    InvalidateOverlayCache();
+                    Check(!_panelHasBounds && !_panelHasRgn && !_chromeSubmittedOnce && !_chromePageValid,
+                        "overlay cache invalidation left stale cache flags set");
+                }
+                finally
+                {
+                    _panelHasBounds = savedHasBounds; _panelHasRgn = savedHasRgn;
+                    _chromeSubmittedOnce = savedSubmitted; _chromePageValid = savedPageValid;
+                }
+            });
+
+            Test("icon bitmap cache preserves hits at capacity before evicting on miss", delegate
+            {
+                var savedCache = new Dictionary<Icon, Bitmap>(_iconBitmapCache);
+                int savedSize = _iconBitmapSize;
+                var clones = new List<Icon>(256);
+                Icon extra = null;
+                try
+                {
+                    _iconBitmapCache.Clear();
+                    _iconBitmapSize = 0;
+                    for (int i = 0; i < 256; i++)
+                    {
+                        var cloned = (Icon)SystemIcons.Application.Clone();
+                        clones.Add(cloned);
+                        Check(GetIconBitmap(cloned, 16) != null, "failed to rasterize test icon " + i);
+                    }
+                    Check(_iconBitmapCache.Count == 256, "cache did not reach 256 capacity: " + _iconBitmapCache.Count);
+                    Bitmap first = GetIconBitmap(clones[0], 16);
+                    Bitmap hit = GetIconBitmap(clones[0], 16);
+                    Check(ReferenceEquals(first, hit) && _iconBitmapCache.Count == 256,
+                        "cache hit at capacity evicted existing entries");
+
+                    extra = (Icon)SystemIcons.Information.Clone();
+                    Bitmap inserted = GetIconBitmap(extra, 16);
+                    Check(inserted != null && _iconBitmapCache.Count == 1 && _iconBitmapCache.ContainsKey(extra),
+                        "cache miss at capacity did not evict and insert new icon");
+                }
+                finally
+                {
+                    ClearIconBitmapCache();
+                    foreach (var kv in savedCache) _iconBitmapCache[kv.Key] = kv.Value;
+                    _iconBitmapSize = savedSize;
+                    foreach (var iconItem in clones) iconItem.Dispose();
+                    if (extra != null) extra.Dispose();
+                }
+            });
+
 
             Console.WriteLine("failures=" + _testFailures);
             return _testFailures == 0;
@@ -6124,8 +7074,26 @@ namespace AppHopper
                 catch (Exception ex) { HealthLog("update-started signal failed: " + ex.Message); }
             }
 
+            var warmupTimer = new System.Windows.Forms.Timer { Interval = 150 };
+            warmupTimer.Tick += delegate
+            {
+                if (warmupTimer != null)
+                {
+                    warmupTimer.Stop();
+                    warmupTimer.Dispose();
+                    warmupTimer = null;
+                }
+                WarmupOverlay();
+            };
+            warmupTimer.Start();
+
             Application.Run();
 
+            if (warmupTimer != null)
+            {
+                warmupTimer.Dispose();
+                warmupTimer = null;
+            }
             if (_foregroundHook != IntPtr.Zero)
             {
                 try { NativeMethods.UnhookWinEvent(_foregroundHook); } catch { }
@@ -6138,6 +7106,8 @@ namespace AppHopper
             if (sessionNotifications) NativeMethods.WTSUnRegisterSessionNotification(hMsg);
             HealthLog("stopped");
             EndSession();
+            DisposeChromeSurface();
+            DisposeRenderCache();
             if (_shellHookMessage != 0)
             {
                 NativeMethods.DeregisterShellHookWindow(hMsg);
