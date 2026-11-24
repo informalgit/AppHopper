@@ -703,13 +703,32 @@ namespace AppHopper
         // ================= tray icon =================
         // Drawn at runtime so the build stays single-file and zero-dependency
         // (no .ico asset shipped). Colors are a fixed brand palette, not the
-        // OS accent: a #F7630C orange plate (from the Windows system accent
-        // palette) with white window cards, readable on light and dark
-        // taskbars alike. The composition is the window switcher's own visual
-        // language - filled front card lower-left, outlined back card
-        // upper-right - the same two-window mark as Windows Task View and
-        // AltTab macOS.
+        // OS accent: two borderless overlapping Fluent blue window tiles
+        // (cyan-blue back tile upper-right, deep-blue front tile lower-left
+        // with a soft shadow separation and white header pill), readable on
+        // light and dark taskbars alike.
         static Icon _trayIcon;   // NotifyIcon does not own its Icon; keep this alive or the HICON gets finalized away
+
+        static void FillTrayRoundRect(Graphics g, Brush brush, float x, float y, float w, float h, float r)
+        {
+            using (var path = new GraphicsPath())
+            {
+                if (r <= 0.1f)
+                {
+                    path.AddRectangle(new RectangleF(x, y, w, h));
+                }
+                else
+                {
+                    float d = Math.Min(Math.Min(w, h), 2 * r);
+                    path.AddArc(x, y, d, d, 180, 90);
+                    path.AddArc(x + w - d, y, d, d, 270, 90);
+                    path.AddArc(x + w - d, y + h - d, d, d, 0, 90);
+                    path.AddArc(x, y + h - d, d, d, 90, 90);
+                    path.CloseFigure();
+                }
+                g.FillPath(brush, path);
+            }
+        }
 
         static Icon MakeTrayIcon()
         {
@@ -722,55 +741,46 @@ namespace AppHopper
             catch { }
             if ((size & 1) == 1) size++;   // even sizes rasterize cleaner
 
-            Color plate = Color.FromArgb(255, 0xF7, 0x63, 0x0C);
-            Color glyph = Color.White;
+            float cr = Math.Max(1.6f, size * 0.13f);
+            float bx = size * 0.28f, by = size * 0.06f, bw = size * 0.66f, bh = size * 0.54f;
+            float fx = size * 0.06f, fy = size * 0.38f, fw = size * 0.66f, fh = size * 0.56f;
 
             using (var bmp = new Bitmap(size, size))
             using (var g2 = Graphics.FromImage(bmp))
             {
                 g2.SmoothingMode = SmoothingMode.AntiAlias;
-                float m = 0.5f;   // keeps the AA edge off the bitmap border
-                // rounded plate
-                float pr = size * 0.27f;
-                using (var path = new GraphicsPath())
+                g2.PixelOffsetMode = PixelOffsetMode.HighQuality;
+
+                // back window tile, upper-right
+                using (var br = new LinearGradientBrush(
+                    new RectangleF(bx, by, bw, bh),
+                    Color.FromArgb(255, 0x40, 0xC4, 0xFF),
+                    Color.FromArgb(255, 0x00, 0x91, 0xEA),
+                    45f))
                 {
-                    path.AddArc(m, m, 2 * pr, 2 * pr, 180, 90);
-                    path.AddArc(size - m - 2 * pr, m, 2 * pr, 2 * pr, 270, 90);
-                    path.AddArc(size - m - 2 * pr, size - m - 2 * pr, 2 * pr, 2 * pr, 0, 90);
-                    path.AddArc(m, size - m - 2 * pr, 2 * pr, 2 * pr, 90, 90);
-                    path.CloseFigure();
-                    using (var b = new SolidBrush(plate))
-                        g2.FillPath(b, path);
+                    br.WrapMode = WrapMode.TileFlipXY;
+                    FillTrayRoundRect(g2, br, bx, by, bw, bh, cr);
                 }
-                float cr = size * 0.075f;   // window-card corner radius
-                float sw = size * 0.07f;    // back-card stroke width
-                // back card: outlined, upper-right
-                float bx = size * 0.30f, by = size * 0.08f;
-                float bw = size * 0.54f, bh = size * 0.40f;
-                using (var path = new GraphicsPath())
+
+                // soft drop-shadow separating front tile from back tile and light taskbars
+                using (var shadow = new SolidBrush(Color.FromArgb(75, 0, 0, 0)))
+                    FillTrayRoundRect(g2, shadow, fx - size * 0.03f, fy - size * 0.04f, fw + size * 0.07f, fh + size * 0.06f, cr * 1.15f);
+
+                // front window tile, lower-left
+                using (var br = new LinearGradientBrush(
+                    new RectangleF(fx, fy, fw, fh),
+                    Color.FromArgb(255, 0x00, 0x78, 0xD4),
+                    Color.FromArgb(255, 0x00, 0x4E, 0x8C),
+                    45f))
                 {
-                    path.AddArc(bx, by, 2 * cr, 2 * cr, 180, 90);
-                    path.AddArc(bx + bw - 2 * cr, by, 2 * cr, 2 * cr, 270, 90);
-                    path.AddArc(bx + bw - 2 * cr, by + bh - 2 * cr, 2 * cr, 2 * cr, 0, 90);
-                    path.AddArc(bx, by + bh - 2 * cr, 2 * cr, 2 * cr, 90, 90);
-                    path.CloseFigure();
-                    using (var pen = new Pen(glyph, sw))
-                        g2.DrawPath(pen, path);
+                    br.WrapMode = WrapMode.TileFlipXY;
+                    FillTrayRoundRect(g2, br, fx, fy, fw, fh, cr);
                 }
-                // front card: filled, lower-left; no overlap, so the pair can
-                // only ever read as two windows (never as a lock, copy or "S")
-                float fx = size * 0.16f, fy = size * 0.52f;
-                float fw = size * 0.54f, fh = size * 0.40f;
-                using (var path = new GraphicsPath())
-                {
-                    path.AddArc(fx, fy, 2 * cr, 2 * cr, 180, 90);
-                    path.AddArc(fx + fw - 2 * cr, fy, 2 * cr, 2 * cr, 270, 90);
-                    path.AddArc(fx + fw - 2 * cr, fy + fh - 2 * cr, 2 * cr, 2 * cr, 0, 90);
-                    path.AddArc(fx, fy + fh - 2 * cr, 2 * cr, 2 * cr, 90, 90);
-                    path.CloseFigure();
-                    using (var b = new SolidBrush(glyph))
-                        g2.FillPath(b, path);
-                }
+
+                // window titlebar pill on front tile
+                using (var pill = new SolidBrush(Color.FromArgb(245, 255, 255, 255)))
+                    FillTrayRoundRect(g2, pill, fx + size * 0.11f, fy + size * 0.12f, size * 0.28f, Math.Max(1.2f, size * 0.08f), size * 0.04f);
+
                 IntPtr h = bmp.GetHicon();
                 try { return (Icon)Icon.FromHandle(h).Clone(); }
                 finally { NativeMethods.DestroyIcon(h); }
